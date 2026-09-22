@@ -72,12 +72,20 @@ Create a .chatrc file with:
 # is the last line: a body that is an action object is never a message to a
 # person. `--force` overrides it.
 _refuse_json_body() {
-    local head2
-    head2=$(printf '%s\n' "$1" | sed -E '/[^[:space:]]/,$!d' | sed -n '1,2p' | tr '\n' ' ')
-    printf '%s' "$head2" | grep -qE '^[[:space:]]*\{[[:space:]]*"action"[[:space:]]*:' || return 0
+    # die if the body is a structured action object rather than words for a person.
+    # JSON-GUARD-FENCE-FIX: strip markdown code fence markers and blank lines before
+    # the shape check, and look for the action key across the first lines, so a fenced
+    # or pretty-printed action object cannot slip past a line check.
+    local msg first
+    if [ $# -gt 0 ] && [ -n "$1" ]; then msg=$1; else msg=$(cat); fi
+    msg=$(printf '%s\n' "$msg" | sed -e '/^[[:space:]]*```[A-Za-z]*[[:space:]]*$/d' -e '/^[[:space:]]*~~~[A-Za-z]*[[:space:]]*$/d' -e '/^[[:space:]]*$/d')
+    first=$(printf '%s\n' "$msg" | head -1)
+    printf '%s' "$first" | grep -qE '^[[:space:]]*\{' || return 0
+    printf '%s\n' "$msg" | head -8 | grep -qE '"action"[[:space:]]*:' || return 0
     die "refusing to send: this message is a structured action object, not words for a person.
 A reply body must be plain text. If this really is meant literally, add --force."
 }
+
 
 cmd_send() {
     local message="" from="" to="${IDENTITY_NAME:-}"
