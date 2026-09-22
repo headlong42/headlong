@@ -64,6 +64,21 @@ Create a .chatrc file with:
     fi
 }
 
+# _refuse_json_body <message>: die if the body is a structured action object
+# rather than words for a person. On 2026-09-20/21 the responder's model
+# returned {"action":"no_reply","message":""} padded with whitespace to its
+# token cap; the object could not be salvaged and the text path sent it as
+# the reply anyway, and six of those reached one Slack thread. The transport
+# is the last line: a body that is an action object is never a message to a
+# person. `--force` overrides it.
+_refuse_json_body() {
+    local head2
+    head2=$(printf '%s\n' "$1" | sed -E '/[^[:space:]]/,$!d' | sed -n '1,2p' | tr '\n' ' ')
+    printf '%s' "$head2" | grep -qE '^[[:space:]]*\{[[:space:]]*"action"[[:space:]]*:' || return 0
+    die "refusing to send: this message is a structured action object, not words for a person.
+A reply body must be plain text. If this really is meant literally, add --force."
+}
+
 cmd_send() {
     local message="" from="" to="${IDENTITY_NAME:-}"
     while [[ $# -gt 0 ]]; do
@@ -79,6 +94,7 @@ cmd_send() {
         message=$(cat)
     fi
     [[ -z "$message" ]] && die "No message provided. Usage: chat send [--from <name>] [--to <name>] <message>"
+    [[ "$force" -eq 1 ]] || _refuse_json_body "$message"
 
     _resolve_from_to
 
@@ -120,6 +136,7 @@ cmd_reply() {
         message=$(cat)
     fi
     [[ -z "$message" ]] && die "No message provided. Usage: chat reply <to_name> <message>"
+    [[ "$force" -eq 1 ]] || _refuse_json_body "$message"
 
     local from="${IDENTITY_NAME:-}"
     [[ -z "$from" ]] && die "IDENTITY_NAME not set. Run: identity shell <name>"
