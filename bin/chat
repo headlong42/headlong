@@ -78,10 +78,13 @@ _refuse_json_body() {
     # or pretty-printed action object cannot slip past a line check.
     local msg first
     if [ $# -gt 0 ] && [ -n "$1" ]; then msg=$1; else msg=$(cat); fi
-    msg=$(printf '%s\n' "$msg" | sed -e '/^[[:space:]]*```[A-Za-z]*[[:space:]]*$/d' -e '/^[[:space:]]*~~~[A-Za-z]*[[:space:]]*$/d' -e '/^[[:space:]]*$/d')
+    # JSON-GUARD-BREAK2-FIX: also drop a UTF-8 BOM and CR, accept a
+    # single-quoted action key, and scan 40 lines instead of 8 so a long
+    # pretty-printed object cannot hide its action key past the window.
+    msg=$(printf '%s\n' "$msg" | sed -e '1s/^\xef\xbb\xbf//' -e 's/\r$//' -e '/^[[:space:]]*```[A-Za-z]*[[:space:]]*$/d' -e '/^[[:space:]]*~~~[A-Za-z]*[[:space:]]*$/d' -e '/^[[:space:]]*$/d')
     first=$(printf '%s\n' "$msg" | head -1)
     printf '%s' "$first" | grep -qE '^[[:space:]]*\{' || return 0
-    printf '%s\n' "$msg" | head -8 | grep -qE '"action"[[:space:]]*:' || return 0
+    printf '%s\n' "$msg" | head -40 | grep -qE '["'"'"'\'']action["'"'"'\''][[:space:]]*:' || return 0
     die "refusing to send: this message is a structured action object, not words for a person.
 A reply body must be plain text. If this really is meant literally, add --force."
 }
