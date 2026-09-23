@@ -62,6 +62,45 @@ record_count() {
 
 now() { date +%s; }
 
+test_die_after_claim_recovers() {
+    setup_identity
+    # THINKERS_TEST_DIE_AFTER_CLAIM is fault injection added for this case: the
+    # dispatcher kill -9s itself between claiming the due wake and launching
+    # its step, the exact window where a crash used to swallow a scheduled
+    # send with nothing left behind.
+    env_run env THINKERS_TEST_DIE_AFTER_CLAIM=1 THINKERS_CLAIM_STALE_SECS=1 thinkers start >/dev/null 2>&1
+    sleep 2
+    printf '%s' "$(( $(now) - 1 ))" > "$RUN/napper.wake_at"
+    sleep 3
+    local claims
+    claims=$(find "$RUN/claimed" -type f 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "$(record_count)" -eq 0 ]]; then
+        ok "a crash between claim and launch dispatches nothing, the loss is real"
+    else
+        bad "a crash between claim and launch dispatches nothing, the loss is real" "record count $(record_count)"
+    fi
+    if [[ "$claims" -eq 1 ]]; then
+        ok "the crash leaves the claim receipt behind as evidence"
+    else
+        bad "the crash leaves the claim receipt behind as evidence" "claims=$claims"
+    fi
+    env_run thinkers stop >/dev/null 2>&1 || true
+    env_run env THINKERS_CLAIM_STALE_SECS=1 thinkers start >/dev/null 2>&1
+    sleep 5
+    if [[ "$(record_count)" -eq 1 ]]; then
+        ok "the next dispatcher re-arms the orphaned claim and fires it exactly once"
+    else
+        bad "the next dispatcher re-arms the orphaned claim and fires it exactly once" "record count $(record_count): $(tr '\n' ' ' < "$TMP/id/record" 2>/dev/null)"
+    fi
+    claims=$(find "$RUN/claimed" -type f 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "$claims" -eq 0 && ! -f "$RUN/napper.wake_at" ]]; then
+        ok "the recovered wake leaves no receipt and no wake file"
+    else
+        bad "the recovered wake leaves no receipt and no wake file" "claims=$claims wake=$([[ -f "$RUN/napper.wake_at" ]] && echo yes || echo no)"
+    fi
+    env_run thinkers stop >/dev/null 2>&1
+}
+
 test_many_starts_one_dispatch() {
     setup_identity
     local n=4 i
@@ -137,6 +176,7 @@ test_tokens_unique() {
 test_many_starts_one_dispatch
 test_lock_is_held
 test_tokens_unique
+test_die_after_claim_recovers
 
 printf 'cases: pass=%d fail=%d skip=0\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]] || exit 1
