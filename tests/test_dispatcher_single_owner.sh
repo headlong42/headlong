@@ -62,6 +62,94 @@ record_count() {
 
 now() { date +%s; }
 
+test_crash_after_launch_does_not_double_fire() {
+    # The window this closes: the dispatcher claims the due wake, launches the
+    # step, and is killed before it clears its receipt. The send has already gone
+    # out. If the stale-claim sweep re-arms that receipt the same wake is sent a
+    # second time, which is the duplicate post this change exists to stop.
+    #
+    # The crash goes in through a PATH shim for rm, the one command both the old
+    # and the new code run in that window, so this case can go red on the pre-fix
+    # commit without depending on instrumentation the old code does not have.
+    setup_identity
+    local shim="$TMP/shim2" shimlog="$TMP/shim2.log" crashflag="$TMP/crash2.fired"
+    local realmv realrm sent_before sent_after leftovers i
+    realmv=$(command -v mv)
+    realrm=$(command -v rm)
+    mkdir -p "$shim"
+    : > "$shimlog"
+    rm -f "$crashflag"
+
+    cat > "$shim/rm" <<SHIM
+#!/usr/bin/env bash
+# Crash injection for test_crash_after_launch_does_not_double_fire: the send is
+# already out by the time the dispatcher clears its receipt. Kill it here and
+# the receipt is left behind, which is exactly what a real crash in that window
+# leaves. Exit without running the real rm so the leftover survives.
+for _a in "\$@"; do
+    case "\$_a" in
+        */claimed/napper|*/sent/napper)
+            if [[ ! -f "\$SHIM_CRASH_FLAG" ]]; then
+                : > "\$SHIM_CRASH_FLAG"
+                printf '%s\n' "\$_a" >> "\$SHIM_LOG"
+                kill -KILL "\$PPID" 2>/dev/null
+                exit 1
+            fi
+            ;;
+    esac
+done
+exec "\$SHIM_REAL_RM" "\$@"
+SHIM
+    chmod +x "$shim/rm"
+
+    env_run env PATH="$shim:$PATH" \
+        SHIM_REAL_RM="$realrm" SHIM_LOG="$shimlog" SHIM_CRASH_FLAG="$crashflag" \
+        THINKERS_CLAIM_STALE_SECS=1 thinkers start >/dev/null 2>&1
+    sleep 2
+
+    printf '%s' "$(( $(now) - 5 ))" > "$RUN/napper.wake_at"
+    for ((i = 0; i < 10; i++)); do
+        [[ -f "$crashflag" ]] && break
+        sleep 1
+    done
+
+    if [[ -f "$crashflag" ]]; then
+        ok "the dispatcher dies after the send with its receipt still on disk"
+    else
+        bad "the dispatcher dies after the send with its receipt still on disk" \
+            "no crash flag, shim log: $(tr '\n' ' ' < "$shimlog" 2>/dev/null)"
+    fi
+
+    sent_before=$(record_count)
+    if [[ "$sent_before" -eq 1 ]]; then
+        ok "the wake goes out exactly once before the crash"
+    else
+        bad "the wake goes out exactly once before the crash" "record count $sent_before"
+    fi
+
+    env_run thinkers stop >/dev/null 2>&1 || true
+    env_run env THINKERS_CLAIM_STALE_SECS=1 thinkers start >/dev/null 2>&1
+    sleep 6
+
+    sent_after=$(record_count)
+    if [[ "$sent_after" -eq 1 ]]; then
+        ok "the next dispatcher does not send the same wake again"
+    else
+        bad "the next dispatcher does not send the same wake again" \
+            "record count $sent_after: $(tr '\n' ' ' < "$TMP/id/record" 2>/dev/null)"
+    fi
+
+    leftovers=$(find "$RUN/claimed" "$RUN/sent" -type f 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "$leftovers" -eq 0 ]]; then
+        ok "the leftover receipt is dropped without re-arming the wake"
+    else
+        bad "the leftover receipt is dropped without re-arming the wake" \
+            "leftovers: $(find "$RUN/claimed" "$RUN/sent" -type f 2>/dev/null | tr '\n' ' ')"
+    fi
+
+    env_run thinkers stop >/dev/null 2>&1 || true
+}
+
 test_die_after_claim_recovers() {
     setup_identity
     # THINKERS_TEST_DIE_AFTER_CLAIM is fault injection added for this case: the
@@ -270,6 +358,7 @@ test_lock_is_held
 test_tokens_unique
 test_die_after_claim_recovers
 test_shim_crash_mid_send_recovers
+test_crash_after_launch_does_not_double_fire
 
 printf 'cases: pass=%d fail=%d skip=0\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]] || exit 1
