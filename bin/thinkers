@@ -899,8 +899,29 @@ _start_dispatcher() {
         # the monolith's old per-step `setsid` background timer, which never ran
         # on macOS (no setsid) so spontaneity silently died. Generic over any
         # thinker; the monolith is the only current writer.
+        # Crash recovery for claim receipts. claimed/<name> exists only between
+        # the claim and the launch of its step, so one older than
+        # THINKERS_CLAIM_STALE_SECS means the dispatcher died in that window and
+        # the send would otherwise be lost silently. Re-arm it as a due wake so
+        # the normal path fires it again: a scheduled wake is at-least-once, and
+        # a rare repeat is better than a post that never goes out.
+        _sweep_claims() {
+            local _cf _cbase _cm _cage _stale="${THINKERS_CLAIM_STALE_SECS:-30}"
+            for _cf in "$run_dir"/claimed/*; do
+                [[ -f "$_cf" ]] || continue
+                _cm=$(stat -c %Y "$_cf" 2>/dev/null || stat -f %m "$_cf" 2>/dev/null || echo 0)
+                _cage=$(( $(date +%s) - _cm ))
+                (( _cage < _stale )) && continue
+                _cbase=$(basename "$_cf")
+                mv -f "$_cf" "$run_dir/$_cbase.wake_at" 2>/dev/null || rm -f "$_cf"
+                printf '%s [dispatcher]   re-armed stale claim %s (age %ss)\n' "$(date -u +%FT%TZ)" "$_cbase" "$_cage" >&2
+            done
+            return 0
+        }
+
         _scheduled_wake_check() {
             local _wf _wname _wat _now
+            _sweep_claims
             _now=$(date +%s)
             for _wf in "$run_dir"/*.wake_at; do
                 [[ -f "$_wf" ]] || continue
@@ -918,12 +939,23 @@ _start_dispatcher() {
                 # a due wake file; the others find it gone and skip, so one
                 # wake is dispatched however many dispatchers are ticking.
                 mkdir -p "$run_dir/claimed"
-                _claim="$run_dir/claimed/$_wname.$dispatcher_token"
+                # Claim receipt: this file lives from the claim until the step
+                # is launched, so a crash in that window leaves evidence instead
+                # of swallowing the send. touch resets the clock, since mv keeps
+                # the mtime of the wake file's own write time (which can be
+                # hours old for a wake that was armed in advance).
+                _claim="$run_dir/claimed/$_wname"
                 mv "$_wf" "$_claim" 2>/dev/null || continue
-                rm -f "$_claim"
+                touch "$_claim" 2>/dev/null
+                if [[ -n "${THINKERS_TEST_DIE_AFTER_CLAIM:-}" ]]; then
+                    # Fault injection for test_dispatcher_single_owner.sh: die
+                    # between the claim and the launch on purpose.
+                    kill -KILL "${BASHPID:-$$}" 2>/dev/null || exit 1
+                fi
                 printf '%s [dispatcher]   scheduled wake -> %s (due %ss ago)\n' "$(date -u +%FT%TZ)" "$_wname" "$((_now - _wat))" >&2
                 _dispatch_step "$_wname" "$(jq -nc --arg source monolith-timer \
                     '{type:"monolith-wake", content:"wake", source:$source}')"
+                rm -f "$_claim"
             done
         }
 
