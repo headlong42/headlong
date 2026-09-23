@@ -304,8 +304,18 @@ _start_dispatcher() {
     # dispatcher instances — which would double-dispatch every step —
     # self-terminating.
     local dispatcher_token
-    dispatcher_token="$(date +%s).$$.$RANDOM"
-    printf '%s' "$dispatcher_token" > "$run_dir/dispatcher.token"
+    # Minted from 16 bytes of /dev/urandom. The old date+pid+RANDOM mint
+    # collided when two dispatchers started in the same second (pids repeat
+    # across forks), so both passed the ownership check and double-dispatched
+    # every due wake (the 2026-09-22/23 5x and 2x sends).
+    dispatcher_token="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+    [[ -n "$dispatcher_token" ]] || dispatcher_token="$(date +%s)-$$-$RANDOM-$$"
+    # Write the token atomically (temp + rename). Two starts writing the same
+    # file in the same instant could otherwise interleave their writes and
+    # leave a token neither one owns, which would make every dispatcher exit
+    # on the ownership check and leave the mind with none.
+    printf '%s' "$dispatcher_token" > "$run_dir/dispatcher.token.$$"
+    mv "$run_dir/dispatcher.token.$$" "$run_dir/dispatcher.token"
 
     # Build subscription map: thinker_name -> [traj_file, types_pattern, trigger_self]
     # We store this as lines: THINKER_NAME\tTRAJ_FILE\tTYPES_REGEX\tTRIGGER_SELF
@@ -402,6 +412,23 @@ _start_dispatcher() {
         trap '_cleanup_dispatcher' EXIT
         trap '_dispatcher_on_signal INT' INT
         trap '_dispatcher_on_signal TERM' TERM
+        # Single-owner the dispatcher role with a real lock, held on fd 4
+        # for the life of the loop and released on exit. The token check alone
+        # could not stop two same-second starts from both dispatching.
+        exec 4>"$run_dir/dispatcher.lock"
+        if command -v flock >/dev/null 2>&1; then
+            # Wait for the lock instead of bowing out. A `thinkers start` means
+            # take over: it has already written its own token, so the incumbent
+            # exits within a tick of seeing it and releases the lock. Bowing out
+            # on contention (flock -n) left NO dispatcher at all whenever a
+            # start overlapped a live one - the incumbent exits on the token
+            # mismatch and the newcomer had already quit.
+            flock -w 15 4 || {
+                printf '%s [dispatcher] lock timeout waiting for the incumbent - exiting\n' \
+                    "$(date -u +%FT%TZ)" >&2
+                exit 0
+            }
+        fi
 
         # Start tail -F for each unique traj file, tagged with traj path.
         # Track our own tail PIDs separately from the shared tail_pids file:
@@ -887,7 +914,13 @@ _start_dispatcher() {
                 _thinker_busy "$_wname" && continue
                 _count_active_steps
                 if [[ "$_active_step_count" -ge "$THINKERS_MAX_CONCURRENT" ]]; then continue; fi
-                rm -f "$_wf"
+                # Atomic claim: mv is the mutex. Exactly one dispatcher wins
+                # a due wake file; the others find it gone and skip, so one
+                # wake is dispatched however many dispatchers are ticking.
+                mkdir -p "$run_dir/claimed"
+                _claim="$run_dir/claimed/$_wname.$dispatcher_token"
+                mv "$_wf" "$_claim" 2>/dev/null || continue
+                rm -f "$_claim"
                 printf '%s [dispatcher]   scheduled wake -> %s (due %ss ago)\n' "$(date -u +%FT%TZ)" "$_wname" "$((_now - _wat))" >&2
                 _dispatch_step "$_wname" "$(jq -nc --arg source monolith-timer \
                     '{type:"monolith-wake", content:"wake", source:$source}')"
