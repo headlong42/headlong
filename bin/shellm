@@ -1577,8 +1577,10 @@ call_llm() {
 # ---------------------------------------------------------------------------
 
 extract_code() {
-    local _msg _line _code="" _disc="" _in=0 _opened=0 _closed=0 _norm _f
+    local _msg _line _code="" _disc="" _in=0 _opened=0 _closed=0 _done=0 _has=0 _pws=0
+    local _f _pre _post _norm _cr
     _f="$(printf '\140\140\140')"
+    _cr="$(printf '\r')"
     if [ "$#" -gt 0 ] && [ -n "${1-}" ]; then _msg="$1"; else _msg="$(cat)"; fi
     if type normalize_toolcall_markup >/dev/null 2>&1; then
         _norm="$(printf '%s\n' "$_msg" | normalize_toolcall_markup 2>/dev/null)"
@@ -1586,30 +1588,40 @@ extract_code() {
     else
         _norm="$(printf '%s\n' "$_msg")"
     fi
-    _norm="$(printf '%s\n' "$_norm" | sed "s/^.*$_f/$_f/")"
-    while IFS= read -r _line; do
+    while IFS= read -r _line || [ -n "$_line" ]; do
+        _line="${_line%"$_cr"}"
         case "$_line" in
-            "[served_by]"*|"[exec_s]"*|"[exit]"*|"[stdout]"*|"[stderr]"*|"X-"*) break ;;
+            "[served_by]"*|"[exec_s]"*|"[exit]"*|"[stdout]"*|"[stderr]"*|"X-"*)
+                [ "$_in" -eq 1 ] || break ;;
+        esac
+        if [ "$_done" -eq 1 ]; then
+            case "$_line" in *[![:space:]]*) _disc="$_disc$_line"$'\n' ;; esac
+            continue
+        fi
+        _has=0; _pre=""; _post=""
+        case "$_line" in
+            *"$_f"*) _has=1; _pre="${_line%%"$_f"*}"; _post="${_line#*"$_f"}" ;;
         esac
         if [ "$_in" -eq 0 ]; then
-            case "$_line" in
-                "$_f"*) _in=1; _opened=1; continue ;;
-            esac
-            case "$_line" in
-                ""|" "*) ;;
-                *) _disc="$_disc$_line
-" ;;
-            esac
+            if [ "$_has" -eq 1 ] && printf '%s\n' "$_post" | grep -Eq '^[[:space:]]*(bash|sh|shell|zsh)?[[:space:]]*(</?[A-Za-z][^<>]*>)?[[:space:]]*$'; then
+                _in=1; _opened=1; continue
+            fi
+            case "$_line" in *[![:space:]]*) _disc="$_disc$_line"$'\n' ;; esac
         else
-            case "$_line" in
-                "$_f"*) _in=0; _closed=1; continue ;;
-                *) _code="$_code$_line
-" ;;
-            esac
+            _pws=1
+            case "$_pre" in *[![:space:]]*) _pws=0 ;; esac
+            if [ "$_has" -eq 1 ] && [ "$_pws" -eq 1 ] && printf '%s\n' "$_post" | grep -Eq '^[[:space:]]*((</?[A-Za-z][^<>]*>)|(\[[a-z_]+\][^<>]*)|(X-[A-Za-z0-9-]*:[^<>]*))?[[:space:]]*((</?[A-Za-z][^<>]*>)|(\[[a-z_]+\][^<>]*)|(X-[A-Za-z0-9-]*:[^<>]*))?[[:space:]]*$'; then
+                _in=0; _closed=1; _done=1; continue
+            fi
+            _code="$_code$_line"$'\n'
         fi
     done < <(printf '%s\n' "$_norm")
     if [ "$_opened" -eq 1 ] && [ "$_closed" -eq 1 ]; then
         printf '%s' "$_code"
+        if [ -n "$_disc" ]; then
+            printf 'extract_code: text outside the command fence discarded\n' >&2
+            printf '%s' "$_disc" >&2
+        fi
         return 0
     fi
     _disc="$_disc$_code"
