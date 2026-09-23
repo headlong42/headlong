@@ -906,7 +906,7 @@ _start_dispatcher() {
         # the normal path fires it again: a scheduled wake is at-least-once, and
         # a rare repeat is better than a post that never goes out.
         _sweep_claims() {
-            local _cf _cbase _cm _cage _stale="${THINKERS_CLAIM_STALE_SECS:-30}"
+            local _cf _cbase _cm _cage _sf _sm _sage _stale="${THINKERS_CLAIM_STALE_SECS:-30}"
             for _cf in "$run_dir"/claimed/*; do
                 [[ -f "$_cf" ]] || continue
                 _cm=$(stat -c %Y "$_cf" 2>/dev/null || stat -f %m "$_cf" 2>/dev/null || echo 0)
@@ -915,6 +915,17 @@ _start_dispatcher() {
                 _cbase=$(basename "$_cf")
                 mv -f "$_cf" "$run_dir/$_cbase.wake_at" 2>/dev/null || rm -f "$_cf"
                 printf '%s [dispatcher]   re-armed stale claim %s (age %ss)\n' "$(date -u +%FT%TZ)" "$_cbase" "$_cage" >&2
+            done
+            # A sent receipt that outlived its step is a crash between the launch
+            # and the cleanup. The send already happened, so drop the evidence
+            # rather than re-arm it: re-arming here is exactly the double fire.
+            for _sf in "$run_dir"/sent/*; do
+                [[ -f "$_sf" ]] || continue
+                _sm=$(stat -c %Y "$_sf" 2>/dev/null || stat -f %m "$_sf" 2>/dev/null || echo 0)
+                _sage=$(( $(date +%s) - _sm ))
+                (( _sage < _stale )) && continue
+                rm -f "$_sf"
+                printf '%s [dispatcher]   dropped stale sent receipt %s (age %ss)\n' "$(date -u +%FT%TZ)" "$(basename "$_sf")" "$_sage" >&2
             done
             return 0
         }
@@ -952,10 +963,21 @@ _start_dispatcher() {
                     # between the claim and the launch on purpose.
                     kill -KILL "${BASHPID:-$$}" 2>/dev/null || exit 1
                 fi
+                # Sent receipt: renamed across atomically just before the launch.
+                # From here the send belongs to this dispatcher, and _sweep_claims
+                # never re-arms a sent receipt, so a crash after the launch cannot
+                # send the same wake twice. The trade is deliberate and narrow: a
+                # crash in the mv itself is still covered by the claim receipt
+                # above and stays at-least-once, while anything after the rename
+                # can at worst lose a send, never double it.
+                mkdir -p "$run_dir/sent"
+                _sent="$run_dir/sent/$_wname"
+                mv "$_claim" "$_sent" 2>/dev/null || continue
+                touch "$_sent" 2>/dev/null
                 printf '%s [dispatcher]   scheduled wake -> %s (due %ss ago)\n' "$(date -u +%FT%TZ)" "$_wname" "$((_now - _wat))" >&2
                 _dispatch_step "$_wname" "$(jq -nc --arg source monolith-timer \
                     '{type:"monolith-wake", content:"wake", source:$source}')"
-                rm -f "$_claim"
+                rm -f "$_sent"
             done
         }
 
