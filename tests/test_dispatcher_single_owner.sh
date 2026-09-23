@@ -173,10 +173,103 @@ test_tokens_unique() {
     env_run thinkers stop >/dev/null 2>&1
 }
 
+test_shim_crash_mid_send_recovers() {
+    # Hook-independent crash between the claim and the send. No
+    # THINKERS_TEST_DIE_AFTER_CLAIM here: a PATH shim for mv, the command
+    # bin/thinkers uses to move a due wake into its claim slot, performs the
+    # real move and then kills the dispatcher before it can send. The
+    # injection lives entirely in this test file, so the case reproduces the
+    # crash window without any test-only hook in bin/thinkers, and it runs
+    # against pre-receipt code where the send was swallowed with nothing left
+    # behind.
+    setup_identity
+
+    local shim="$TMP/shim" shimlog="$TMP/shim.log" crashflag="$TMP/crash.fired"
+    local realmv claims
+    realmv="$(command -v mv)"
+    mkdir -p "$shim"
+    : > "$shimlog"
+
+    cat > "$shim/mv" <<SHIM
+#!/usr/bin/env bash
+# Crash injection for test_shim_crash_mid_send_recovers: run the real mv, then
+# kill the dispatcher right after it claims a due wake and before it sends.
+printf 'mv %s\n' "\$*" >> "\$SHIM_LOG"
+"\$SHIM_REAL_MV" "\$@"; rc=\$?
+src="\$1"; dst="\${!#}"
+case "\$dst" in
+  */claimed/*)
+    case "\$src" in
+      *.wake_at)
+        printf 'crash-injected ppid=%s src=%s dst=%s\n' "\$PPID" "\$src" "\$dst" >> "\$SHIM_LOG"
+        : > "\$SHIM_CRASH_FLAG"
+        kill -9 "\$PPID" 2>/dev/null
+        ;;
+    esac
+    ;;
+esac
+exit \$rc
+SHIM
+    chmod +x "$shim/mv"
+
+    # The dispatcher runs with our shim first on PATH, so its claim mv is the
+    # injected one. The shim is not exported to the fake thinker step.
+    env_run env PATH="$shim:$PATH" \
+        SHIM_REAL_MV="$realmv" SHIM_LOG="$shimlog" SHIM_CRASH_FLAG="$crashflag" \
+        THINKERS_CLAIM_STALE_SECS=1 thinkers start >/dev/null 2>&1
+    sleep 2
+
+    printf '%s' "$(( $(now) - 1 ))" > "$RUN/napper.wake_at"
+    sleep 3
+
+    if [[ -f "$crashflag" ]]; then
+        ok "the shim crash fires between the claim and the send"
+    else
+        bad "the shim crash fires between the claim and the send" \
+            "no crash flag, shim log: $(tr '\n' ' ' < "$shimlog" 2>/dev/null)"
+    fi
+
+    if [[ "$(record_count)" -eq 0 ]]; then
+        ok "the crash swallows the send, nothing dispatches"
+    else
+        bad "the crash swallows the send, nothing dispatches" "record count $(record_count)"
+    fi
+
+    claims=$(find "$RUN/claimed" -type f 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "$claims" -eq 1 ]]; then
+        ok "the crash leaves the claim receipt behind as evidence"
+    else
+        bad "the crash leaves the claim receipt behind as evidence" "claims=$claims"
+    fi
+
+    # Recovery: a fresh dispatcher sweeps the orphaned claim and fires it.
+    env_run thinkers stop >/dev/null 2>&1 || true
+    env_run env THINKERS_CLAIM_STALE_SECS=1 thinkers start >/dev/null 2>&1
+    sleep 5
+
+    if [[ "$(record_count)" -eq 1 ]]; then
+        ok "the next dispatcher fires the recovered send exactly once"
+    else
+        bad "the next dispatcher fires the recovered send exactly once" \
+            "record count $(record_count): $(tr '\n' ' ' < "$TMP/id/record" 2>/dev/null)"
+    fi
+
+    claims=$(find "$RUN/claimed" -type f 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "$claims" -eq 0 && ! -f "$RUN/napper.wake_at" ]]; then
+        ok "the recovered send leaves no claim receipt and no wake file"
+    else
+        bad "the recovered send leaves no claim receipt and no wake file" \
+            "claims=$claims wake=$([[ -f "$RUN/napper.wake_at" ]] && echo yes || echo no)"
+    fi
+
+    env_run thinkers stop >/dev/null 2>&1
+}
+
 test_many_starts_one_dispatch
 test_lock_is_held
 test_tokens_unique
 test_die_after_claim_recovers
+test_shim_crash_mid_send_recovers
 
 printf 'cases: pass=%d fail=%d skip=0\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]] || exit 1
