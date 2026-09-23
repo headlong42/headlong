@@ -17,6 +17,7 @@ PATH="$REPO/bin:$PATH"
 
 pass=0
 fail=0
+want() { [[ -n "${TEST_FILTER:-}" && "$1" != *"$TEST_FILTER"* ]] && return 0; "$1"; }
 ok()  { pass=$((pass+1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail+1)); printf 'FAIL %s%s\n' "$1" "${2:+ - $2}"; }
 
@@ -189,6 +190,31 @@ test_die_after_claim_recovers() {
     env_run thinkers stop >/dev/null 2>&1
 }
 
+test_stale_claim_keeps_freshest_wake() {
+    setup_identity
+    env_run env THINKERS_CLAIM_STALE_SECS=1 thinkers start >/dev/null 2>&1
+    sleep 2
+    mkdir -p "$RUN/claimed"
+    # A claim is an mv of the wake file, so its content is that wake's own due
+    # time, and a crash leaves it behind mtime-old. Plant that leftover for a due
+    # time far out, plus a fresher wake_at for the same name due sooner.
+    printf '%s' "$(( $(now) + 30 ))" > "$RUN/claimed/napper"
+    touch -d '2 minutes ago' "$RUN/claimed/napper" 2>/dev/null || touch -t 202001010000 "$RUN/claimed/napper"
+    printf '%s' "$(( $(now) + 2 ))" > "$RUN/napper.wake_at"
+    sleep 6
+    if [[ "$(record_count)" -eq 1 ]]; then
+        ok "a stale claim never clobbers a fresher wake_at, the nearer occurrence fires"
+    else
+        bad "a stale claim never clobbers a fresher wake_at, the nearer occurrence fires"             "record count $(record_count), wake_at=$(cat "$RUN/napper.wake_at" 2>/dev/null || echo gone)"
+    fi
+    if [[ ! -f "$RUN/claimed/napper" ]]; then
+        ok "the colliding claim is consumed exactly once"
+    else
+        bad "the colliding claim is consumed exactly once"
+    fi
+    env_run thinkers stop >/dev/null 2>&1
+}
+
 test_many_starts_one_dispatch() {
     setup_identity
     local n=4 i
@@ -353,12 +379,13 @@ SHIM
     env_run thinkers stop >/dev/null 2>&1
 }
 
-test_many_starts_one_dispatch
-test_lock_is_held
-test_tokens_unique
-test_die_after_claim_recovers
-test_shim_crash_mid_send_recovers
-test_crash_after_launch_does_not_double_fire
+want test_many_starts_one_dispatch
+want test_lock_is_held
+want test_tokens_unique
+want test_die_after_claim_recovers
+want test_shim_crash_mid_send_recovers
+want test_crash_after_launch_does_not_double_fire
+want test_stale_claim_keeps_freshest_wake
 
 printf 'cases: pass=%d fail=%d skip=0\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]] || exit 1

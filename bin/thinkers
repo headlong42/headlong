@@ -906,15 +906,39 @@ _start_dispatcher() {
         # the normal path fires it again: a scheduled wake is at-least-once, and
         # a rare repeat is better than a post that never goes out.
         _sweep_claims() {
-            local _cf _cbase _cm _cage _sf _sm _sage _stale="${THINKERS_CLAIM_STALE_SECS:-30}"
+            local _cf _cbase _cm _cage _cwa _ct _wt _sf _sm _sage _stale="${THINKERS_CLAIM_STALE_SECS:-30}"
             for _cf in "$run_dir"/claimed/*; do
                 [[ -f "$_cf" ]] || continue
                 _cm=$(stat -c %Y "$_cf" 2>/dev/null || stat -f %m "$_cf" 2>/dev/null || echo 0)
                 _cage=$(( $(date +%s) - _cm ))
                 (( _cage < _stale )) && continue
                 _cbase=$(basename "$_cf")
-                mv -f "$_cf" "$run_dir/$_cbase.wake_at" 2>/dev/null || rm -f "$_cf"
-                printf '%s [dispatcher]   re-armed stale claim %s (age %ss)\n' "$(date -u +%FT%TZ)" "$_cbase" "$_cage" >&2
+                _cwa="$run_dir/$_cbase.wake_at"
+                # A stale claim and a wake_at for the same name are two
+                # occurrences of one schedule. Keep the earlier due time: mv -f
+                # here used to resurrect the claim's own time over whatever
+                # fresher wake was written while the claim sat stale, firing the
+                # old occurrence out of order and destroying the new one. The
+                # earlier occurrence fires now and the step re-arms the
+                # recurrence on its way out.
+                if [[ -f "$_cwa" ]]; then
+                    _ct=$(cat "$_cf" 2>/dev/null) || _ct=""
+                    _wt=$(cat "$_cwa" 2>/dev/null) || _wt=""
+                    if [[ "$_ct" =~ ^[0-9]+$ ]]; then
+                        if [[ "$_wt" =~ ^[0-9]+$ && "$_wt" -lt "$_ct" ]]; then
+                            printf '%s [dispatcher]   stale claim %s merged into fresher wake_at (kept earlier due %s)\n' "$(date -u +%FT%TZ)" "$_cbase" "$_wt" >&2
+                        else
+                            printf '%s' "$_ct" > "$_cwa" 2>/dev/null || true
+                            printf '%s [dispatcher]   re-armed stale claim %s (age %ss)\n' "$(date -u +%FT%TZ)" "$_cbase" "$_cage" >&2
+                        fi
+                    else
+                        printf '%s [dispatcher]   dropped stale claim %s (unreadable due time), left the existing wake_at alone\n' "$(date -u +%FT%TZ)" "$_cbase" >&2
+                    fi
+                    rm -f "$_cf"
+                else
+                    mv -f "$_cf" "$_cwa" 2>/dev/null || rm -f "$_cf"
+                    printf '%s [dispatcher]   re-armed stale claim %s (age %ss)\n' "$(date -u +%FT%TZ)" "$_cbase" "$_cage" >&2
+                fi
             done
             # A sent receipt that outlived its step is a crash between the launch
             # and the cleanup. The send already happened, so drop the evidence
