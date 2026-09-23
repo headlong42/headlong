@@ -1577,126 +1577,49 @@ call_llm() {
 # ---------------------------------------------------------------------------
 
 extract_code() {
-    local response="$1"
-
-    # Extract the FIRST fenced code block (```bash, ```sh, or bare ```).
-    # Heredoc-aware: lines like ``` inside an open heredoc do NOT close the
-    # outer code fence.  We track heredoc opens (<<[-]DELIM) and closes
-    # (delimiter alone on a line) so nested markdown fences pass through.
-    # If extra fenced blocks follow the first, awk writes a "TRUNCATED" line
-    # to stderr so we can prepend a notice that the model can see next turn.
-    local truncation_file
-    truncation_file=$(mktemp)
-    local code
-    code=$(printf '%s\n' "$response" | awk -v sq="'" '
-        # ── try_open_heredoc: inspect a line for <<[-]DELIM and push delimiter
-        function try_open_heredoc(line,    rest, delim) {
-            if (!match(line, /<<-?/)) return
-            rest = substr(line, RSTART + RLENGTH)
-            sub(/^[[:space:]]*/, "", rest)
-            if (substr(rest, 1, 1) == "\"") {
-                # <<"DELIM"
-                sub(/^"/, "", rest)
-                if (match(rest, /^[^"]+/)) {
-                    hd_stack[++hd_top] = substr(rest, 1, RLENGTH)
-                }
-            } else if (substr(rest, 1, 1) == sq) {
-                # <<'DELIM' — use string pattern since sq cant go in //
-                sub("^" sq, "", rest)
-                if (match(rest, "^[^" sq "]+")) {
-                    hd_stack[++hd_top] = substr(rest, 1, RLENGTH)
-                }
-            } else if (substr(rest, 1, 1) == "\\") {
-                # <<\DELIM
-                sub(/^\\/, "", rest)
-                if (match(rest, /^[A-Za-z_][A-Za-z_0-9]*/)) {
-                    hd_stack[++hd_top] = substr(rest, 1, RLENGTH)
-                }
-            } else {
-                # <<DELIM (unquoted)
-                if (match(rest, /^[A-Za-z_][A-Za-z_0-9]*/)) {
-                    hd_stack[++hd_top] = substr(rest, 1, RLENGTH)
-                }
-            }
-        }
-
-        BEGIN { in_block = 0; hd_top = 0; first_block_closed = 0 }
-
-        # After first block closed: look for another opening fence. A tagged
-        # ```bash/```sh fence may be appended to the end of a prose line (see
-        # opener note below); a bare ``` only counts at line start.
-        first_block_closed && !in_block {
-            if ($0 ~ /```(bash|shell|sh)[[:space:]]*$/ || $0 ~ /^```/) {
-                print "TRUNCATED" > "/dev/stderr"
-                exit
-            }
-            next
-        }
-
-        # Before the opening fence — look for ```bash, ```sh, or bare ```.
-        # ```bash/```sh may be appended to the END of a prose line: some models
-        # (e.g. grok) write "…do this now.```bash" instead of putting the fence
-        # on its own line. Matching only /^```bash/ misses that, extract_code
-        # returns empty, and the fallback below then runs the WHOLE prose
-        # response as bash ("do: command not found"). So match tagged fences
-        # at END of line too — but ONLY at end of line: matching anywhere
-        # turns a prose line that merely mentions ```bash (a model quoting
-        # fence syntax) into an opener, collecting the prose after it as
-        # code. A bare ``` still only opens at line start (mid-line bare ```
-        # is ambiguous with a closing fence). The code always begins on the
-        # next line, so discarding the rest of the fence line is correct.
-        !in_block {
-            if ($0 ~ /```(bash|shell|sh)[[:space:]]*$/ || $0 ~ /^```/) { in_block = 1 }
-            next
-        }
-
-        # Inside the code block
-        in_block {
-            # Check for heredoc close (delimiter alone on its own line)
-            if (hd_top > 0) {
-                stripped = $0
-                gsub(/^[[:space:]]+/, "", stripped)
-                gsub(/[[:space:]]+$/, "", stripped)
-                if (stripped == hd_stack[hd_top]) {
-                    hd_top--
-                }
-            }
-
-            # A bare ``` only closes the fence when no heredoc is open
-            if ($0 ~ /^```[[:space:]]*$/ && hd_top == 0) {
-                in_block = 0
-                first_block_closed = 1
-                next
-            }
-
-            # Track heredoc opens inside the code we are collecting
-            try_open_heredoc($0)
-
-            print
-        }
-    ' 2>"$truncation_file")
-
-    local truncation_signal
-    truncation_signal=$(cat "$truncation_file" 2>/dev/null || true)
-    rm -f "$truncation_file"
-
-    # If no fenced blocks at all, use the whole response as code.
-    # Strip [cmd]/[thought] markers that the model may emit instead of fences.
-    if [[ -z "$code" ]]; then
-        code=$(printf '%s\n' "$response" | sed '/^[[:space:]]*\[cmd\][[:space:]]*$/d; /^[[:space:]]*\[thought\]/d')
+    local _msg _line _code="" _disc="" _in=0 _opened=0 _closed=0 _norm _f
+    _f="$(printf '\140\140\140')"
+    if [ "$#" -gt 0 ] && [ -n "${1-}" ]; then _msg="$1"; else _msg="$(cat)"; fi
+    if type normalize_toolcall_markup >/dev/null 2>&1; then
+        _norm="$(printf '%s\n' "$_msg" | normalize_toolcall_markup 2>/dev/null)"
+        [ -n "$_norm" ] || _norm="$(printf '%s\n' "$_msg")"
+    else
+        _norm="$(printf '%s\n' "$_msg")"
     fi
-
-    # If the model emitted extra blocks past the first, prepend a notice
-    # echoed to stderr.  Stderr is captured and shown back to the model on
-    # its next turn, so it learns its trailing blocks were dropped.  Prepend
-    # rather than append so the notice fires even if the user code exits
-    # early.
-    if [[ "$truncation_signal" == *TRUNCATED* ]]; then
-        code=$'echo "[rest of model response truncated after first code block]" >&2\n'"$code"
+    _norm="$(printf '%s\n' "$_norm" | sed "s/^.*$_f/$_f/")"
+    while IFS= read -r _line; do
+        case "$_line" in
+            "[served_by]"*|"[exec_s]"*|"[exit]"*|"[stdout]"*|"[stderr]"*|"X-"*) break ;;
+        esac
+        if [ "$_in" -eq 0 ]; then
+            case "$_line" in
+                "$_f"*) _in=1; _opened=1; continue ;;
+            esac
+            case "$_line" in
+                ""|" "*) ;;
+                *) _disc="$_disc$_line
+" ;;
+            esac
+        else
+            case "$_line" in
+                "$_f"*) _in=0; _closed=1; continue ;;
+                *) _code="$_code$_line
+" ;;
+            esac
+        fi
+    done < <(printf '%s\n' "$_norm")
+    if [ "$_opened" -eq 1 ] && [ "$_closed" -eq 1 ]; then
+        printf '%s' "$_code"
+        return 0
     fi
-
-    echo "$code"
+    _disc="$_disc$_code"
+    if [ -n "$_disc" ]; then
+        printf 'extract_code: no complete fence pair, reply text discarded\n' >&2
+        printf '%s' "$_disc" >&2
+    fi
+    return 0
 }
+
 
 # ---------------------------------------------------------------------------
 # System prompt
