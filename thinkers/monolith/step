@@ -231,7 +231,7 @@ if command -v chat >/dev/null 2>&1; then
         | (.[] | "- PENDING REQUEST from \(.person // "someone"): \(.request)"
             + " (pending for \(.age_s | age_text)"
             + (if .age_s > $overdue then ", OVERDUE: deliver what you have, or that it cannot be done, this wake" else "" end)
-            + "). The responder already told them you would get back to them, so they are waiting. Strongly prefer doing this work now (act), timer wake or not, over inner-life work; then deliver the result with exactly: chat reply --follow-up --reply-to \(.trigger_step) \(.person // "<their-name>") \"<result>\"  — and append an observation with --field resolves=\(.trigger_step) so this request stops showing here. If you have a good reason not to this wake, append a thought saying why and what would unblock it."),
+            + "). The responder already told them you would get back to them, so they are waiting. Strongly prefer doing this work now (act), timer wake or not, over inner-life work; then deliver the result with: chat reply --follow-up --reply-to \(.trigger_step) \(.person // "<their-name>") <<\"MSG\" (the message on stdin as a quoted heredoc, written as described under How to write a message to a person; never a double-quoted argument, backticks in it vanish) — and append an observation with --field resolves=\(.trigger_step) so this request stops showing here. If you have a good reason not to this wake, append a thought saying why and what would unblock it."),
           (if $n > $max then "- \($n - $max) more pending requests: run `chat pending` to see them all." else empty end)' 2>/dev/null) || pending_req=""
 fi
 [[ -n "$pending_req" ]] && hints="${hints}${pending_req}
@@ -264,6 +264,12 @@ fi
 # (before the placeholder below) and the last three stream steps.
 related_query="$hints $(printf '%s\n' "$recent_context" | tail -n 3 | jq -r '.content // ""' 2>/dev/null | cut -c1-600 | tr '\n' ' ')"
 [[ -z "$hints" ]] && hints="- (no special signals — pick what best serves the mind right now)"
+# Clock and scheduled-goal windows go first, after the placeholder test and
+# the related-memories query: they are present on every wake and are not the
+# wake's topic (design/scheduled_goals.md).
+_sched=$(_prompt_section schedule _schedule_signals "$MEM_DIR") || _sched=""
+[[ -n "$_sched" ]] && hints="$_sched
+$hints"
 
 prompt_file="$SCRIPT_DIR/prompt.md"
 [[ -f "$prompt_file" ]] || { printf 'monolith/step: error: prompt.md not found at %s\n' "$prompt_file" >&2; exit 1; }
@@ -371,6 +377,27 @@ _last_thought_id() {
             | .step_id // empty' 2>/dev/null \
         | tail -n 1
 }
+_last_diagnostic_id() {
+    # Last FAILING shell-output step_id (exit != 0) for a run_id, from the
+    # cached post-run probe; falls back to the last non-empty shell-output
+    # when no command actually failed (inference-layer deaths leave no
+    # failed command — the fallback is provably never worse than the
+    # last-non-empty pick). Gives a failed no-durable-step run a rerunnable
+    # diagnostic pointer (see design/monolith_run_health.md B2 + the
+    # failure-path certification gap). Empty when the run never ran a shell.
+    local _rid="$1"
+    printf '%s\n' "$_probe_tail" \
+        | jq -Rnr --arg rid "$_rid" '[ inputs | fromjson? // empty
+            | select(.type == "shell-output")
+            | select(.run_id == $rid)
+            | select((.stdout != null and (.stdout|length) > 0)
+                     or (.stderr != null and (.stderr|length) > 0))
+            | select(.step_id != null)
+            | {sid: .step_id, exit: (.exit // null)} ]
+          | (map(select(.exit != null and .exit != 0)) | last | .sid)
+            // (last | .sid)
+            // empty' 2>/dev/null
+}
 before_visible=""
 before_thought=""
 if traj exists 2>/dev/null; then
@@ -402,23 +429,67 @@ esac
 # design/monolith_run_health.md.
 prompt_file_tmp=$(mktemp "$state_dir/monolith_prompt.XXXXXX")
 printf '%s' "$route_prompt" > "$prompt_file_tmp"
-# shellm's stderr still streams to the journal, and a copy lands in a temp
-# file so a run that dies with no durable step can say why in its error step
-# (19 "run failed (rc=1)" steps on 2026-09-07/08 carried no reason at all).
-# fd 3 carries shellm's stdout past the tee; PIPESTATUS keeps shellm's rc.
+# Both of shellm's streams go to FILES, never to a pipe this step reads.
+# stdout is the run's response; stderr is copied so a run that dies with no
+# durable step can say why in its error step (19 "run failed (rc=1)" steps
+# on 2026-09-07/08 carried no reason at all), and a tail -F streams it live
+# to the step log while the run works.
+#
+# Why files: a pipe only reaches end-of-file once EVERY holder of its write
+# end has closed it, and anything the run backgrounds (`nohup cmd &`)
+# inherits the run's open fds. 2026-09-14: the mind started two web servers
+# inside a wake; they held the old `$( ... )` capture pipe, the run finished
+# and wrote its final step, and this step sat in read() for six hours. Its
+# EXIT trap never armed the next wake and the mind fell silent. With files
+# the step waits only for its direct child; leaked processes are reported
+# below and the dispatcher's stuck-step guard is the backstop.
+run_out_tmp=$(mktemp "$state_dir/monolith_run_out.XXXXXX")
 run_err_tmp=$(mktemp "$state_dir/monolith_run_err.XXXXXX")
+tail -n +1 -F "$run_err_tmp" >&2 2>/dev/null &
+run_err_tail_pid=$!
 run_rc=0
-run_response=$( { SHELLM_NO_BANNER=1 \
+SHELLM_NO_BANNER=1 \
     SHELLM_TRIGGER_STEP_ID="$trigger_step_id" \
     SHELLM_WAKE="$wake_reason" \
     SHELLM_RUN_ID_OUT="$run_id_file" \
     shellm --model "$THINK_MODEL" --traj "$TRAJ_ID" --context-scope run \
     "${shellm_flags[@]}" \
-    --prompt-file "$prompt_file_tmp" 2>&1 >&3 | tee "$run_err_tmp" >&2
-    exit "${PIPESTATUS[0]}"; } 3>&1 ) || run_rc=$?
+    --prompt-file "$prompt_file_tmp" >"$run_out_tmp" 2>"$run_err_tmp" || run_rc=$?
 rm -f "$prompt_file_tmp"
+# tail -F polls once a second; give it one tick to flush the last lines.
+sleep 1
+kill "$run_err_tail_pid" 2>/dev/null || true
+wait "$run_err_tail_pid" 2>/dev/null || true
+run_response=$(cat "$run_out_tmp" 2>/dev/null) || run_response=""
+rm -f "$run_out_tmp"
 run_err_tail=$(grep -v '^[[:space:]]*$' "$run_err_tmp" 2>/dev/null | tail -n 3 | cut -c1-300 | tr '\n' ' ' | sed 's/ $//') || run_err_tail=""
 rm -f "$run_err_tmp"
+
+# Anything still alive in this step's session is a process the run left
+# behind (setsid gives each step its own session on Linux; on macOS the
+# session is shared with the dispatcher, so only report when it is ours). The
+# session, not the process group: shellm runs each execution tree in a group
+# of its own, so what a run backgrounds is no longer in this step's group. Not
+# killed here: a backgrounded sub-run can be deliberate. Reported so the log
+# says what outlived the wake, which is what took six hours to find above.
+if [[ "$(ps -o sid= -p $$ 2>/dev/null | tr -d ' ')" == "$$" ]]; then
+    # pgrep runs inside a subshell of this session, so its own pipeline shows
+    # up in the list; those pids are gone once the substitution returns,
+    # and the kill -0 below drops them. Only what is still alive counts.
+    run_leftovers=""
+    for run_leftover in $(pgrep -s $$ 2>/dev/null || true); do
+        [[ "$run_leftover" == "$$" ]] && continue
+        kill -0 "$run_leftover" 2>/dev/null || continue
+        run_leftovers="${run_leftovers}${run_leftovers:+ }${run_leftover}"
+    done
+    if [[ -n "$run_leftovers" ]]; then
+        printf '  WARNING: %s process(es) the run backgrounded are still alive after it exited:\n' \
+            "$(printf '%s\n' $run_leftovers | wc -l | tr -d ' ')" >&2
+        for run_leftover in $run_leftovers; do
+            ps -o pid=,etime=,args= -p "$run_leftover" 2>/dev/null | cut -c1-160 | sed 's/^/    /' >&2 || true
+        done
+    fi
+fi
 
 after_visible=""
 after_thought=""
@@ -445,6 +516,19 @@ run_errored=0
 [[ "$run_rc" -ne 0 ]] && run_errored=1
 if [[ "$did_work" -eq 0 ]]; then
     idle_run_id=$(cat "$run_id_file" 2>/dev/null) || idle_run_id=""
+    # Failure-path certification: the run's shell-output steps (the real
+    # diagnostic) are already in the trajectory, but this bare error step
+    # never references them — a stranger sees "no durable step" and cannot
+    # rerun the diagnostic. The outliving layer holds run_id + the post-run
+    # probe at write time, and the run just exited, so its shell-output
+    # steps are among the most-recent. Point the error step at the failing
+    # command (last exit != 0; else last non-empty — inference-layer deaths
+    # leave no failed command) via a `diagnostic_step` field. Absent when
+    # the run never ran a shell (nothing to reference — correct).
+    diagnostic_step=""
+    if [[ "$run_errored" -eq 1 && -n "$idle_run_id" ]]; then
+        diagnostic_step=$(_last_diagnostic_id "$idle_run_id") || diagnostic_step=""
+    fi
     if [[ "$run_errored" -eq 1 ]]; then
         printf '  run FAILED (rc=%s) — recording error\n' "$run_rc" >&2
         jq -nc \
@@ -452,11 +536,13 @@ if [[ "$did_work" -eq 0 ]]; then
             --arg trigger "$trigger_step_id" \
             --arg run_id "$idle_run_id" \
             --arg detail "$run_err_tail" \
+            --arg diag "$diagnostic_step" \
             --argjson rc "$run_rc" \
             '{type:"error", content:("monolith run failed (rc=\($rc)) with no durable step" + (if $detail == "" then "" else ": " + $detail end)), source:$source, reason:"run-failed", rc:$rc}
              + (if $detail == "" then {} else {stderr_tail: $detail} end)
              + (if $trigger == "" then {} else {trigger_step: $trigger} end)
-             + (if $run_id == "" then {} else {run_id: $run_id} end)' \
+             + (if $run_id == "" then {} else {run_id: $run_id} end)
+             + (if $diag == "" then {} else {diagnostic_step: $diag} end)' \
             | traj append >/dev/null || true
     else
         printf '  run produced no durable step (rc=0) — marking idle; timer keeps the loop alive\n' >&2

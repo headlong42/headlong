@@ -32,4 +32,18 @@ esac
     exit 2
 }
 
+# The silence check (deploy/thinkers-silence-alert.sh) rides along with the
+# thinkers unit: a start or restart also arms its timer, so every path that
+# brings a mind up — bootstrap, dash, operator — gets the "gone quiet"
+# alert without a separate step. Best effort: a box without the timer unit
+# (not yet deployed) still starts its mind. A stop leaves the timer armed;
+# the check exits quietly while the dispatcher is down.
+case "$action" in
+    start|restart)
+        if [[ -f /etc/systemd/system/headlong-thinkers-silence@.timer ]]; then
+            /usr/bin/systemctl enable --now "headlong-thinkers-silence@${ident}.timer" >/dev/null 2>&1 || true
+        fi
+        ;;
+esac
+
 exec /usr/bin/systemctl "$action" "headlong-thinkers@${ident}.service"

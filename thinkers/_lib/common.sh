@@ -133,8 +133,17 @@ _runtime_line() {
             | sort -n | tail -1)
         [[ -n "$newest" ]] && sync_t=$(_epoch_utc "$newest")
     fi
-    printf 'Runtime: headlong %s (%s)%s%s. A fact about your own runtime that you verified under this commit holds until this line changes.\n' \
-        "$sha" "$subject" "${head_t:+, checked out $head_t}" "${sync_t:+; your thinkers synced $sync_t}"
+    # Boundary sentence, only when it is true from where this wake runs: under
+    # the thinkers sandbox (deploy/thinkers-sandbox.sh) the checkout is a
+    # read-only mount and the identity directory is the writable island. Said
+    # every wake so the mind never has to rediscover it from an EROFS error
+    # (a Slack message saying so leaves the recent stream in fifteen minutes).
+    local boundary=""
+    if [[ ! -w "$root/bin" ]]; then
+        boundary=" The checkout at $root is read-only inside a wake: bin, thinkers, tools, deploy and .env cannot be edited in place, and no identity can be created beside yours; runtime changes go through your own clone and a pull request. Your identity directory${IDENTITY_DIR:+ ($IDENTITY_DIR)} is yours to write."
+    fi
+    printf 'Runtime: headlong %s (%s)%s%s. A fact about your own runtime that you verified under this commit holds until this line changes.%s\n' \
+        "$sha" "$subject" "${head_t:+, checked out $head_t}" "${sync_t:+; your thinkers synced $sync_t}" "$boundary"
     return 0
 }
 
@@ -213,10 +222,55 @@ _outbound_section() {
                      elif .state == "skipped" then "not sent (\(.reason // "skipped"))"
                      elif .state == "pending" then (if .age_s > 300 then "PENDING \(.age_s | age_text), no delivery confirmation yet (the bridge may be down)" else "pending" end)
                      else "sent (this transport does not confirm delivery)" end)
+                  + (if .key then " [\(.key)]" else "" end)
                   + " \"" + ((.filename // .content // "") | gsub("\n"; " ") | if length > 70 then .[0:70] + "…" else . end) + "\"";
         "Sent in the last \($since) (newest first; `chat sent` shows more; a FAILED line means the message never reached anyone, fix the address and send again; do not send again anything listed as delivered or pending):",
         (.[:$max][] | line),
         (if length > $max then "- and \(length - $max) more: `chat sent --since \($since)`" else empty end)'
+    return 0
+}
+
+# Clock line plus one routing signal per scheduled goal (design/scheduled_goals.md).
+# A goal memory with `schedule: 09:00 17:00` (local times, `tz:` zone, default
+# HEADLONG_TZ, default UTC) has one window per time per day. Whether a window
+# is due, done or still ahead is worked out here, not by the model: on
+# 2026-09-18 Audel, with no clock in its prompt, posted "Friday 9am PT" on
+# Thursday evening, five times. A window is done when the sent ledger holds
+# its key (`chat send --key`), due from its time until SCHEDULE_GRACE_MIN
+# later, and only the latest open window is ever due, so an outage costs one
+# post, not one per lost window. Local HH:MM strings and minutes of the day
+# only: no date parsing, so GNU and BSD date both work.
+_fm() { awk -v k="$2: " 'NR==1 && /^---$/{f=1; next} f && /^---$/{exit} f && index($0, k)==1{print substr($0, length(k)+1)}' "$1"; }
+_schedule_signals() {
+    local mem_dir="${1:-$MEM_DIR}" tz="${HEADLONG_TZ:-UTC}" grace="${SCHEDULE_GRACE_MIN:-360}"
+    local f sched gtz until id title day now now_m zone sent t t_m key at due next said
+    printf -- '- Now: %s (%s).\n' "$(TZ="$tz" date +'%A %Y-%m-%d %H:%M %Z')" "$(date -u +'%Y-%m-%d %H:%MZ')"
+    [[ -d "$mem_dir" ]] || return 0
+    sent=$(chat sent --since 2d -n 500 --json 2>/dev/null | jq -r '.[] | select(.key != null and .state != "failed" and .state != "skipped") | "\(.key) \(.ts[11:16])Z"' 2>/dev/null) || sent=""
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        sched=$(_fm "$f" schedule); until=$(_fm "$f" until)
+        if [[ -z "$sched" || ( -n "$until" && "$until" < "$(date -u +%Y-%m-%d)" ) ]]; then continue; fi
+        gtz=$(_fm "$f" tz); gtz="${gtz:-$tz}"; id=$(_fm "$f" id); title=$(_fm "$f" summary | cut -c1-60)
+        day=$(TZ="$gtz" date +%Y-%m-%d); now=$(TZ="$gtz" date +%H:%M); zone=$(TZ="$gtz" date +%Z)
+        now_m=$(( 10#${now%:*} * 60 + 10#${now#*:} )); due=""; next=""; said=""
+        for t in $sched; do
+            t_m=$(( 10#${t%:*} * 60 + 10#${t#*:} )); key="$id/$day-${t/:/}"
+            at=$(printf '%s\n' "$sent" | awk -v k="$key" '$1==k{v=$2} END{print v}')
+            if (( t_m > now_m )); then
+                if [[ -z "$next" ]]; then next="$t $zone, in $(( (t_m - now_m) / 60 ))h$(( (t_m - now_m) % 60 ))m"; fi
+            elif [[ -n "$at" ]]; then said="${said}the $t window was sent at $at; "; due=""
+            elif (( now_m - t_m <= grace )); then due="$t $key"
+            else said="${said}the $t window was missed, let it go; "; fi
+        done
+        if [[ -n "$due" ]]; then
+            printf -- '- DUE NOW: "%s", the %s %s window of %s. Send it once, this wake, with: chat send --to <name> --key %s <<"MSG" (the message on stdin as a quoted heredoc). The key marks this window done; a second send with it is refused.\n' \
+                "$title" "${due%% *}" "$zone" "$day" "${due#* }"
+        else
+            printf -- '- Scheduled "%s": %snext window %s. Nothing to send for this goal before then.\n' \
+                "$title" "$said" "${next:-tomorrow at ${sched%% *} $zone}"
+        fi
+    done < <(grep -l '^schedule:' "$mem_dir"/*.md 2>/dev/null)
     return 0
 }
 
@@ -472,8 +526,11 @@ _responder_scan() {
 #     reads as elapsed time without eating the whole window.
 #   - `error` steps (a run that died with no durable step) are IN, collapsed
 #     the same way, so the mind can see its own failed runs.
-# The window is the last N kept steps BEFORE collapsing, so N still bounds the
-# raw steps considered; the output is at most N lines and usually fewer.
+# The window is the last N lines AFTER collapsing. It used to be cut first, so
+# 20 idle wakes filled the window and collapsed into one "idle x20" line: on
+# 2026-09-18 that was the whole stream on three of the four wakes that re-sent
+# the papers post, 7 to 50 minutes after the send they could no longer see.
+# The raw input is still bounded by _root_traj_raw_tail.
 _RECENT_STREAM_COLLAPSE_JQ='
   def secs: ((. // "")[0:19] + "Z") | try fromdateiso8601 catch null;
   def dur($a; $b):
@@ -560,8 +617,8 @@ _recent_stream() {
             | with_entries(select(.key | IN("type", "content", "source", "ts", "from", "to", "run_id", "step_id", "request", "person", "resolves", "trigger_step", "reply_to", "follow_up", "decision", "deferred", "rc", "details", "status", "reason")))' \
         2>/dev/null \
         | jq -cs "$_RECENT_STREAM_PAIR_JQ" 2>/dev/null \
-        | tail -n "$n" \
         | jq -cs "$_RECENT_STREAM_COLLAPSE_JQ" 2>/dev/null \
+        | tail -n "$n" \
         | jq -c '.ts |= (tostring | .[0:16])
             | .step_id |= (tostring | .[0:8])
             | if .run_id then .run_id |= (tostring | .[0:8]) else . end' 2>/dev/null

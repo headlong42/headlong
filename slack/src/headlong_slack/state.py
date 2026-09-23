@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from pathlib import Path
 
 ACTIVE_THREAD_TTL = 7 * 24 * 3600
@@ -83,3 +83,66 @@ class ActiveThreads:
         tmp = self._path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self._threads))
         tmp.replace(self._path)
+
+
+class PeerGuard:
+    """Bounds bot-to-bot traffic so two personas cannot talk forever.
+
+    Two Headlong personas in one thread each answer every message the
+    other posts. Without a bound that is an infinite loop billed to two
+    LLM keys. Two limits, both counted on the messages this bridge
+    forwards from peers:
+
+    - per thread, at most `max_turns` peer messages in a row with no person
+      speaking in the thread; a human message resets the count.
+    - per hour, at most `hourly_cap` peer messages across all threads.
+
+    In-memory only: a bridge restart resets the counts, and the hourly cap
+    bounds what a restart loop could let through.
+    """
+
+    def __init__(self, max_turns: int, hourly_cap: int):
+        self.max_turns = max_turns
+        self.hourly_cap = hourly_cap
+        self._runs: dict[str, int] = {}
+        self._recent: deque[float] = deque()
+        self._blocked: set[str] = set()
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _key(channel: str, thread_ts: str | None) -> str:
+        return f"{channel}:{thread_ts or ''}"
+
+    def human_spoke(self, channel: str, thread_ts: str | None) -> None:
+        """A person posted in this thread: peers may take turns again."""
+        key = self._key(channel, thread_ts)
+        with self._lock:
+            self._runs.pop(key, None)
+            self._blocked.discard(key)
+
+    def allow(self, channel: str, thread_ts: str | None) -> tuple[bool, str]:
+        """Record one forwarded peer message, or refuse it with a reason.
+
+        The reason is empty when allowed, and empty on a repeat refusal
+        for the same thread so the caller logs each block once.
+        """
+        key = self._key(channel, thread_ts)
+        now = time.time()
+        with self._lock:
+            while self._recent and self._recent[0] < now - 3600:
+                self._recent.popleft()
+            reason = ""
+            if len(self._recent) >= self.hourly_cap:
+                reason = f"hourly cap of {self.hourly_cap} peer messages reached"
+            elif self._runs.get(key, 0) >= self.max_turns:
+                reason = (
+                    f"{self.max_turns} peer messages in a row without a person; "
+                    "waiting for someone to speak in the thread"
+                )
+            if reason:
+                first = key not in self._blocked
+                self._blocked.add(key)
+                return False, (reason if first else "")
+            self._runs[key] = self._runs.get(key, 0) + 1
+            self._recent.append(now)
+            return True, ""

@@ -49,6 +49,30 @@ variable "subdomain" {
   default     = "agents"
 }
 
+variable "dash_subdomain" {
+  description = "Hostname label for the dash (dash_subdomain.domain). Defaults to subdomain. Split out so a persona's public name can change without renaming the AWS resources (SNS topic, alarms, lambda, instance) that subdomain also names — renaming those replaces them."
+  type        = string
+  default     = ""
+}
+
+# Extra hostnames served by the same box and tunnel beside the primary ones,
+# each with its own DNS record (in the zone given as the value) and its own
+# Access app on the same allowlist. For a persona that renamed its public
+# hostnames and keeps the old ones alive: a phone PWA is pinned to the origin
+# it was installed from, so a redirect would not keep it working, but a second
+# ingress does. Empty by default.
+variable "extra_dash_hosts" {
+  description = "Additional dash hostnames: hostname => { zone_id, name } where name is the record label inside that zone, e.g. \"slack.shellm.net\" => { zone_id = \"...\", name = \"slack\" }."
+  type        = map(object({ zone_id = string, name = string }))
+  default     = {}
+}
+
+variable "extra_chat_hosts" {
+  description = "Additional phone-chat hostnames, same shape as extra_dash_hosts; each gets the public-assets bypass the PWA needs."
+  type        = map(object({ zone_id = string, name = string }))
+  default     = {}
+}
+
 variable "chat_subdomain" {
   description = "Extra hostname for the phone chat PWA (chat -> chat.example.com), served by the same box and tunnel with its own Access app. Set to \"\" to disable."
   type        = string

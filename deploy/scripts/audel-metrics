@@ -197,6 +197,7 @@ TOK = ("calls", "in", "out", "think", "bf")
 CTX_BUCKETS = (("<2m", 0, 120), ("2-15m", 120, 900), ("15-60m", 900, 3600),
                ("1-6h", 3600, 21600), ("6-48h", 21600, 172800))
 ctx_rows = []   # (ts, context_msgs, gap_s or None, decision)
+rsp_rows = []   # (ts, decision, failure or None, llm_ms or None, served_by or None, truncated, timed_out, out_tok or None)
 
 def day_key(ts):
     return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d")
@@ -262,6 +263,18 @@ with open(path, encoding="utf-8", errors="replace") as fh:
             fb_marked.add(step["trigger_step"])
             fb_events.append((step["trigger_step"], ts))
         elif (t == "observation" and step.get("source") == "responder"
+              and step.get("decision") in ("replied", "no-reply", "reply-failed")):
+            # Every decision, with what the reply call did (llm_ms, served_by,
+            # truncated, timed_out, failure kind) once the 2026-09-22 step is
+            # deployed; older observations count as decisions with no call data.
+            rsp_rows.append((
+                ts, step.get("decision"), step.get("failure"),
+                step.get("llm_ms") if isinstance(step.get("llm_ms"), (int, float)) else None,
+                step.get("served_by") if isinstance(step.get("served_by"), str) else None,
+                bool(step.get("truncated")), bool(step.get("timed_out")),
+                step.get("out_tok") if isinstance(step.get("out_tok"), int) else None,
+            ))
+        if (t == "observation" and step.get("source") == "responder"
               and step.get("decision") in ("replied", "no-reply")
               and isinstance(step.get("context_msgs"), int)):
             gap = step.get("gap_s")
@@ -497,6 +510,37 @@ for label, lo, hi in CTX_BUCKETS:
         "forgot": sum(1 for r in rows if r[1] == 0),
         "median_ctx": pct([r[1] for r in rows]).get("p50") if rows else None,
     })
+# Responder calls: failures by kind, call latency, and the upstream host
+# (served_by) each call landed on, with that host's truncation and timeout
+# counts. One model id on OpenRouter is two dozen hosts at different speeds.
+_with_call = [r for r in rsp_rows if r[3] is not None]
+_hosts = {}
+for r in _with_call:
+    h = _hosts.setdefault(r[4] or "(unknown)", {"calls": 0, "truncated": 0, "timed_out": 0, "ms": []})
+    h["calls"] += 1
+    h["truncated"] += 1 if r[5] else 0
+    h["timed_out"] += 1 if r[6] else 0
+    h["ms"].append(r[3])
+_fail_kinds = {}
+for r in rsp_rows:
+    if r[1] == "reply-failed":
+        _fail_kinds[r[2] or "(unspecified)"] = _fail_kinds.get(r[2] or "(unspecified)", 0) + 1
+responder_calls = {
+    "decisions": len(rsp_rows),
+    "replied": sum(1 for r in rsp_rows if r[1] == "replied"),
+    "no_reply": sum(1 for r in rsp_rows if r[1] == "no-reply"),
+    "failed": sum(1 for r in rsp_rows if r[1] == "reply-failed"),
+    "failures": _fail_kinds,
+    "with_call_data": len(_with_call),
+    "since": (datetime.fromtimestamp(min(r[0] for r in _with_call), timezone.utc).strftime("%Y-%m-%d")
+              if _with_call else None),
+    "llm_ms": pct([r[3] for r in _with_call]) if _with_call else {},
+    "out_tok": pct([r[7] for r in _with_call if r[7] is not None]) if _with_call else {},
+    "hosts": sorted(
+        ({"host": k, "calls": v["calls"], "truncated": v["truncated"], "timed_out": v["timed_out"],
+          "llm_ms": pct(v["ms"])} for k, v in _hosts.items()),
+        key=lambda h: -h["calls"]),
+}
 context = {
     "decisions": len(ctx_rows),
     "first_contact": sum(1 for r in ctx_rows if r[2] is None),
@@ -525,6 +569,7 @@ out = {
     },
     "injections": injections,
     "context": context,
+    "responder_calls": responder_calls,
     "daily": [[d, daily[d]] for d in sorted(daily)],
     "rel_distinct": {d: len(v) for d, v in day_distinct.items()},
     "by_model": by_model,
@@ -671,6 +716,30 @@ else:
         print("  %-10s %6d %8d %8s %11s" % (b["gap"], b["n"], b["forgot"], share, med))
     print("  (gap = time since the previous message with that person; forgot = the prompt held")
     print("   none of the earlier conversation; median_ctx = earlier messages in the prompt, cap 12)")
+
+rc = d.get("responder_calls") or {}
+print()
+print("responder calls (every decision; call data from the 2026-09-22 step on)")
+if not rc.get("decisions"):
+    print("  none recorded")
+else:
+    fails = ", ".join("%s %d" % (k, v) for k, v in sorted((rc.get("failures") or {}).items(), key=lambda kv: -kv[1])) or "-"
+    print("  decisions: %d   replied: %d   no_reply: %d   failed: %d (%s)"
+          % (rc["decisions"], rc.get("replied", 0), rc.get("no_reply", 0), rc.get("failed", 0), fails))
+    if rc.get("with_call_data"):
+        ms = rc.get("llm_ms") or {}
+        ot = rc.get("out_tok") or {}
+        print("  calls with data: %d since %s   llm_s p50/p90/max: %s/%s/%s   out_tok p50/p90/max: %s/%s/%s"
+              % (rc["with_call_data"], rc.get("since"),
+                 *(("%.0f" % (ms[k] / 1000.0)) if ms.get(k) is not None else "-" for k in ("p50", "p90", "max")),
+                 *((ot[k]) if ot.get(k) is not None else "-" for k in ("p50", "p90", "max"))))
+        print("  %-22s %6s %9s %9s %10s" % ("served_by", "calls", "truncated", "timed_out", "llm_s p50"))
+        for h in rc.get("hosts") or []:
+            p50 = h.get("llm_ms", {}).get("p50")
+            print("  %-22s %6d %9d %9d %10s" % (h["host"][:22], h["calls"], h["truncated"], h["timed_out"],
+                  ("%.0f" % (p50 / 1000.0)) if p50 is not None else "-"))
+        print("  (served_by = the upstream host OpenRouter routed the reply call to; truncated = hit the")
+        print("   token cap; timed_out = hit the wall clock cap; llm_s = the reply call alone, not the wake)")
 
 daily = d.get("daily") or []
 if daily:

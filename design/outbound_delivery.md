@@ -198,6 +198,14 @@ The bridge's five-minute dedup stays as a backstop for a replayed step. This
 moves the check the mind failed to make on 2026-09-08 into the tool, so the
 mind does not have to remember to check.
 
+The check applies to the identity's own sends only. A message a person
+sends in (the bridges deliver with `--from <person> --to <identity>`) is
+never refused: on 2026-09-21 the check ran on inbound deliveries too, a
+second "great" in one day came back HTTP 409, 22 of Andy's messages never
+reached the mind, and the two bridges posted "couldn't reach my mind" at
+each other in a loop. The bridges now treat a 409 as a refusal (logged, no
+retry, no error post) and never forward a peer persona's bridge error text.
+
 ### 7. Other transports (delivery 2)
 
 The Telegram bridge writes the same `delivery` step with `transport:

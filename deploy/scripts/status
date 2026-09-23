@@ -36,7 +36,7 @@ if [[ "$state" == "running" ]]; then
         if has telegram-bridge; then
             echo "telegram: $(systemctl is-active "$(u telegram-bridge)")"
         fi'
-    if [[ "${SHELLM_TF_STACK:-}" == "terraform-slack" ]]; then
+    if is_persona_stack; then
         telegram_check='
         if has telegram-bridge; then
             echo "telegram: $(systemctl is-active "$(u telegram-bridge)")"

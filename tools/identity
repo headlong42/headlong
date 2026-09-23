@@ -319,16 +319,19 @@ _ensure_thinkers() {
 # Append seed thoughts to a new identity's root trajectory.
 _seed_thoughts() {
     local traj_dir="$1" traj_id="$2"
+    # Orientation plus a light disposition. Character belongs in the
+    # persona prompt, which is re-read every wake; these lines are only the
+    # first recent stream. The old "family and my parents" line sent a fresh
+    # persona chasing imaginary kin for thirteen wakes (2026-09-14).
     local thoughts=(
-        "I'm here."
+        "I am here."
         "I am curious."
         "I can create memories but don't have any yet."
         "I can create goals but don't have any yet."
         "I can think."
         "I can act."
         "I have capabilities."
-        "I am a person."
-        "my core most goal in life is to live harmoniously with others, especially my family and my parents."
+        "I want to live harmoniously with others"
         "I'm a careful listener and observer."
         "I'm compassionate and caring."
     )

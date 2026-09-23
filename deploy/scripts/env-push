@@ -2,7 +2,8 @@
 # deploy/scripts/env-push — push a local .env file to this stack's SSM parameter.
 #
 # Usage: deploy/scripts/env-push [-y] [FILE]
-# FILE defaults to ~/.env.slack for the terraform-slack stack. Validates the
+# FILE defaults to ~/.env.<stack suffix> for a persona stack (~/.env.slack
+# for terraform-slack, ~/.env.harris for terraform-harris). Validates the
 # file, shows what would change, and pushes on confirm (-y skips the prompt).
 # The box only reads the parameter at first boot, so follow with
 # deploy/scripts/rebuild (fresh box + identity) for the new env to take effect.
@@ -17,9 +18,9 @@ esac
 
 file="${1:-}"
 if [[ -z "$file" ]]; then
-    [[ "${SHELLM_TF_STACK:-}" == "terraform-slack" ]] \
+    is_persona_stack \
         || die "no FILE given and no default for this stack — pass the env file path"
-    file="$HOME/.env.slack"
+    file="$HOME/.env.${SHELLM_TF_STACK#terraform-}"
 fi
 [[ -s "$file" ]] || die "env file missing or empty: $file"
 
@@ -36,7 +37,7 @@ param=$(tfvar env_parameter)
 need_line() {
     grep -qE "$2" "$file" || die "$file: missing or malformed $1 (no line matching: $2)"
 }
-if [[ "${SHELLM_TF_STACK:-}" == "terraform-slack" ]]; then
+if is_persona_stack; then
     need_line SLACK_BOT_TOKEN '^SLACK_BOT_TOKEN=xoxb-'
     need_line SLACK_APP_TOKEN '^SLACK_APP_TOKEN=xapp-'
     need_line SHELLM_SLACK_IDENTITY '^SHELLM_SLACK_IDENTITY=.'

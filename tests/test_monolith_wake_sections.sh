@@ -35,6 +35,10 @@ mk 2026-08-20-00-00-00_a1_gh   fact "2026-08-20 00:00:00" "GitHub write on this 
 mk 2026-08-21-00-00-00_b2_disp fact "2026-08-21 00:00:00" "The dispatcher token file arms the wake and lives under run/"
 mk 2026-08-22-00-00-00_c3_todo todo "2026-08-22 00:00:00" "Ping Braden about the temporal test"
 printf '{"step_id":"t1","type":"thought","content":"I should check the github pull-only login headlong42 before the PR work","source":"monolith","ts":"2026-09-04T00:00:00Z"}\n' >> "$TRAJ"
+# A scheduled goal whose one window opened at 00:00 UTC and is always inside
+# the grace period (design/scheduled_goals.md).
+export SCHEDULE_GRACE_MIN=1440
+printf -- '---\nid: 5ced0001\nsummary: Daily digest for the team\ntype: goal\ncreated: 2026-09-01 00:00:00\nschedule: 00:00\n---\n\nDaily digest for the team\n' > "$ID/memories/2026-09-01-00-00-00_5ced0001_digest.md"
 mkdir -p "$ID/workdir/notes"; printf 'a\n' > "$ID/workdir/notes/a.md"; printf 'b\n' > "$ID/workdir/notes/b.md"
 
 run_step() {  # $1 = trigger json, then env overrides
@@ -59,6 +63,8 @@ p=$(cat "$STUB_CAPTURE" 2>/dev/null)
 grep -q '^Sent in the last 24h' <<<"$p" && ok "the sent section is in the wake prompt" || bad "sent section present"
 grep -q 'to slack-C0BMVH6LM4K: delivered "papers for today"' <<<"$p" && ok "a delivered send is listed as delivered" || bad "delivered line" "$(grep 'to slack-' <<<"$p")"
 grep -q 'to slack-nick: FAILED, never arrived (unknown slack address form) "lost note"' <<<"$p" && ok "a failed send is listed with its reason" || bad "failed line" "$(grep 'to slack-' <<<"$p")"
+grep -q '^- Now: [A-Z][a-z]*day [0-9-]* [0-9:]* UTC (' <<<"$p" && ok "the clock line is in the routing signals" || bad "clock line" "$(grep -A2 '^Routing signals' <<<"$p")"
+grep -q "^- DUE NOW: \"Daily digest for the team\".*--key 5ced0001/$(date -u +%Y-%m-%d)-0000 " <<<"$p" && ok "a scheduled goal's open window is DUE with its key" || bad "due line" "$(grep -i 'digest' <<<"$p" | head -3)"
 grep -q '^Related memories' <<<"$p" && ok "the related-memories section is in the wake prompt" || bad "related section present" "$(grep -c . <<<"$p") lines"
 grep -q '^Runtime: headlong [0-9a-f]\{7,\} (' <<<"$p" && ok "the runtime line names the checked-out commit" || bad "runtime line present"
 grep -q '^Workspace: ' <<<"$p" && ok "the workspace section is in the wake prompt" || bad "workspace section present"

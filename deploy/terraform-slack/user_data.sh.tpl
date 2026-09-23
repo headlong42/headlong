@@ -37,6 +37,9 @@ if [ -n "$ENV_CONTENT" ]; then
     chmod 600 /opt/shellm/app/.env
     unset ENV_CONTENT
     echo "==> .env installed from SSM parameter ${env_parameter}"
+    # The parameter holds the full file; the bridge tokens move to
+    # .env.bridge so the mind never sees them (deploy/split-bridge-env.sh).
+    bash /opt/shellm/app/deploy/split-bridge-env.sh /opt/shellm/app || true
 else
     echo "==> WARNING: no value at SSM parameter ${env_parameter}; add keys manually"
 fi
@@ -46,7 +49,7 @@ fi
 mkdir -p /etc/systemd/system/headlong-web.service.d
 cat > /etc/systemd/system/headlong-web.service.d/override.conf <<OVERRIDE
 [Service]
-Environment="HEADLONG_WEB_ALLOWED_ORIGINS=https://${hostname}"
+Environment="HEADLONG_WEB_ALLOWED_ORIGINS=${allowed_origins}"
 OVERRIDE
 
 systemctl daemon-reload

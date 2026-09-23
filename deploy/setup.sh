@@ -81,6 +81,34 @@ ENV
     chmod 600 "$APP_DIR/.env"
 fi
 
+# Identities live outside the checkout (design/runtime_isolation.md, layer
+# 0): the runtime tree is the runtime, the minds' state is its own tree, and
+# a deploy pull can never touch it. The real directory is bind-mounted at
+# the old path inside the checkout, so every tool that says ".identities"
+# sees a plain directory (a symlink there tripped the web scan and would
+# trip find/tar, 2026-09-15). The mount is in fstab so it survives reboots.
+# A box from before this layout has a populated real directory at the old
+# path; that is left alone (migration is a deliberate stop, move, mount).
+IDENTITIES_DIR="${HEADLONG_IDENTITIES_DIR:-/var/lib/headlong/identities}"
+echo "==> Identities root: $IDENTITIES_DIR (mounted at $APP_DIR/.identities)"
+mkdir -p "$IDENTITIES_DIR"
+chown "$SHELLM_USER:$SHELLM_USER" "$IDENTITIES_DIR"
+chmod 755 "$(dirname "$IDENTITIES_DIR")" "$IDENTITIES_DIR"
+if [[ -L "$APP_DIR/.identities" ]]; then
+    rm -f "$APP_DIR/.identities"
+fi
+if [[ -d "$APP_DIR/.identities" ]] && ! mountpoint -q "$APP_DIR/.identities" \
+    && [[ -n "$(ls -A "$APP_DIR/.identities" 2>/dev/null)" ]]; then
+    echo "    note: $APP_DIR/.identities is a populated directory (pre-layer-0 box); not mounting over it"
+else
+    mkdir -p "$APP_DIR/.identities"
+    chown "$SHELLM_USER:$SHELLM_USER" "$APP_DIR/.identities"
+    if ! grep -qs "^$IDENTITIES_DIR $APP_DIR/.identities " /etc/fstab; then
+        printf '%s %s none bind 0 0\n' "$IDENTITIES_DIR" "$APP_DIR/.identities" >> /etc/fstab
+    fi
+    mountpoint -q "$APP_DIR/.identities" || mount --bind "$IDENTITIES_DIR" "$APP_DIR/.identities"
+fi
+
 echo "==> Installing systemd service"
 sed "s|@SHELLM_HOME@|$SHELLM_HOME|g" "$SCRIPT_DIR/headlong-web.service" \
     > /etc/systemd/system/headlong-web.service
@@ -91,10 +119,14 @@ systemctl enable --now headlong-web
 # headlong-thinkers@<identity>.service (via the sudo wrapper) so they get
 # their own cgroup instead of living inside headlong-web's.
 echo "==> Installing per-identity thinkers unit + control wrapper"
-for unit_tpl in headlong-thinkers@ headlong-thinkers-alert@; do
-    sed "s|@SHELLM_HOME@|$SHELLM_HOME|g" "$SCRIPT_DIR/${unit_tpl}.service" \
-        > "/etc/systemd/system/${unit_tpl}.service"
+for unit_file in headlong-thinkers@.service headlong-thinkers-alert@.service \
+                 headlong-thinkers-silence@.service headlong-thinkers-silence@.timer; do
+    sed "s|@SHELLM_HOME@|$SHELLM_HOME|g" "$SCRIPT_DIR/${unit_file}" \
+        > "/etc/systemd/system/${unit_file}"
 done
+# Runtime sandbox drop-in for the thinkers template (HEADLONG_SANDBOX in
+# .env, default on; see deploy/thinkers-sandbox.sh).
+bash "$SCRIPT_DIR/thinkers-sandbox.sh" install "$APP_DIR" "$SHELLM_HOME" >/dev/null
 install -o root -g root -m 0755 "$SCRIPT_DIR/headlong-thinkersctl" /usr/local/bin/headlong-thinkersctl
 if visudo -cf "$SCRIPT_DIR/sudoers-headlong-thinkers"; then
     install -o root -g root -m 0440 "$SCRIPT_DIR/sudoers-headlong-thinkers" /etc/sudoers.d/headlong-thinkers

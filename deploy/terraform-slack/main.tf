@@ -42,8 +42,13 @@ provider "aws" {
 provider "cloudflare" {}
 
 locals {
-  hostname      = "${var.subdomain}.${var.domain}"
+  # The public dash name. var.subdomain stays the AWS naming prefix (tunnel,
+  # SNS, alarms, lambda, instance tag); only the hostname follows
+  # dash_subdomain, so a rename is a Cloudflare-only change.
+  hostname      = "${coalesce(var.dash_subdomain, var.subdomain)}.${var.domain}"
   chat_hostname = var.chat_subdomain != "" ? "${var.chat_subdomain}.${var.domain}" : ""
+  # Every dash origin the web server should accept (primary + extras).
+  dash_origins = join(",", [for h in concat([local.hostname], sort(keys(var.extra_dash_hosts))) : "https://${h}"])
 }
 
 # ---------------------------------------------------------------------------
@@ -78,6 +83,14 @@ resource "cloudflare_zero_trust_tunnel_cloudflared_config" "shellm" {
         service  = "http://localhost:8080"
       }
     }
+    # Extra hostnames kept alive beside the primary ones (see variables.tf).
+    dynamic "ingress_rule" {
+      for_each = sort(concat(keys(var.extra_dash_hosts), keys(var.extra_chat_hosts)))
+      content {
+        hostname = ingress_rule.value
+        service  = "http://localhost:8080"
+      }
+    }
     # Catch-all required by Cloudflare: anything else gets a 404
     ingress_rule {
       service = "http_status:404"
@@ -87,7 +100,7 @@ resource "cloudflare_zero_trust_tunnel_cloudflared_config" "shellm" {
 
 resource "cloudflare_record" "shellm" {
   zone_id = var.cloudflare_zone_id
-  name    = var.subdomain
+  name    = coalesce(var.dash_subdomain, var.subdomain)
   type    = "CNAME"
   content = "${cloudflare_zero_trust_tunnel_cloudflared.shellm.id}.cfargotunnel.com"
   proxied = true
@@ -100,6 +113,25 @@ resource "cloudflare_record" "chat" {
   type    = "CNAME"
   content = "${cloudflare_zero_trust_tunnel_cloudflared.shellm.id}.cfargotunnel.com"
   proxied = true
+}
+
+# Extra hostnames: records in their own zones, by label.
+resource "cloudflare_record" "extra_dash" {
+  for_each = var.extra_dash_hosts
+  zone_id  = each.value.zone_id
+  name     = each.value.name
+  type     = "CNAME"
+  content  = "${cloudflare_zero_trust_tunnel_cloudflared.shellm.id}.cfargotunnel.com"
+  proxied  = true
+}
+
+resource "cloudflare_record" "extra_chat" {
+  for_each = var.extra_chat_hosts
+  zone_id  = each.value.zone_id
+  name     = each.value.name
+  type     = "CNAME"
+  content  = "${cloudflare_zero_trust_tunnel_cloudflared.shellm.id}.cfargotunnel.com"
+  proxied  = true
 }
 
 # Email OTP login: allow-listed users enter their email and get a 6-digit
@@ -157,15 +189,14 @@ resource "cloudflare_zero_trust_access_policy" "allowlist" {
   precedence     = 1
   decision       = "allow"
 
+  # One include block with both selectors. With two blocks (emails, then
+  # domains) the v4 provider kept only the last one: the live policies held
+  # just the domain rule, the explicit emails were re-added on every apply
+  # and dropped again, and OTP login for a non-domain address never worked
+  # (found 2026-09-15 via the API; the plan had shown the "diff" forever).
   include {
-    email = var.allowed_emails
-  }
-
-  dynamic "include" {
-    for_each = length(var.allowed_email_domains) > 0 ? [1] : []
-    content {
-      email_domain = var.allowed_email_domains
-    }
+    email        = var.allowed_emails
+    email_domain = length(var.allowed_email_domains) > 0 ? var.allowed_email_domains : null
   }
 }
 
@@ -224,15 +255,112 @@ resource "cloudflare_zero_trust_access_policy" "chat_allowlist" {
   precedence     = 1
   decision       = "allow"
 
+  # One include block with both selectors. With two blocks (emails, then
+  # domains) the v4 provider kept only the last one: the live policies held
+  # just the domain rule, the explicit emails were re-added on every apply
+  # and dropped again, and OTP login for a non-domain address never worked
+  # (found 2026-09-15 via the API; the plan had shown the "diff" forever).
   include {
-    email = var.allowed_emails
+    email        = var.allowed_emails
+    email_domain = length(var.allowed_email_domains) > 0 ? var.allowed_email_domains : null
   }
+}
 
-  dynamic "include" {
-    for_each = length(var.allowed_email_domains) > 0 ? [1] : []
-    content {
-      email_domain = var.allowed_email_domains
-    }
+# Access for the extra hostnames: the same shape as the primary dash and chat
+# apps above, one set per hostname, same allowlist. Kept as separate
+# resources (not a for_each over the primaries) so a stack with no extras
+# has no state to migrate.
+resource "cloudflare_zero_trust_access_application" "extra_dash" {
+  for_each         = var.extra_dash_hosts
+  zone_id          = each.value.zone_id
+  name             = "shellm (${each.key})"
+  domain           = each.key
+  type             = "self_hosted"
+  session_duration = var.access_session_duration
+
+  allowed_idps = concat(
+    [data.cloudflare_zero_trust_access_identity_provider.otp.id],
+    cloudflare_zero_trust_access_identity_provider.google[*].id,
+  )
+  auto_redirect_to_identity = var.google_oauth_client_id == ""
+}
+
+resource "cloudflare_zero_trust_access_policy" "extra_dash_allowlist" {
+  for_each       = var.extra_dash_hosts
+  application_id = cloudflare_zero_trust_access_application.extra_dash[each.key].id
+  zone_id        = each.value.zone_id
+  name           = "shellm email allowlist"
+  precedence     = 1
+  decision       = "allow"
+
+  # One include block with both selectors. With two blocks (emails, then
+  # domains) the v4 provider kept only the last one: the live policies held
+  # just the domain rule, the explicit emails were re-added on every apply
+  # and dropped again, and OTP login for a non-domain address never worked
+  # (found 2026-09-15 via the API; the plan had shown the "diff" forever).
+  include {
+    email        = var.allowed_emails
+    email_domain = length(var.allowed_email_domains) > 0 ? var.allowed_email_domains : null
+  }
+}
+
+resource "cloudflare_zero_trust_access_application" "extra_chat" {
+  for_each         = var.extra_chat_hosts
+  zone_id          = each.value.zone_id
+  name             = "shellm chat (${each.key})"
+  domain           = each.key
+  type             = "self_hosted"
+  session_duration = var.access_session_duration
+
+  allowed_idps = concat(
+    [data.cloudflare_zero_trust_access_identity_provider.otp.id],
+    cloudflare_zero_trust_access_identity_provider.google[*].id,
+  )
+  auto_redirect_to_identity = var.google_oauth_client_id == ""
+}
+
+resource "cloudflare_zero_trust_access_application" "extra_chat_public_assets" {
+  for_each = var.extra_chat_hosts
+  zone_id  = each.value.zone_id
+  name     = "shellm chat public assets (${each.key})"
+  domain   = "${each.key}/manifest.webmanifest"
+  self_hosted_domains = [
+    "${each.key}/manifest.webmanifest",
+    "${each.key}/icons/",
+  ]
+  type             = "self_hosted"
+  session_duration = var.access_session_duration
+}
+
+resource "cloudflare_zero_trust_access_policy" "extra_chat_public_assets_bypass" {
+  for_each       = var.extra_chat_hosts
+  application_id = cloudflare_zero_trust_access_application.extra_chat_public_assets[each.key].id
+  zone_id        = each.value.zone_id
+  name           = "public PWA assets"
+  precedence     = 1
+  decision       = "bypass"
+
+  include {
+    everyone = true
+  }
+}
+
+resource "cloudflare_zero_trust_access_policy" "extra_chat_allowlist" {
+  for_each       = var.extra_chat_hosts
+  application_id = cloudflare_zero_trust_access_application.extra_chat[each.key].id
+  zone_id        = each.value.zone_id
+  name           = "shellm chat email allowlist"
+  precedence     = 1
+  decision       = "allow"
+
+  # One include block with both selectors. With two blocks (emails, then
+  # domains) the v4 provider kept only the last one: the live policies held
+  # just the domain rule, the explicit emails were re-added on every apply
+  # and dropped again, and OTP login for a non-domain address never worked
+  # (found 2026-09-15 via the API; the plan had shown the "diff" forever).
+  include {
+    email        = var.allowed_emails
+    email_domain = length(var.allowed_email_domains) > 0 ? var.allowed_email_domains : null
   }
 }
 
@@ -332,14 +460,26 @@ resource "aws_instance" "shellm" {
   }
 
   user_data = templatefile("${path.module}/user_data.sh.tpl", {
-    tunnel_token  = cloudflare_zero_trust_tunnel_cloudflared.shellm.tunnel_token
-    repo          = var.shellm_repo
-    branch        = var.shellm_branch
-    hostname      = local.hostname
-    env_parameter = var.env_parameter
-    region        = var.aws_region
+    tunnel_token    = cloudflare_zero_trust_tunnel_cloudflared.shellm.tunnel_token
+    repo            = var.shellm_repo
+    branch          = var.shellm_branch
+    hostname        = local.hostname
+    allowed_origins = local.dash_origins
+    env_parameter   = var.env_parameter
+    region          = var.aws_region
   })
   user_data_replace_on_change = true
+
+  # The AMI data source tracks the newest Ubuntu image and user_data carries
+  # the hostname and tunnel token, so a plain plan drifted into "must be
+  # replaced" on every run and no apply was safe (2026-08-24 followup; it
+  # blocked the 2026-09-15 hostname move). A rebuild is an explicit act:
+  # deploy/scripts/rebuild passes -replace=aws_instance.shellm, which still
+  # replaces the box and renders the current AMI and user_data into the new
+  # one. Everything else applies around a running instance.
+  lifecycle {
+    ignore_changes = [ami, user_data]
+  }
 
   tags = {
     Name = "shellm-${var.subdomain}"

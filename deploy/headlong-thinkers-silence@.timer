@@ -1,0 +1,15 @@
+# headlong-thinkers-silence@<identity>.timer — runs the silence check every
+# five minutes. Enabled per identity by deploy/update.sh and the identity
+# bootstrap alongside headlong-thinkers@<identity>.service.
+
+[Unit]
+Description=headlong silence check timer for identity %i
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=headlong-thinkers-silence@%i.service
+
+[Install]
+WantedBy=timers.target

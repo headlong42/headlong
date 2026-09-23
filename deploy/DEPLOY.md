@@ -194,7 +194,13 @@ own migration and none of them need to happen for the unit rename.
 - `headlong-web` binds `127.0.0.1` and the tunnel is outbound-only, so the
   only path in is through Access. Don't "temporarily" bind `0.0.0.0`.
 - Secrets: root key in `/opt/shellm/app/.env` (mode 600); per-identity
-  overrides via the Config tab (stored in `<identity>/.env`).
+  overrides via the Config tab (stored in `<identity>/.env`). The Slack
+  bridge tokens are split out to `/opt/shellm/app/.env.bridge`, which
+  the mind cannot read (`deploy/split-bridge-env.sh`, run by `update.sh`).
+- Every wake runs under a systemd sandbox: filesystem read-only except
+  the shellm home, the identity's own directory and the temp dirs. `HEADLONG_SANDBOX=0` in the root `.env` plus `update.sh` and a
+  `headlong-thinkersctl restart <identity>` turns it off
+  (`deploy/thinkers-sandbox.sh`, see SECURITY.md).
 - Optional: install Docker (`apt install docker.io`, add `shellm` to the
   `docker` group) so generated code runs in shellm's Docker sandbox
   instead of directly on the host.

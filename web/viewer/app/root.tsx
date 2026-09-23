@@ -77,10 +77,14 @@ export default function App() {
     }
   }, []);
 
-  // chat.* is the messaging hostname: land on /talk instead of the dash.
+  // The messaging hostname lands on /talk instead of the dash. It is
+  // chat.<domain> for the first persona box and <name>-chat.<domain> for
+  // later ones (harris-chat.headlong.ai): Cloudflare's free certificate
+  // covers one label, so a per-persona chat host cannot be chat.<name>.
   useEffect(() => {
+    const label = window.location.hostname.split(".")[0];
     if (
-      window.location.hostname.startsWith("chat.") &&
+      (label === "chat" || label.endsWith("-chat")) &&
       location.pathname === "/"
     ) {
       navigate("/talk", { replace: true });

@@ -1,0 +1,25 @@
+{
+  "display_information": {
+    "name": "Headlong Alerts",
+    "description": "Box alerts for the Headlong personas (dispatcher death, silence, instance checks). Posts only; hears nothing.",
+    "background_color": "#2b2b2b"
+  },
+  "features": {
+    "bot_user": {
+      "display_name": "headlong-alerts",
+      "always_online": false
+    }
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": [
+        "chat:write"
+      ]
+    }
+  },
+  "settings": {
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": false,
+    "token_rotation_enabled": false
+  }
+}

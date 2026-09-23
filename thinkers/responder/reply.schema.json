@@ -1,0 +1,10 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "action": {"type": "string", "enum": ["reply", "defer", "no_reply"]},
+    "message": {"type": "string"},
+    "request": {"type": "string"}
+  },
+  "required": ["action", "message", "request"]
+}

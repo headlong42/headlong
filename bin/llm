@@ -38,6 +38,7 @@ _llm_load_env "$_llm_home/.env" || true
 LLM_MODEL="${LLM_MODEL:-}"
 LLM_SYSTEM=""
 LLM_MAX_TOKENS="${LLM_MAX_TOKENS:-}"
+LLM_JSON_SCHEMA=""     # --json-schema FILE: a JSON Schema the reply must satisfy
 LLM_MESSAGES=""
 LLM_STREAM=1
 LLM_PROVIDER="${LLM_PROVIDER:-}"
@@ -263,6 +264,9 @@ Options:
                            openrouter, named or inferred from the model)
   --thinking [LEVEL]       Enable thinking (Anthropic: adaptive; Gemini: minimal/low/medium/high)
   --effort LEVEL           Thinking effort/provider output effort
+  --json-schema FILE       Ask for one JSON object matching this JSON Schema
+                           (response_format json_schema, strict) on OpenAI-style
+                           providers; ignored with a warning elsewhere
   --raw                    Print raw non-streaming API response JSON
   -h, --help               Show this help
 
@@ -391,6 +395,7 @@ while [[ $# -gt 0 ]]; do
             fi
             shift ;;
         --effort)        LLM_EFFORT="${2:?--effort requires a value}"; shift 2 ;;
+        --json-schema)   _jsf="${2:?--json-schema requires a path}"; [[ -f "$_jsf" ]] || die "Schema file not found: $_jsf"; LLM_JSON_SCHEMA=$(cat "$_jsf"); shift 2 ;;
         --raw)           LLM_RAW=1; shift ;;
         --stop-after-code-block) LLM_STOP_AFTER_CODE_BLOCK=1; shift ;;
         -*)              die "Unknown option: $1 (try llm --help)" ;;
@@ -576,6 +581,11 @@ get_model_max_tokens() {
         # is null). It's a reasoning model, so the generic 16384 starves its
         # thinking. Give it the reasoning-model tier like Anthropic above.
         x-ai/grok-4*|x-ai/grok*) echo 64000 ;;
+        # Zhipu GLM 5.x (via OpenRouter): reasoning model whose thinking
+        # counts against max_tokens; 16384 returned empty answers on Harris
+        # (2026-09-16, finish_reason length at zero visible characters).
+        # OpenRouter reports a 943K completion ceiling.
+        z-ai/glm-5*) echo 64000 ;;
         */*) echo 16384 ;;
         *)
             # Conservative fallback for unknown models. openai-compatible
@@ -655,6 +665,7 @@ supports_gemini_thinking() {
 # ---------------------------------------------------------------------------
 
 build_payload_anthropic() {
+    [[ -n "$LLM_JSON_SCHEMA" ]] && echo "llm: --json-schema ignored: not supported for provider anthropic (OpenAI-style providers only)" >&2
     local -a jq_args=(
         --arg model "$LLM_MODEL"
         --argjson max_tokens "$LLM_MAX_TOKENS"
@@ -723,10 +734,21 @@ build_payload_openai() {
         fi
     fi
 
+    # --json-schema: OpenAI-style structured output. The file holds a bare
+    # JSON Schema; it is wrapped as {type:"json_schema", json_schema:{name,
+    # strict:true, schema}} which OpenAI, OpenRouter and most compatible
+    # endpoints accept. A provider that cannot enforce it returns an API
+    # error, so callers that must work everywhere retry without the flag.
+    if [[ -n "$LLM_JSON_SCHEMA" ]]; then
+        jq_args+=(--argjson schema "$LLM_JSON_SCHEMA")
+        jq_filter="${jq_filter} + {response_format: {type: \"json_schema\", json_schema: {name: \"response\", strict: true, schema: \$schema}}}"
+    fi
+
     printf '%s' "$msgs" | jq "${jq_args[@]}" "$jq_filter"
 }
 
 build_payload_gemini() {
+    [[ -n "$LLM_JSON_SCHEMA" ]] && echo "llm: --json-schema ignored: not supported for provider gemini" >&2
     # Convert messages to Gemini format: {contents:[{role,parts:[{text}]}]}
     local contents
     contents=$(printf '%s' "$LLM_MESSAGES" | jq '[.[] | {role: (if .role == "assistant" then "model" else .role end), parts: [{text: .content}]}]')
@@ -975,6 +997,7 @@ check_truncated_opencode() { check_truncated_anthropic; }
 # Shared by the non-streaming path and the streaming handlers (stderr passes
 # straight through the handler subshell, so this works from either).
 warn_truncated() {
+    _llm_truncated=1
     echo "llm: warning: output truncated at max_tokens=$LLM_MAX_TOKENS (reasoning tokens count against it) — raise with -t" >&2
 }
 
@@ -987,14 +1010,24 @@ warn_truncated() {
 # cache hit rate is cache_tok / in_tok.
 # A fifth arg "estimated" marks a record derived from bytes rather than the
 # provider's count (the stream was cut before the usage event arrived).
+# The record also carries served_by (the upstream host OpenRouter routed the
+# call to, from the "provider" field on its responses; absent elsewhere) and
+# truncated: true when the output hit max_tokens. One model id on OpenRouter
+# is two dozen hosts at different speeds, so a slow or cut-off call is only
+# explainable with the host on the record.
+_llm_served_by=""
+_llm_truncated=0
 write_usage() {
-    jq -nc --arg i "${1:-}" --arg o "${2:-}" --arg t "${3:-}" --arg c "${4:-}" --arg e "${5:-}" '
+    jq -nc --arg i "${1:-}" --arg o "${2:-}" --arg t "${3:-}" --arg c "${4:-}" --arg e "${5:-}" \
+        --arg p "$_llm_served_by" --arg tr "$_llm_truncated" '
         {}
         + (if ($i | test("^[0-9]+$")) then {in_tok: ($i | tonumber)} else {} end)
         + (if ($o | test("^[0-9]+$")) then {out_tok: ($o | tonumber)} else {} end)
         + (if ($t | test("^[0-9]+$")) then {think_tok: ($t | tonumber)} else {} end)
         + (if ($c | test("^[0-9]+$")) then {cache_tok: ($c | tonumber)} else {} end)
-        + (if $e == "estimated" then {estimated: true} else {} end)' \
+        + (if $e == "estimated" then {estimated: true} else {} end)
+        + (if $p != "" then {served_by: $p} else {} end)
+        + (if $tr == "1" then {truncated: true} else {} end)' \
         > "$LLM_USAGE_FILE" 2>/dev/null || true
 }
 
@@ -1004,9 +1037,10 @@ write_usage() {
 #   $_llm_home/usage/llm.jsonl      otherwise (hand calls)
 # LLM_USAGE_LEDGER overrides the path (/dev/null disables).
 #   {"ts":...,"provider":...,"model":...,"in_tok":N,"out_tok":N,"think_tok":N,
-#    "cache_tok":N,"identity":...,"run_id":...}
+#    "cache_tok":N,"served_by":...,"truncated":true,"identity":...,"run_id":...}
 # identity/run_id are present only when known; cache_tok only when the
-# provider reported cached input tokens. The dash usage page and
+# provider reported cached input tokens; served_by only on OpenRouter (the
+# upstream host); truncated only when the output hit max_tokens. The dash usage page and
 # deploy/scripts/audel-metrics count this file, so every llm call counts
 # toward spend, not only the ones bin/shellm stamps on reasoning steps.
 _llm_ledger="${LLM_USAGE_LEDGER:-}"
@@ -1127,6 +1161,10 @@ stream_openai() {
             if [[ -n "$_chunk" ]]; then
                 mark_emitted
                 _emit_text "$_chunk" || break
+            fi
+            # OpenRouter names the upstream host on every chunk; read it once.
+            if [[ -z "$_llm_served_by" && "$json" == *'"provider"'* ]]; then
+                _llm_served_by=$(printf '%s' "$json" | jq -r '.provider // empty | if type == "string" then . else empty end' 2>/dev/null) || _llm_served_by=""
             fi
             # Only the final chunk carries a non-null finish_reason; the glob
             # keeps jq off the hot per-delta path.
@@ -1478,6 +1516,7 @@ else
     if [[ -n "$("check_truncated_${LLM_PROVIDER}" < "$local_resp")" ]]; then
         warn_truncated
     fi
+    [[ "$LLM_PROVIDER" == "openrouter" ]] && { _llm_served_by=$(jq -r '.provider // empty | if type == "string" then . else empty end' "$local_resp" 2>/dev/null) || _llm_served_by=""; }
 
     case "$LLM_PROVIDER" in
         # opencode (Zen) speaks the Anthropic wire protocol, usage shape included.

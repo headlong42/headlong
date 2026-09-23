@@ -8,8 +8,8 @@
 # Pins: reasoning steps are dropped, final steps kept, runs of consecutive idle
 # (and error) steps collapse into one line with a count and duration, idles
 # separated by another step are not merged, order is preserved, content is
-# still truncated at 1500 characters, and the window (N) bounds the raw steps
-# considered before collapsing. No LLM calls, no docker.
+# still truncated at 1500 characters, and the window (N) counts lines after
+# collapsing. No LLM calls, no docker.
 
 set -uo pipefail
 unset IDENTITY_DIR IDENTITY_NAME MEM_DIR TRAJ_DIR TRAJ_ID ROOT_TRAJ_ID THINK_CONTEXT_TAIL 2>/dev/null
@@ -117,10 +117,12 @@ order=$(printf '%s\n' "$out" | jq -r .step_id | tr '\n' ' ')
 len=$(printf '%s\n' "$out" | jq -r 'select(.step_id == "t2") | .content | length')
 [[ "$len" -le 1520 ]] && ok "long content is still truncated" || bad "long content is still truncated" "got $len"
 
-# The window bounds raw kept steps before collapsing: N=3 sees e1 e2 t2 only
+# The window is cut AFTER collapsing, so a run of idles or errors costs one
+# line and cannot push real steps out: N=3 is i4, the collapsed e2, and t2.
+# (Cut first, 20 idle wakes became the whole stream: 2026-09-18 re-sends.)
 out3=$(stream 3)
 order3=$(printf '%s\n' "$out3" | jq -r .step_id | tr '\n' ' ')
-[[ "$order3" == "e2 t2 " ]] && ok "N bounds the raw steps considered (3 kept -> 2 lines after collapsing)" || bad "N bounds the raw steps considered" "got $order3"
+[[ "$order3" == "i4 e2 t2 " ]] && ok "N counts lines after collapsing (N=3 -> i4 e2 t2)" || bad "N counts lines after collapsing" "got $order3"
 
 # Every output line is still one JSON object callers can parse
 if printf '%s\n' "$out" | jq -e . >/dev/null 2>&1; then

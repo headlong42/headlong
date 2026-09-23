@@ -36,6 +36,16 @@ THINKERS_WATCHDOG_SECS="${THINKERS_WATCHDOG_SECS:-300}"
 # twice, and the responder answered month-old Slack threads for 22 hours.
 # 0 disables.
 THINKERS_REWIND_TOLERANCE="${THINKERS_REWIND_TOLERANCE:-600}"
+# Stuck-step guard. A step whose shellm run has written its final step is
+# done; the little that follows (state file, backoff, arming the next wake)
+# takes seconds. A step still alive this many seconds after its run's final
+# is wedged, and the dispatcher ends it (TERM, then KILL 15s later). A
+# wedged step is fatal to a trigger_self:false loop: the next wake is armed
+# by the step's EXIT trap, so a step that never exits leaves nothing to fire.
+# 2026-09-14: two web servers the mind had backgrounded held the monolith
+# step's output pipe open; the step outlived its final by six hours and the
+# mind was silent the whole time. 0 disables.
+THINKERS_STEP_GRACE="${THINKERS_STEP_GRACE:-300}"
 VERBOSE=0
 NO_SELF_TRIGGER=0
 
@@ -294,8 +304,18 @@ _start_dispatcher() {
     # dispatcher instances — which would double-dispatch every step —
     # self-terminating.
     local dispatcher_token
-    dispatcher_token="$(date +%s).$$.$RANDOM"
-    printf '%s' "$dispatcher_token" > "$run_dir/dispatcher.token"
+    # Minted from 16 bytes of /dev/urandom. The old date+pid+RANDOM mint
+    # collided when two dispatchers started in the same second (pids repeat
+    # across forks), so both passed the ownership check and double-dispatched
+    # every due wake (the 2026-09-22/23 5x and 2x sends).
+    dispatcher_token="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+    [[ -n "$dispatcher_token" ]] || dispatcher_token="$(date +%s)-$$-$RANDOM-$$"
+    # Write the token atomically (temp + rename). Two starts writing the same
+    # file in the same instant could otherwise interleave their writes and
+    # leave a token neither one owns, which would make every dispatcher exit
+    # on the ownership check and leave the mind with none.
+    printf '%s' "$dispatcher_token" > "$run_dir/dispatcher.token.$$"
+    mv "$run_dir/dispatcher.token.$$" "$run_dir/dispatcher.token"
 
     # Build subscription map: thinker_name -> [traj_file, types_pattern, trigger_self]
     # We store this as lines: THINKER_NAME\tTRAJ_FILE\tTYPES_REGEX\tTRIGGER_SELF
@@ -392,6 +412,23 @@ _start_dispatcher() {
         trap '_cleanup_dispatcher' EXIT
         trap '_dispatcher_on_signal INT' INT
         trap '_dispatcher_on_signal TERM' TERM
+        # Single-owner the dispatcher role with a real lock, held on fd 4
+        # for the life of the loop and released on exit. The token check alone
+        # could not stop two same-second starts from both dispatching.
+        exec 4>"$run_dir/dispatcher.lock"
+        if command -v flock >/dev/null 2>&1; then
+            # Wait for the lock instead of bowing out. A `thinkers start` means
+            # take over: it has already written its own token, so the incumbent
+            # exits within a tick of seeing it and releases the lock. Bowing out
+            # on contention (flock -n) left NO dispatcher at all whenever a
+            # start overlapped a live one - the incumbent exits on the token
+            # mismatch and the newcomer had already quit.
+            flock -w 15 4 || {
+                printf '%s [dispatcher] lock timeout waiting for the incumbent - exiting\n' \
+                    "$(date -u +%FT%TZ)" >&2
+                exit 0
+            }
+        fi
 
         # Start tail -F for each unique traj file, tagged with traj path.
         # Track our own tail PIDs separately from the shared tail_pids file:
@@ -516,6 +553,7 @@ _start_dispatcher() {
         # tolerance window that tail re-emits before the swap detector
         # restarts the feeder. A step_id seen once is never dispatched twice.
         _nl=$'\n'
+        _tab=$'\t'
         _recent_ids="$_nl"
         _recent_n=0
         if (( _rewind_tol > 0 )); then
@@ -528,6 +566,17 @@ _start_dispatcher() {
 
         # Track thinker step PIDs as "name:pid" pairs (space-separated, bash 3.2 compat)
         _step_entries=""
+        # Stuck-step guard state (bash 3.2: no associative arrays, so
+        # newline-separated records). _run_owner maps a shellm-run step_id
+        # to the thinker whose step launched it (the run's launched_by), so a
+        # later final can be attributed to exactly that step and not to
+        # another busy thinker or a nested sub-run (shellm blanks
+        # SHELLM_LAUNCHED_BY for children). _stuck holds one record per
+        # thinker whose run has finished but whose step is still alive:
+        #   name<TAB>final_seen_SECONDS<TAB>run_id<TAB>traj_file<TAB>term_sent_SECONDS_or_empty
+        _run_owner=""
+        _run_owner_n=0
+        _stuck=""
         # A new dispatcher starts a fresh ledger, deliberately: the on-disk
         # prune below rewrites step_pids from _step_entries alone, so a dead
         # dispatcher's leftover lines would be dropped on the first prune
@@ -615,6 +664,7 @@ _start_dispatcher() {
                     # to wait for.
                     wait "$_pid" 2>/dev/null || true
                     _changed=1
+                    _stuck_forget "${_entry%%:*}"
                 fi
             done
             _step_entries="$_new"
@@ -665,6 +715,93 @@ _start_dispatcher() {
             _step_entries="${_step_entries}${_step_entries:+ }${_dname}:$!"
             printf '%s %s\n' "$!" "$_dname" >> "$run_dir/step_pids"
             _wd_touch "$_dname"
+            _stuck_forget "$_dname"
+        }
+
+        # --- stuck-step guard (THINKERS_STEP_GRACE) ---------------------------
+        _stuck_forget() {
+            local _fname="$1" _rec _new=""
+            [[ -n "$_stuck" ]] || return 0
+            while IFS= read -r _rec; do
+                [[ -z "$_rec" ]] && continue
+                [[ "${_rec%%$'\t'*}" == "$_fname" ]] && continue
+                _new="${_new}${_rec}${_nl}"
+            done <<< "$_stuck"
+            _stuck="$_new"
+        }
+
+        # A shellm-run step with launched_by names the thinker that owns the
+        # run; remember step_id -> thinker (bounded) so the run's final can be
+        # matched back. Only while that thinker is busy: a run attributed to a
+        # thinker with no live step is history or noise.
+        _stuck_note_run() {  # <step_id> <launched_by>
+            [[ -n "$1" && -n "$2" ]] || return 0
+            _thinker_busy "$2" || return 0
+            _run_owner="${_run_owner}${1}${_nl}${2}${_nl}"
+            if (( ++_run_owner_n > 64 )); then
+                _run_owner="$(printf '%s' "$_run_owner" | tail -n 32)${_nl}"
+                _run_owner_n=16
+            fi
+        }
+
+        # A final for a run we attributed: the owning step is done with its
+        # run. Start its grace clock unless one is already running.
+        _stuck_note_final() {  # <run_id> <traj_file>
+            local _rid="$1" _ftraj="$2" _oname="" _prev="" _l _rec
+            [[ -n "$_rid" && -n "$_run_owner" ]] || return 0
+            while IFS= read -r _l; do
+                if [[ "$_prev" == "$_rid" ]]; then _oname="$_l"; fi
+                _prev="$_l"
+            done <<< "$_run_owner"
+            [[ -n "$_oname" ]] || return 0
+            _thinker_busy "$_oname" || return 0
+            if [[ -n "$_stuck" ]]; then
+                while IFS= read -r _rec; do
+                    [[ "${_rec%%$'\t'*}" == "$_oname" ]] && return 0
+                done <<< "$_stuck"
+            fi
+            _stuck="${_stuck}${_oname}${_tab}${SECONDS}${_tab}${_rid}${_tab}${_ftraj}${_tab}${_nl}"
+        }
+
+        # Tick: end any step that has outlived its run's final by the grace
+        # period. TERM first — bash runs the step's EXIT trap on TERM, so the
+        # monolith still arms its next wake — then KILL if it is still there
+        # 15s later. One error step per incident so the operator sees it on
+        # the timeline; the dispatcher log carries the survivors.
+        _stuck_step_check() {
+            (( THINKERS_STEP_GRACE > 0 )) || return 0
+            [[ -n "$_stuck" ]] || return 0
+            local _rec _sname _sat _srid _straj _sterm _new="" _spid _e _age _left
+            while IFS=$'\t' read -r _sname _sat _srid _straj _sterm; do
+                [[ -n "$_sname" ]] || continue
+                if ! _thinker_busy "$_sname"; then continue; fi   # step ended on its own
+                _age=$(( SECONDS - _sat ))
+                _spid=""
+                for _e in $_step_entries; do
+                    [[ "${_e%%:*}" == "$_sname" ]] && _spid="${_e#*:}"
+                done
+                if [[ -z "$_sterm" ]]; then
+                    if (( _age < THINKERS_STEP_GRACE )); then
+                        _new="${_new}${_sname}${_tab}${_sat}${_tab}${_srid}${_tab}${_straj}${_tab}${_nl}"
+                        continue
+                    fi
+                    _left=$(ps -o pid=,etime=,args= -g "$_spid" 2>/dev/null | grep -v "^ *${_spid} " | cut -c1-120 | tr '\n' ';' || true)
+                    printf '%s [dispatcher] STUCK: %s step (pid %s) is still running %ss after its run %s wrote its final — sending TERM. Still alive in its process group: %s\n' \
+                        "$(date -u +%FT%TZ)" "$_sname" "$_spid" "$_age" "$_srid" "${_left:-none}" >&2
+                    _append_traj_error "$_straj" "step-stuck" \
+                        "dispatcher: the $_sname step (pid $_spid) was still running ${_age}s after its run's final step, so the dispatcher ended it (TERM). A step that never exits arms no next wake, and the mind goes silent. Usual cause: a process the run left in the background holding the step's output open. Do not background servers or long jobs inside a wake; hand them to a scratch identity or a systemd unit instead."
+                    [[ -n "$_spid" ]] && _kill_tree "$_spid" TERM
+                    _new="${_new}${_sname}${_tab}${_sat}${_tab}${_srid}${_tab}${_straj}${_tab}${SECONDS}${_nl}"
+                elif (( SECONDS - _sterm >= 15 )); then
+                    printf '%s [dispatcher] STUCK: %s step (pid %s) ignored TERM for 15s — sending KILL\n' \
+                        "$(date -u +%FT%TZ)" "$_sname" "$_spid" >&2
+                    [[ -n "$_spid" ]] && _kill_tree "$_spid" KILL
+                    # drop the record; prune reaps the pid on the next tick
+                else
+                    _new="${_new}${_sname}${_tab}${_sat}${_tab}${_srid}${_tab}${_straj}${_tab}${_sterm}${_nl}"
+                fi
+            done <<< "$_stuck"
+            _stuck="$_new"
         }
 
         # Fire the watchdog for watched thinkers whose window elapsed with no
@@ -762,8 +899,63 @@ _start_dispatcher() {
         # the monolith's old per-step `setsid` background timer, which never ran
         # on macOS (no setsid) so spontaneity silently died. Generic over any
         # thinker; the monolith is the only current writer.
+        # Crash recovery for claim receipts. claimed/<name> exists only between
+        # the claim and the launch of its step, so one older than
+        # THINKERS_CLAIM_STALE_SECS means the dispatcher died in that window and
+        # the send would otherwise be lost silently. Re-arm it as a due wake so
+        # the normal path fires it again: a scheduled wake is at-least-once, and
+        # a rare repeat is better than a post that never goes out.
+        _sweep_claims() {
+            local _cf _cbase _cm _cage _cwa _ct _wt _sf _sm _sage _stale="${THINKERS_CLAIM_STALE_SECS:-30}"
+            for _cf in "$run_dir"/claimed/*; do
+                [[ -f "$_cf" ]] || continue
+                _cm=$(stat -c %Y "$_cf" 2>/dev/null || stat -f %m "$_cf" 2>/dev/null || echo 0)
+                _cage=$(( $(date +%s) - _cm ))
+                (( _cage < _stale )) && continue
+                _cbase=$(basename "$_cf")
+                _cwa="$run_dir/$_cbase.wake_at"
+                # A stale claim and a wake_at for the same name collide on one
+                # name-keyed due time, and one pending due time per name is the
+                # scheduler's contract. The wake_at is the live schedule, so drop the
+                # claim and keep the scheduled time. The claim's own due time is in the
+                # past by the time it is stale (a claim only forms once its wake is
+                # already due) and the payload either one fires is the same constant
+                # wake for the name, so re-arming with the claim's time only fires the
+                # live occurrence early: the early send this sweep guards against.
+                if [[ -f "$_cwa" ]]; then
+                    _ct=$(cat "$_cf" 2>/dev/null) || _ct=""
+                    _wt=$(cat "$_cwa" 2>/dev/null) || _wt=""
+                    if [[ "$_wt" =~ ^[0-9]+$ ]]; then
+                        printf '%s [dispatcher]   dropped stale claim %s, kept scheduled wake_at %s\n' "$(date -u +%FT%TZ)" "$_cbase" "$_wt" >&2
+                    elif [[ "$_ct" =~ ^[0-9]+$ ]]; then
+                        printf '%s' "$_ct" > "$_cwa" 2>/dev/null || true
+                        printf '%s [dispatcher]   re-armed stale claim %s (age %ss)\n' "$(date -u +%FT%TZ)" "$_cbase" "$_cage" >&2
+                    else
+                        printf '%s [dispatcher]   dropped stale claim %s (unreadable due time), left the existing wake_at alone\n' "$(date -u +%FT%TZ)" "$_cbase" >&2
+                    fi
+                    rm -f "$_cf"
+                else
+                    mv -f "$_cf" "$_cwa" 2>/dev/null || rm -f "$_cf"
+                    printf '%s [dispatcher]   re-armed stale claim %s (age %ss)\n' "$(date -u +%FT%TZ)" "$_cbase" "$_cage" >&2
+                fi
+            done
+            # A sent receipt that outlived its step is a crash between the launch
+            # and the cleanup. The send already happened, so drop the evidence
+            # rather than re-arm it: re-arming here is exactly the double fire.
+            for _sf in "$run_dir"/sent/*; do
+                [[ -f "$_sf" ]] || continue
+                _sm=$(stat -c %Y "$_sf" 2>/dev/null || stat -f %m "$_sf" 2>/dev/null || echo 0)
+                _sage=$(( $(date +%s) - _sm ))
+                (( _sage < _stale )) && continue
+                rm -f "$_sf"
+                printf '%s [dispatcher]   dropped stale sent receipt %s (age %ss)\n' "$(date -u +%FT%TZ)" "$(basename "$_sf")" "$_sage" >&2
+            done
+            return 0
+        }
+
         _scheduled_wake_check() {
             local _wf _wname _wat _now
+            _sweep_claims
             _now=$(date +%s)
             for _wf in "$run_dir"/*.wake_at; do
                 [[ -f "$_wf" ]] || continue
@@ -777,10 +969,38 @@ _start_dispatcher() {
                 _thinker_busy "$_wname" && continue
                 _count_active_steps
                 if [[ "$_active_step_count" -ge "$THINKERS_MAX_CONCURRENT" ]]; then continue; fi
-                rm -f "$_wf"
+                # Atomic claim: mv is the mutex. Exactly one dispatcher wins
+                # a due wake file; the others find it gone and skip, so one
+                # wake is dispatched however many dispatchers are ticking.
+                mkdir -p "$run_dir/claimed"
+                # Claim receipt: this file lives from the claim until the step
+                # is launched, so a crash in that window leaves evidence instead
+                # of swallowing the send. touch resets the clock, since mv keeps
+                # the mtime of the wake file's own write time (which can be
+                # hours old for a wake that was armed in advance).
+                _claim="$run_dir/claimed/$_wname"
+                mv "$_wf" "$_claim" 2>/dev/null || continue
+                touch "$_claim" 2>/dev/null
+                if [[ -n "${THINKERS_TEST_DIE_AFTER_CLAIM:-}" ]]; then
+                    # Fault injection for test_dispatcher_single_owner.sh: die
+                    # between the claim and the launch on purpose.
+                    kill -KILL "${BASHPID:-$$}" 2>/dev/null || exit 1
+                fi
+                # Sent receipt: renamed across atomically just before the launch.
+                # From here the send belongs to this dispatcher, and _sweep_claims
+                # never re-arms a sent receipt, so a crash after the launch cannot
+                # send the same wake twice. The trade is deliberate and narrow: a
+                # crash in the mv itself is still covered by the claim receipt
+                # above and stays at-least-once, while anything after the rename
+                # can at worst lose a send, never double it.
+                mkdir -p "$run_dir/sent"
+                _sent="$run_dir/sent/$_wname"
+                mv "$_claim" "$_sent" 2>/dev/null || continue
+                touch "$_sent" 2>/dev/null
                 printf '%s [dispatcher]   scheduled wake -> %s (due %ss ago)\n' "$(date -u +%FT%TZ)" "$_wname" "$((_now - _wat))" >&2
                 _dispatch_step "$_wname" "$(jq -nc --arg source monolith-timer \
                     '{type:"monolith-wake", content:"wake", source:$source}')"
+                rm -f "$_sent"
             done
         }
 
@@ -800,6 +1020,7 @@ _start_dispatcher() {
             fi
             _fire_pending
             _watchdog_check
+            _stuck_step_check
             _scheduled_wake_check
             _respawn_dead_feeders
         }
@@ -907,13 +1128,25 @@ _start_dispatcher() {
             # thinker was busy is delivered before this newer step
             _fire_pending
 
-            # Parse step
-            _step_type=$(printf '%s' "$_step_json" | jq -r '.type // empty' 2>/dev/null) || continue
-            _step_source=$(printf '%s' "$_step_json" | jq -r '.source // empty' 2>/dev/null) || true
+            # Parse step: one jq call for everything the loop reads. step_id,
+            # run_id and launched_by feed the stuck-step guard. Fields are
+            # joined with the unit separator (0x1f): unlike a tab, it is not
+            # IFS whitespace, so `read` keeps empty fields in place instead
+            # of collapsing a missing source into the step_id slot.
+            _step_type="" _step_source="" _step_sid="" _step_rid="" _step_lby=""
+            IFS=$'\x1f' read -r _step_type _step_source _step_sid _step_rid _step_lby < <(
+                printf '%s' "$_step_json" \
+                | jq -r '[.type, .source, .step_id, .run_id, .launched_by] | map(. // "" | tostring) | join("\u001f")' 2>/dev/null
+            ) || true
 
             if [[ -z "$_step_type" ]]; then continue; fi
 
             printf '%s [dispatcher] step: type=%s source=%s\n' "$(date -u +%FT%TZ)" "$_step_type" "$_step_source" >&2
+
+            case "$_step_type" in
+                shellm-run) _stuck_note_run "$_step_sid" "$_step_lby" ;;
+                final)      _stuck_note_final "$_step_rid" "$_traj_file" ;;
+            esac
 
             # Find matching thinkers by scanning sub_map
             while IFS=$'\t' read -r _name _straj _stypes _sself _swd; do

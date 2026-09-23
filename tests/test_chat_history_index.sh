@@ -129,7 +129,7 @@ if [[ "$(jq -r .step_id "$IDX" | grep -c '^n')" == 0 ]] && [[ "$(wc -l < "$IDX" 
 else
     bad "index holds only the 7 message steps" "$(wc -l < "$IDX") lines"
 fi
-read -r off hdr < "$IDX.offset"
+read -r off hdr _ < "$IDX.offset"   # offset, header, then inode and size (2026-09-15)
 [[ "$off" == "$(wc -c < "$TRAJ" | tr -d ' ')" && "$hdr" == hdr-1 ]] && ok "offset file records the consumed bytes and the header" || bad "offset file records the consumed bytes and the header" "got '$off $hdr'"
 
 # incremental: append, no rebuild
@@ -141,7 +141,7 @@ n=$(chat history --with "$ANDY_T1" --json | jq 'length')
 # partial last line: not consumed, offset not advanced past it
 printf '{"step_id":"a7","type":"message","from":"%s","to":"%s","content":"half writ' "$ANDY_DM" "$ME" >> "$TRAJ"
 n=$(chat history --with "$ANDY_T1" --json | jq 'length')
-read -r off hdr < "$IDX.offset"
+read -r off hdr _ < "$IDX.offset"   # offset, header, then inode and size (2026-09-15)
 full=$(wc -c < "$TRAJ" | tr -d ' ')
 if [[ "$n" == 6 && "$off" -lt "$full" ]]; then
     ok "a partial last line is left for the next call"
@@ -157,7 +157,7 @@ n=$(chat history --with "$ANDY_T1" --json | jq 'length')
 header hdr-2
 msg z1 pwa-andy "$ME" "hello from the phone" 30
 n=$(chat history --with pwa-andy --json | jq 'length')
-read -r off hdr < "$IDX.offset"
+read -r off hdr _ < "$IDX.offset"   # offset, header, then inode and size (2026-09-15)
 [[ "$n" == 1 && "$hdr" == hdr-2 && "$(wc -l < "$IDX" | tr -d ' ')" == 1 ]] && ok "a replaced trajectory rebuilds the index" || bad "a replaced trajectory rebuilds the index" "n=$n hdr=$hdr lines=$(wc -l < "$IDX")"
 
 # --- aliases via a person memory ---------------------------------------------

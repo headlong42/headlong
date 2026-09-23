@@ -541,17 +541,31 @@ awk -v drops="\$DROPS" '
     /^pick / { for (i = 1; i <= n; i++) if (index(D[i], \$2) == 1) next }
     { print }
 ' "\$todo.orig" > "\$todo"
+# How many commits survive the filter. Zero makes git report "nothing to
+# do" and exit non-zero, which is the success case handled below.
+grep -c '^pick ' "\$todo" > /tmp/audel-todo-remaining || true
 FEOF
 chmod +x /tmp/audel-todo-filter.sh
 stashed=0
 if [ -n "\$(g status --porcelain)" ]; then
     g stash push -u -m audel-commits-reconcile >/dev/null && stashed=1
 fi
+rm -f /tmp/audel-todo-remaining
 if ! sudo -u shellm env DROPS="\$DROPS" GIT_SEQUENCE_EDITOR=/tmp/audel-todo-filter.sh GIT_EDITOR=true git -C /opt/shellm/app rebase -i origin/main; then
-    g rebase --abort || true
-    [ "\$stashed" -eq 1 ] && { g stash pop || true; }
-    echo "rebase CONFLICT — aborted, box left as it was" >&2
-    exit 1
+    g rebase --abort >/dev/null 2>&1 || true
+    if [ "\$(cat /tmp/audel-todo-remaining 2>/dev/null)" = "0" ]; then
+        # Every box commit was either already upstream or dispositioned
+        # away (2026-09-14: the one box commit was a rejected signing
+        # patch). git calls an empty todo "nothing to do" and fails; the
+        # box should simply be levelled with origin/main. --keep refuses
+        # if it would clobber a tracked change, and untracked files are
+        # in the stash.
+        g reset --keep origin/main
+    else
+        [ "\$stashed" -eq 1 ] && { g stash pop || true; }
+        echo "rebase CONFLICT — aborted, box left as it was" >&2
+        exit 1
+    fi
 fi
 [ "\$stashed" -eq 1 ] && { g stash pop || echo "warning: stash pop conflicted — agent WIP left in the stash" >&2; }
 echo "=== AFTER ==="

@@ -112,7 +112,17 @@ fence 'shellm -q --max-iterations 1 "sub task" > sub.txt 2>&1; echo "sub done"' 
 printf '30' > "$WORK/script/2.sleep"
 fence 'FINAL=sub-answer' > "$WORK/script/2"
 fence 'FINAL=done' > "$WORK/script/last"
+# Sample the process table while the case runs. On a failure the last samples
+# show every process group and which members were stopped (STAT T) when the
+# tree was killed; the macOS SIGHUP death of 2026-09-17 left no other evidence.
+( while :; do
+      { date -u +%T; ps -axo pid=,ppid=,pgid=,stat=,command= | grep -F "$WORK" | grep -v 'grep -F' | cut -c1-160; echo; } >> "$WORK/ps.samples"
+      sleep 0.5
+  done ) 2>/dev/null &
+sampler=$!
 SHELLM_INACTIVITY_TIMEOUT=3 SHELLM_INACTIVITY_MAX=8 run_shellm "ceiling case"
+ceiling_rc=$?
+kill "$sampler" 2>/dev/null; wait "$sampler" 2>/dev/null
 if grep -q 'shellm-watchdog\] nested timeout' "$WORK/err"; then
     ok "nested run past SHELLM_INACTIVITY_MAX is killed"
 else
@@ -124,7 +134,11 @@ if grep -q 'A nested shellm run was still alive' "${ceiling_traj[@]}" 2>/dev/nul
     ok "kill feedback names the sub-run, not an interactive prompt"
 else
     bad "kill feedback names the sub-run, not an interactive prompt" \
-        "$(grep -o '"type":"feedback"[^}]*' "${ceiling_traj[@]}" 2>/dev/null | head -c 200)"
+        "shellm rc=$ceiling_rc; $(tail -10 "$WORK/err")"
+    echo "--- process samples (pid ppid pgid stat command), last 120 lines:"
+    tail -120 "$WORK/ps.samples" 2>/dev/null || true
+    jq -c 'select(.type == "shell-output" or .type == "feedback") | {type,exit,timed_out,feedback,content}' \
+        "${ceiling_traj[@]}" 2>/dev/null || true
 fi
 
 # --- case 4: without beacon stamps the same block dies, as it used to --------

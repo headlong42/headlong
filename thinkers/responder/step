@@ -22,6 +22,16 @@ THINK_MODEL="${THINK_MODEL:-${SHELLM_MODEL:-claude-opus-4-7}}"
 THINK_CONTEXT_TAIL="${THINK_CONTEXT_TAIL:-20}"
 REPLY_MODEL="${MONOLITH_REPLY_MODEL:-$THINK_MODEL}"
 
+# The reply call is bounded twice, on its own, never inherited from the mind:
+# RESPONDER_MAX_TOKENS caps the output (reasoning counts against it; the
+# largest real reply on either persona was about 5K tokens, nearly all
+# thinking, and a DeepSeek runaway pads whitespace up to whatever the cap
+# is) and RESPONDER_MAX_TIME caps the wall clock (the inherited 600 s let one
+# runaway hold a reply for ten minutes on 2026-09-21). bin/llm's own retries
+# are off here: a second three-minute attempt is not a chat reply.
+RESPONDER_MAX_TOKENS="${RESPONDER_MAX_TOKENS:-8192}"
+RESPONDER_MAX_TIME="${RESPONDER_MAX_TIME:-180}"
+
 # Wall-clock milliseconds, for compose_ms. Same perl path bin/traj uses for
 # its timestamps; the fallback is whole seconds, still a valid number.
 _now_ms() {
@@ -30,12 +40,90 @@ _now_ms() {
 }
 t_start_ms=$(_now_ms)
 
+# What the reply call(s) did, merged into every decision observation by
+# _finish_metrics: llm_ms (all calls), llm_calls, out_tok / think_tok /
+# served_by (from bin/llm's usage record; served_by is OpenRouter's upstream
+# host, one model id there is two dozen hosts at different speeds),
+# truncated, timed_out. Failures add `failure`: timeout, truncated, parse,
+# markup, empty, send.
+_llm_meta='{}'
+_llm_timed_out=0
+_llm_truncated=0
+_llm_calls=0
+# _reply_llm runs inside a command substitution (its stdout is the reply),
+# so its record travels through a file (_rl_meta_file, made right before the
+# call) and _rl_sync pulls it into this shell.
+_rl_meta_file=""
+_reply_llm() {   # _reply_llm <llm args...>; stdout = the reply, rc = llm's rc
+    local usage err rc t0 ms rec prev
+    usage=$(mktemp) || return 1
+    err=$(mktemp) || { rm -f "$usage"; return 1; }
+    t0=$(_now_ms)
+    rc=0
+    LLM_USAGE_FILE="$usage" LLM_MAX_TIME="$RESPONDER_MAX_TIME" LLM_RETRIES=0 \
+        llm -t "$RESPONDER_MAX_TOKENS" "$@" 2>"$err" || rc=$?
+    ms=$(( $(_now_ms) - t0 ))
+    cat "$err" >&2
+    local truncated=0 timed_out=0
+    grep -q 'output truncated at max_tokens' "$err" 2>/dev/null && truncated=1
+    grep -qE 'timed out|curl: \(28\)' "$err" 2>/dev/null && timed_out=1
+    rec=""
+    [[ -s "$usage" ]] && rec=$(jq -c 'select(type == "object")' "$usage" 2>/dev/null | head -1)
+    [[ -n "$rec" ]] || rec='{}'
+    prev=$(cat "$_rl_meta_file" 2>/dev/null); [[ -n "$prev" ]] || prev='{}'
+    jq -nc --argjson prev "$prev" --argjson rec "$rec" --argjson ms "$ms" \
+        --argjson tr "$truncated" --argjson to "$timed_out" '
+        $prev
+        + {llm_ms: (($prev.llm_ms // 0) + $ms), llm_calls: (($prev.llm_calls // 0) + 1)}
+        + ($rec | {out_tok, think_tok, served_by} | with_entries(select(.value != null)))
+        + (if $tr == 1 or ($rec.truncated == true) then {truncated: true} else {} end)
+        + (if $to == 1 then {timed_out: true} else {} end)' > "$_rl_meta_file" 2>/dev/null \
+        || printf '%s' "$prev" > "$_rl_meta_file"
+    rm -f "$usage" "$err"
+    return "$rc"
+}
+_rl_sync() {   # after each _reply_llm: its record into this shell's variables
+    _llm_meta=$(cat "$_rl_meta_file" 2>/dev/null); [[ -n "$_llm_meta" ]] || _llm_meta='{}'
+    _llm_timed_out=$(printf '%s' "$_llm_meta" | jq -r 'if .timed_out == true then 1 else 0 end' 2>/dev/null) || _llm_timed_out=0
+    _llm_truncated=$(printf '%s' "$_llm_meta" | jq -r 'if .truncated == true then 1 else 0 end' 2>/dev/null) || _llm_truncated=0
+    _llm_calls=$(printf '%s' "$_llm_meta" | jq -r '.llm_calls // 0' 2>/dev/null) || _llm_calls=0
+}
+
+# Card redaction for everything this step writes: the reply sent back, the
+# observations, the deferral handoff, and person notes. The triggering
+# message is the record and keeps its raw content in the log, and the model
+# still sees the raw text in its prompt (the work may need the digits); what
+# stays out is OUR restatements, because recap lifts digit text upward into
+# sealed summary blocks. Redaction is by shape first (three or four groups
+# of four with single separators, or a contiguous 13-19 digit run) and by
+# keyword second (card/pan/credit/debit/amex/visa/mastercard near a long
+# digit run, which also catches Amex's 4-6-5 grouping), plus keyword-anchored
+# cvv and expiry forms. A bare MM/YY is deliberately not redacted: that is
+# also a date and dates are facts the work needs, so an expiry only goes
+# when a keyword says it is one. Verification codes stay: an OTP relayed in
+# chat is the work's input. POSIX ERE only: stock macOS sed has no word boundary escape (the CI Mac job caught these rules silently not matching there), so every boundary is an explicit (^|[^0-9A-Za-z]) restored by backreference; the I flag is honored on both the GNU and FreeBSD lineages.
+_redact_card() {
+    sed -E \
+        -e 's/[0-9]{4}([ -][0-9]{4}){2,3}/[card redacted]/g' \
+        -e 's/(^|[^0-9A-Za-z])[0-9]{13,19}/\1[card redacted]/g' \
+        -e 's/(^|[^0-9A-Za-z])(card|pan|credit|debit|amex|visa|mastercard)[^A-Za-z0-9]{0,8}(the |is |was )?[0-9][0-9 -]{11,27}[0-9]/\1\2 [card redacted]/Ig' \
+        -e 's/(^|[^0-9A-Za-z])(cvv|cvc|cvv2|csc|security code|sec code)[ :.,=-]*(the |is |was )?[0-9]{3,4}/\1\2 [redacted]/Ig' \
+        -e 's/(^|[^0-9A-Za-z])(exp|expiry|expiration|expires|good (through|thru))[ :.,=-]*(the |is |was )?[0-9]{1,2}\/[0-9]{2,4}/\1\2 [redacted]/Ig'
+}
+
 # Read the triggering step from stdin.
 step_json=$(cat)
 [[ -z "$step_json" ]] && exit 0
 trigger_type=$(printf '%s' "$step_json" | jq -r '.type // empty' 2>/dev/null) || true
 trigger_content=$(printf '%s' "$step_json" | jq -r '.content // empty' 2>/dev/null) || true
 trigger_step_id=$(printf '%s' "$step_json" | jq -r '.step_id // empty' 2>/dev/null) || true
+
+# One redacted excerpt for every observation that quotes the message: the
+# failure exits below (timeout, token cap, broken JSON, raw JSON) and the
+# quiet paths all interpolate this, never the raw content. Redacted before
+# the 200-byte cut so digits straddling the cut are still caught.
+trigger_excerpt=$(printf '%s' "$trigger_content" | _redact_card)
+trigger_excerpt=$(printf '%.200s' "$trigger_excerpt")
 
 [[ "$trigger_type" == "message" ]] || exit 0
 
@@ -86,7 +174,7 @@ _obs() {
 # Self-message guard: replying would create a self-chat loop.
 if [[ "$msg_from" == "$IDENTITY_NAME" ]]; then
     printf '  self-message — dropping with observation\n' >&2
-    _obs "self-message dropped: you chat-sent a message to yourself and it will not be replied to (replying would loop). To message someone else use: chat reply <their-name> <message>. To keep a note for later, write it as a thought step instead. Your message was: $(printf '%.200s' "$trigger_content")"
+    _obs "self-message dropped: you chat-sent a message to yourself and it will not be replied to (replying would loop). To message someone else use: chat reply <their-name> <message>. To keep a note for later, write it as a thought step instead. Your message was: $trigger_excerpt"
     exit 0
 fi
 
@@ -263,9 +351,13 @@ _finish_metrics() {
     local ms gap
     ms=$(( $(_now_ms) - t_start_ms ))
     gap=$(_gap_s) || gap=""
-    printf '%s' "$metrics_json" | jq -c --argjson ms "$ms" --arg g "$gap" \
-        '. + {compose_ms: $ms} + (if $g == "" then {} else {gap_s: ($g | tonumber)} end)' \
+    printf '%s' "$metrics_json" | jq -c --argjson ms "$ms" --arg g "$gap" --argjson llm "$_llm_meta" --arg p "${_parse:-}" \
+        '. + $llm + {compose_ms: $ms} + (if $g == "" then {} else {gap_s: ($g | tonumber)} end)
+           + (if $p == "" then {} else {parse: $p} end)' \
         2>/dev/null || printf '%s' "$metrics_json"
+}
+_fail_metrics() {   # _fail_metrics <kind>: the metrics plus what went wrong
+    _finish_metrics | jq -c --arg k "$1" '. + {failure: $k}' 2>/dev/null || _finish_metrics
 }
 
 # ---------------------------------------------------------------------------
@@ -311,7 +403,79 @@ $_pnb
     fi
 fi
 
-reply_system="$system_prompt
+# ---------------------------------------------------------------------------
+# Reply voice and shape
+# ---------------------------------------------------------------------------
+# The voice is concrete bans, not adjectives. The 2026-09-16 replay of 57
+# real prompts (headlong-experiments/responder-defer) showed "first person,
+# natural, conversational, concise" left 94% of replies with em dashes, a
+# third over 400 characters and a fifth in three or more paragraphs; this
+# block cut those to 3%, 3% and 0% and a blind judge preferred its
+# readability 20 to 1. The deferral protocol is stated INSIDE the block on
+# purpose: the same block without it halved deferrals and produced bare
+# "Let me look into that" replies with no work behind them.
+#
+# Shape: with RESPONDER_STRUCTURED=1, or auto (default) on a model whose
+# provider enforces a JSON Schema, the model returns one object
+# {action, message, request} through `llm --json-schema` (reply.schema.json
+# beside this step), which makes the reply/defer/no_reply decision a
+# required field instead of a first line the model can forget. On the same
+# replay the structured form kept every deferral and was judged clearer
+# 12 to 6. Any other model, RESPONDER_STRUCTURED=0, or a failed schema call
+# uses the text protocol (DEFER: first line / NO_REPLY) unchanged.
+RESPONDER_STRUCTURED="${RESPONDER_STRUCTURED:-auto}"
+_schema_file="$SCRIPT_DIR/reply.schema.json"
+_supports_schema() {
+    case "$1" in
+        deepseek/*|x-ai/*|z-ai/glm-5*|moonshotai/*|qwen/*|meta-llama/*|mistralai/*|google/gemini*|openai/*|gpt-4o*|gpt-5*|o1*|o3*|o4*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+structured=0
+case "$RESPONDER_STRUCTURED" in
+    1) structured=1 ;;
+    0) structured=0 ;;
+    *) _supports_schema "$REPLY_MODEL" && structured=1 ;;
+esac
+[[ -f "$_schema_file" ]] || structured=0
+
+_compose_reply_system() {   # $1 = 1 structured, 0 text; sets reply_system
+    local defer_rule defer_para noreply_rule output_para
+    if [[ "$1" -eq 1 ]]; then
+        defer_rule='answer with action "defer", the work in "request" (one line) and one short
+  holding sentence in "message". A holding sentence with action "reply" is a
+  promise nobody will keep.'
+        defer_para='Answer completely from what you already know. If a real answer needs tools,
+files, or looking something up, do not guess and do not promise to check
+yourself: hand the work to the mind with action "defer" and send a short
+holding message such as "Let me look into that and get back to you." The
+mind follows up with the result.'
+        noreply_rule='use action "no_reply" with an empty message.'
+        output_para='Output ONLY one JSON object and nothing else (no code fence, no preamble):
+{"action": "reply" | "defer" | "no_reply",
+ "message": "the reply text to send; empty when no_reply",
+ "request": "one line describing the work for the mind; only when defer, else empty"}
+The message follows the rules above: no dashes, no markdown, no praise
+opener, no closing question. It is delivered automatically: never write
+'"'"'chat reply'"'"' or the recipient'"'"'s address inside it, and never put commands in it.
+Check before you answer: does this need work you cannot do inside this reply?
+Then action is "defer", request is the work, message is the holding sentence.'
+    else
+        defer_rule='write `DEFER: <the work, one line>` as the first line and one short holding
+  sentence as the second. A holding sentence without the DEFER line is a
+  promise nobody will keep.'
+        defer_para='Answer completely from what you already know. If a real answer needs tools,
+files, or looking something up, do not guess and do not promise to check
+yourself: put `DEFER: <the work, one line>` on the first line, then the short
+message to send (e.g. "Let me look into that and get back to you."). The work
+is handed to the mind, which follows up with the result.'
+        noreply_rule='output exactly NO_REPLY on its own line and nothing else.'
+        output_para='Output ONLY the reply message text, no preamble, no quotes, no commands.
+Delivery is automatic: never write '"'"'chat reply'"'"' or the recipient'"'"'s address.
+Check before you answer: does this need work you cannot do inside this reply?
+Then the first line is DEFER: and the second is the holding sentence.'
+    fi
+    reply_system="$system_prompt
 
 The current time is $now_utc. You are in a live chat conversation with
 $msg_from. The messages are the real back-and-forth so far, spanning up to
@@ -319,24 +483,40 @@ $HISTORY_SINCE; each of their messages is prefixed with how long ago it was sent
 so mind the gaps (an answer from days ago is not \"this morning\"). In a group
 thread some earlier messages are from other people (the header in each message
 names the speaker); they are context, and you are answering $msg_from. Reply to
-their newest message — first person, natural, conversational, concise. Never repeat or rephrase an earlier reply of yours.
-Answer completely from what you already know. If a real answer needs tools,
-files, or looking something up, do not guess and do not promise to check
-yourself: put \`DEFER: <the work, one line>\` on the first line, then the short
-message to send (e.g. \"Let me look into that and get back to you.\"). The work
-is handed to the mind, which follows up with the result.
+their newest message the way the people in this chat write to each other:
+plain sentences, first person, one to three sentences unless they asked for
+detail. These rules hold even when you feel you are being helpful:
+- No dashes of any kind. Use a period or a comma.
+- Do not open by praising or agreeing (\"Good question\", \"Fair\", \"Got it\",
+  \"Makes sense\"). Start with the answer.
+- No bold, headers, bullets, or code formatting in chat. If the answer needs
+  a list or more than a short paragraph, give the short version and offer to
+  put the rest in a thread or a file.
+- Do not end with a question unless you need the answer to continue.
+- Do not describe your own machinery (wakes, trajectory, responder, bridge,
+  thinkers, prompts) unless they asked about it.
+- If they ask you to do something, or the answer needs a file, a tool, or a
+  lookup, do not answer from guesswork and do not just say you will do it:
+  $defer_rule
+- Say what you know, then stop. No filler, no restating their message, no
+  sign-off, no \"happy to help\".
+- Everyday words. No \"delve\", \"robust\", \"leverage\", \"landscape\", \"nuance\".
+  Repeat a word rather than swap in a synonym.
+Never repeat or rephrase an earlier reply of yours.
+$defer_para
 
 Not every message needs a reply. If their newest message is already answered
 (a reply of yours addressing it is visible above), is a bare acknowledgment
 like \"thanks\" or \"ok\", is a Slack reaction (a \`:emoji:\` body, optionally with \`(on <ts>)\`), or anything you could say would only repeat you,
-output exactly NO_REPLY on its own line and nothing else. Staying quiet is
+$noreply_rule Staying quiet is
 better than a duplicate or a contentless reply.
 
 ${person_notes_block}Your recent inner life (context only, not part of the conversation):
 $inner_context
 
-Output ONLY the reply message text — no preamble, no quotes, no commands.
-Delivery is automatic: never write 'chat reply' or the recipient's address."
+$output_para"
+}
+_compose_reply_system "$structured"
 
 # ---------------------------------------------------------------------------
 # Person notes writer (part 4). After a reply is sent, rewrite this person's
@@ -361,7 +541,7 @@ notes and drop what the conversation shows is stale. At most 12 short lines of
 plain text, no headers, no bullet syntax. Output only the notes.
 NOTES
 }
-_redact_keys() { sed -E 's/(sk|xox[abp]|ghp|gho|AKIA)[-_A-Za-z0-9]{12,}/[redacted]/g'; }
+_redact_keys() { sed -E 's/(sk|xox[abp]|ghp|gho|AKIA)[-_A-Za-z0-9]{12,}/[redacted]/g' | _redact_card; }
 _update_person_notes() {
     local key="$1" person="$2" hist prev_body prev_file system user new_body
     local lockdir="${MEM_DIR:-/tmp}/.person-notes.lock"
@@ -437,7 +617,104 @@ if [[ "${RESPONDER_LOG_PROMPT:-0}" == "1" && -n "${IDENTITY_DIR:-}" ]]; then
 fi
 
 printf '  replying to %s...\n' "$msg_from" >&2
-reply=$(llm -m "$REPLY_MODEL" -M "$convo_json" -s "$reply_system") || true
+reply=""
+_parse="text"
+_rl_meta_file=$(mktemp)
+printf '{}' > "$_rl_meta_file"
+if [[ "$structured" -eq 1 ]]; then
+    _parse="structured"
+    if ! reply=$(_reply_llm -m "$REPLY_MODEL" -M "$convo_json" -s "$reply_system" --json-schema "$_schema_file"); then
+        _rl_sync
+        if [[ "$_llm_timed_out" -eq 1 || "$_llm_truncated" -eq 1 ]]; then
+            # The budget is spent (the wall clock, or the whole token cap on
+            # nothing visible); a second attempt would only double the wait.
+            printf '  structured reply call spent its budget (timed out: %s, truncated: %s) — not retrying\n' "$_llm_timed_out" "$_llm_truncated" >&2
+            reply=""
+        else
+            # The provider refused the schema (or the call failed fast): once
+            # more as plain text so a model without structured output answers.
+            printf '  structured reply call failed — retrying as plain text\n' >&2
+            structured=0
+            _parse="text"
+            _compose_reply_system 0
+            reply=$(_reply_llm -m "$REPLY_MODEL" -M "$convo_json" -s "$reply_system") || true
+            _rl_sync
+            _llm_meta=$(printf '%s' "$_llm_meta" | jq -c '. + {fallback: true}' 2>/dev/null || printf '%s' "$_llm_meta")
+            printf '%s' "$_llm_meta" > "$_rl_meta_file"
+        fi
+    fi
+else
+    reply=$(_reply_llm -m "$REPLY_MODEL" -M "$convo_json" -s "$reply_system") || true
+fi
+_rl_sync
+rm -f "$_rl_meta_file"
+
+# Nothing came back and the call itself was the reason: say which.
+if [[ -z "$(printf '%s' "$reply" | tr -d '[:space:]')" ]]; then
+    if [[ "$_llm_timed_out" -eq 1 ]]; then
+        printf '  reply call timed out — appending failure observation\n' >&2
+        _obs "reply failed: the model took longer than ${RESPONDER_MAX_TIME}s to answer $msg_from, so nothing was sent. Reply to them yourself. Their message was: $trigger_excerpt" reply-failed "$(_fail_metrics timeout)"
+        exit 0
+    fi
+    if [[ "$_llm_truncated" -eq 1 ]]; then
+        printf '  reply hit the %s token cap with nothing usable — appending failure observation\n' "$RESPONDER_MAX_TOKENS" >&2
+        _obs "reply failed: the model spent its whole ${RESPONDER_MAX_TOKENS} token budget answering $msg_from and produced nothing usable, so nothing was sent. Reply to them yourself. Their message was: $trigger_excerpt" reply-failed "$(_fail_metrics truncated)"
+        exit 0
+    fi
+fi
+
+# Structured reply: read the object and hand the rest of the step the text
+# protocol it already knows (NO_REPLY line, DEFER: line + holding sentence,
+# or the message). An object that does not parse is treated as text, so a
+# model that ignored the format still gets the DEFER parser and the markup
+# guard below instead of an empty reply.
+# A cut-off object is repaired when the cut fell outside a string (DeepSeek's
+# 2026-09-21 shape: the object complete up to `"message":""`, then whitespace
+# to the cap): closing braces make it whole and every field is what the model
+# wrote. A cut inside a string is repaired only for no_reply, since a reply or
+# holding message cut mid-sentence must not reach the person. An object that
+# cannot be repaired is never sent as text: ten `{"action":"no_reply",...`
+# fragments went to Slack that way.
+_salvage_object() {   # _salvage_object <text>; stdout: the object, or nothing
+    local t c out
+    t=$(printf '%s' "$1" | sed -E '1s/^[[:space:]]*```(json)?[[:space:]]*//' | sed -E 's/[[:space:]]+$//')
+    for c in '}' '}}' '"}' '"}}'; do
+        out=$(printf '%s%s' "$t" "$c" | jq -c 'select(type == "object" and (.action | type) == "string")' 2>/dev/null) || continue
+        [[ -n "$out" ]] || continue
+        case "$c" in
+            '"'*) [[ "$(printf '%s' "$out" | jq -r '.action | ascii_downcase')" == "no_reply" ]] || return 1 ;;
+        esac
+        printf '%s' "$out"
+        return 0
+    done
+    return 1
+}
+
+if [[ "$structured" -eq 1 ]]; then
+    _obj=$(printf '%s' "$reply" | sed -E '1s/^[[:space:]]*```(json)?[[:space:]]*//' | sed -E '$s/[[:space:]]*```[[:space:]]*$//' \
+        | jq -c 'select(type == "object" and (.action | type) == "string")' 2>/dev/null) || _obj=""
+    if [[ -z "$_obj" ]] && _obj=$(_salvage_object "$reply") && [[ -n "$_obj" ]]; then
+        printf '  structured reply was cut off — repaired the object\n' >&2
+        _parse="salvaged"
+    fi
+    if [[ -n "$_obj" ]]; then
+        _action=$(printf '%s' "$_obj" | jq -r '.action | ascii_downcase')
+        _message=$(printf '%s' "$_obj" | jq -r '.message // ""')
+        _request=$(printf '%s' "$_obj" | jq -r '.request // "" | gsub("\n"; " ")')
+        case "$_action" in
+            no_reply) reply="NO_REPLY" ;;
+            defer)    reply=$(printf 'DEFER: %s\n%s' "$_request" "$_message") ;;
+            *)        reply="$_message" ;;
+        esac
+    elif printf '%s' "$reply" | grep -qE '^[[:space:]]*\{'; then
+        printf '  structured reply did not parse and could not be repaired — not sending\n' >&2
+        _obs "reply failed: the model's reply to $msg_from was a broken JSON object, so nothing was sent. Reply to them yourself. Their message was: $trigger_excerpt" reply-failed "$(_fail_metrics parse)"
+        exit 0
+    else
+        printf '  structured reply did not parse as an object — treating it as text\n' >&2
+        _parse="text"
+    fi
+fi
 
 # Drop leading blank lines first: the NO_REPLY and DEFER protocols key off
 # the first line, and a model that opens with a newline (Nemotron, 2026-09-10)
@@ -452,7 +729,7 @@ reply=$(printf '%s' "$reply" | sed -E '1s/^[[:space:]]*chat reply [A-Za-z0-9._-]
 first_line=$(printf '%s' "$reply" | head -n 1 | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//')
 if [[ "$first_line" == "NO_REPLY" ]]; then
     printf '  model declined to reply (NO_REPLY)\n' >&2
-    _obs "Chose not to reply to $msg_from — their message needed no reply (already answered, or a bare acknowledgment). Their message was: $(printf '%.200s' "$trigger_content")" no-reply "$(_finish_metrics)"
+    _obs "Chose not to reply to $msg_from — their message needed no reply (already answered, or a bare acknowledgment). Their message was: $trigger_excerpt" no-reply "$(_finish_metrics)"
     exit 0
 fi
 
@@ -463,10 +740,47 @@ fi
 # delivers the result with `chat reply --follow-up`. Without this the
 # responder's "let me check" bound nobody (Experiment C: 6 to 9 of 22 replies
 # promised work that never happened).
+#
+# The model does not always put the DEFER line first, or only once. Nemotron
+# has emitted it after the holding text, and on 2026-09-14 twice: the holding
+# sentence glued onto the first copy ("...headlong mainLet me open that PR
+# for you.") and a clean copy on the next line, so line 1 became the request
+# and line 2, still starting "DEFER:", was sent to Nick. So: the request is
+# the first DEFER line wherever it is (a shorter DEFER line that is a prefix
+# of it wins, which un-glues the duplicate case), every DEFER line is dropped
+# from the text sent, and what is left is the holding message.
+#
+# 2026-09-15 23:58Z shape: the holding sentence glued in FRONT of the DEFER
+# on one line ("...your wake prompt.DEFER: Investigate ..."), so the line
+# started with prose, no DEFER line was found, and the whole thing went to
+# Slack. A DEFER: glued to a non-space character is split onto its own line
+# first. A DEFER: after a space is left alone on purpose: that is the model
+# talking about the protocol ("the raw DEFER: handoff text"), not using it.
+reply=$(printf '%s\n' "$reply" | awk '{
+    i = index($0, "DEFER:")
+    if (i > 1 && substr($0, i - 1, 1) !~ /[[:space:]]/) { print substr($0, 1, i - 1); print substr($0, i) } else print
+}')
 deferred_request=""
-if [[ "$first_line" == DEFER:* ]]; then
-    deferred_request=$(printf '%s' "$first_line" | sed -E 's/^DEFER:[[:space:]]*//')
-    reply=$(printf '%s' "$reply" | sed '1d' | sed '/./,$!d')
+_defer_lines=$(printf '%s' "$reply" | grep -E '^[[:space:]]*DEFER:' || true)
+if [[ -n "$_defer_lines" ]]; then
+    while IFS= read -r _dl; do
+        _dl=$(printf '%s' "$_dl" | sed -E 's/^[[:space:]]*DEFER:[[:space:]]*//;s/[[:space:]]+$//')
+        [[ -n "$_dl" ]] || continue
+        if [[ -z "$deferred_request" ]]; then
+            deferred_request="$_dl"
+        elif [[ "$deferred_request" == "$_dl"* && ${#_dl} -lt ${#deferred_request} ]]; then
+            deferred_request="$_dl"
+        fi
+    done <<< "$_defer_lines"
+    # The handoff and every later restatement ride the redacted form; the
+    # original message step (its id is quoted in the action) stays the record.
+    deferred_request=$(printf '%s' "$deferred_request" | _redact_card)
+    # grep -v exits 1 when it drops every line (a bare DEFER); under pipefail
+    # that must not kill the step.
+    reply=$(printf '%s' "$reply" | grep -vE '^[[:space:]]*DEFER:' | sed '/./,$!d' || true)
+    # The un-glued shape leaves the holding sentence twice (before and after
+    # the DEFER); send a repeated non-blank line once.
+    reply=$(printf '%s\n' "$reply" | awk '!/[^[:space:]]/ || !seen[$0]++' | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}')
     [[ -z "$reply" ]] && reply="Let me look into that and get back to you."
     printf '  deferring to the mind: %s\n' "$deferred_request" >&2
     jq -nc --arg source "$THINKER_NAME" --arg trigger "$trigger_step_id" \
@@ -480,10 +794,33 @@ if [[ "$first_line" == DEFER:* ]]; then
         | traj append >/dev/null || true
 fi
 
+# Whatever path led here, a reply that still looks like the structured
+# object is not a message; the person would read raw JSON.
+if printf '%s' "$reply" | head -n 1 | grep -qE '^[[:space:]]*\{[[:space:]]*"action"'; then
+    printf '  reply is a raw action object — not sending\n' >&2
+    _obs "reply failed: the model's reply to $msg_from was a raw JSON object, so nothing was sent. Reply to them yourself. Their message was: $trigger_excerpt" reply-failed "$(_fail_metrics parse)"
+    exit 0
+fi
+
+# A reply that is tool-call markup is the model trying to act, not talk
+# (Nemotron 3 Ultra: "<function=skills>..." sent to a DM on 2026-09-15).
+# Never send it; surface it like a failed reply so the mind can answer.
+if printf '%s' "$reply" | head -n 1 | grep -qE '^[[:space:]]*<(function|tool_call|parameter|invoke)[=> ]'; then
+    printf '  model returned tool-call markup instead of a reply — not sending\n' >&2
+    _obs "reply failed: the model answered $msg_from with tool-call markup instead of a message, so nothing was sent. Reply to them yourself. Their message was: $trigger_excerpt" reply-failed "$(_fail_metrics markup)"
+    exit 0
+fi
+
+# What we send back never needs card digits: the sender has their own card,
+# and this text also lands in the log as a message step. Dates, times, and
+# confirmation numbers pass through untouched.
+reply=$(printf '%s' "$reply" | _redact_card)
+
 reply_args=()
 [[ -n "$trigger_step_id" ]] && reply_args+=(--reply-to "$trigger_step_id")
 if [[ -n "$reply" ]] && printf '%s' "$reply" | chat reply ${reply_args[@]+"${reply_args[@]}"} "$msg_from"; then
     _extra=$(_finish_metrics)
+    _extra=$(printf '%s' "$_extra" | jq -c --argjson s "$structured" --arg p "$_parse" '. + {structured: ($s == 1), parse: $p}')
     if [[ -n "$deferred_request" ]]; then
         _extra=$(printf '%s' "$_extra" | jq -c --arg r "$deferred_request" '. + {deferred: true, request: $r}')
         _obs "Replied to $msg_from with a holding message and handed the mind a pending request: $(printf '%.200s' "$deferred_request")" replied "$_extra"
@@ -497,4 +834,6 @@ fi
 
 # Reply failed — surface it so the monolith can pick it up.
 printf '  reply failed — appending failure observation\n' >&2
-_obs "reply failed: could not send a reply to $msg_from (empty model output or chat error — see responder log). Their message was: $(printf '%.200s' "$trigger_content")" reply-failed "$(_finish_metrics)"
+_kind=send
+[[ -n "$reply" ]] || _kind=empty
+_obs "reply failed: could not send a reply to $msg_from (empty model output or chat error — see responder log). Their message was: $trigger_excerpt" reply-failed "$(_fail_metrics "$_kind")"

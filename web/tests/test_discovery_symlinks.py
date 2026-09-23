@@ -116,3 +116,38 @@ def test_traversal_in_an_alias_id_is_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(KeyError):
         discovery.resolve_identity(root, "..~..~etc")
+
+
+def test_linked_identities_root_is_walked(tmp_path: Path) -> None:
+    """The whole .identities root kept outside the checkout and linked back
+    (the box layout since 2026-09-15): identities under it are found with
+    their usual ids and link-path locations, and a link INSIDE it is still
+    only a candidate, never recursed through."""
+    root = tmp_path / "root"
+    root.mkdir()
+    real_root = tmp_path / "var-lib" / "identities"
+    _identity(real_root / "harris", "harris")
+    (real_root / "default").symlink_to("harris")
+    (root / ".identities").symlink_to(real_root)
+    # a link inside the root to a tree that must not be walked
+    deep = tmp_path / "elsewhere" / "deep"
+    _identity(deep / "nested" / "hidden", "hidden")
+    (real_root / "trap").symlink_to(deep)
+
+    ids = _ids(root)
+    assert ".identities~harris" in ids
+    assert ids.count(".identities~harris") == 1
+    assert ".identities~default" not in ids
+    assert not any("hidden" in i for i in ids)
+    resolved = discovery.resolve_identity(root, ".identities~harris")
+    assert resolved.path == root / ".identities" / "harris"
+    assert discovery.resolve_identity(root, ".identities~default").id == ".identities~harris"
+
+
+def test_linked_root_that_is_itself_an_identity_stays_a_candidate(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    lone = _identity(tmp_path / "solo", "solo")
+    (root / ".identities").symlink_to(lone)
+    ids = _ids(root)
+    assert ids == [".identities"] or ".identities" in ids

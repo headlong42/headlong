@@ -199,6 +199,23 @@ class Inbound:
                 response = httpx.post(self._chat_url, json=body, timeout=30)
                 response.raise_for_status()
                 return
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 409:
+                    # The mind's tool refused the message on purpose (a
+                    # duplicate or a bad target); it will refuse it again,
+                    # and "couldn't reach my mind" would be untrue.
+                    log.warning(
+                        "chat POST refused for %s: %s", from_name, exc.response.text[:200]
+                    )
+                    return
+                log.warning(
+                    "chat POST failed (attempt %d/%d)",
+                    attempt,
+                    DELIVERY_ATTEMPTS,
+                    exc_info=True,
+                )
+                if attempt < DELIVERY_ATTEMPTS:
+                    time.sleep(2 * attempt)
             except httpx.HTTPError:
                 log.warning(
                     "chat POST failed (attempt %d/%d)",

@@ -115,7 +115,9 @@ The contract, implemented by the invoker in `bin/llm` (pinned by
 - Usage reporting: when the environment carries `LLM_USAGE_FILE`, the
   adapter writes one JSON object to that path, with any of `in_tok`,
   `out_tok`, `think_tok` as integers. `bin/llm` stamps the ledger from
-  it. An adapter that cannot count tokens writes nothing.
+  it. An adapter that cannot count tokens writes nothing. `bin/llm` itself
+  also records `served_by` (the upstream host, OpenRouter only) and
+  `truncated: true` (the output hit `max_tokens`) on the same record.
 - `bin/llm` wraps the adapter in its own wall-clock deadline
   (`LLM_MAX_TIME`). The adapter runs in its own process group; on
   expiry `bin/llm` TERMs the group, waits a 5s grace, then KILLs the
