@@ -914,23 +914,22 @@ _start_dispatcher() {
                 (( _cage < _stale )) && continue
                 _cbase=$(basename "$_cf")
                 _cwa="$run_dir/$_cbase.wake_at"
-                # A stale claim and a wake_at for the same name are two
-                # occurrences of one schedule. Keep the earlier due time: mv -f
-                # here used to resurrect the claim's own time over whatever
-                # fresher wake was written while the claim sat stale, firing the
-                # old occurrence out of order and destroying the new one. The
-                # earlier occurrence fires now and the step re-arms the
-                # recurrence on its way out.
+                # A stale claim and a wake_at for the same name collide on one
+                # name-keyed due time, and one pending due time per name is the
+                # scheduler's contract. The wake_at is the live schedule, so drop the
+                # claim and keep the scheduled time. The claim's own due time is in the
+                # past by the time it is stale (a claim only forms once its wake is
+                # already due) and the payload either one fires is the same constant
+                # wake for the name, so re-arming with the claim's time only fires the
+                # live occurrence early: the early send this sweep guards against.
                 if [[ -f "$_cwa" ]]; then
                     _ct=$(cat "$_cf" 2>/dev/null) || _ct=""
                     _wt=$(cat "$_cwa" 2>/dev/null) || _wt=""
-                    if [[ "$_ct" =~ ^[0-9]+$ ]]; then
-                        if [[ "$_wt" =~ ^[0-9]+$ && "$_wt" -lt "$_ct" ]]; then
-                            printf '%s [dispatcher]   stale claim %s merged into fresher wake_at (kept earlier due %s)\n' "$(date -u +%FT%TZ)" "$_cbase" "$_wt" >&2
-                        else
-                            printf '%s' "$_ct" > "$_cwa" 2>/dev/null || true
-                            printf '%s [dispatcher]   re-armed stale claim %s (age %ss)\n' "$(date -u +%FT%TZ)" "$_cbase" "$_cage" >&2
-                        fi
+                    if [[ "$_wt" =~ ^[0-9]+$ ]]; then
+                        printf '%s [dispatcher]   dropped stale claim %s, kept scheduled wake_at %s\n' "$(date -u +%FT%TZ)" "$_cbase" "$_wt" >&2
+                    elif [[ "$_ct" =~ ^[0-9]+$ ]]; then
+                        printf '%s' "$_ct" > "$_cwa" 2>/dev/null || true
+                        printf '%s [dispatcher]   re-armed stale claim %s (age %ss)\n' "$(date -u +%FT%TZ)" "$_cbase" "$_cage" >&2
                     else
                         printf '%s [dispatcher]   dropped stale claim %s (unreadable due time), left the existing wake_at alone\n' "$(date -u +%FT%TZ)" "$_cbase" >&2
                     fi
