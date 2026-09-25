@@ -730,3 +730,32 @@ _build_shellm_flags() {
         printf '%s\n' "--bin" "$path"
     done
 }
+
+# ---------------------------------------------------------------------------
+# Prompt redaction
+# ---------------------------------------------------------------------------
+
+# Scrub credentials out of a wakeup prompt before it reaches a model. The
+# recent stream, the outbound ledger and the routing signals quote the mind
+# log verbatim, and one pasted token was re-quoted into 133 later log entries
+# because every prompt covering its window carried it back in. A companion
+# change scrubs the same shapes at the traj append write point, but the log
+# already holds the old values and every prompt re-quotes them, so the prompt
+# boundary is where they must stop for good. Keep the shape rules and the env
+# name list in sync with traj_redact in bin/traj.
+prompt_redact() {
+    local s="$1" v n
+    for n in GITHUB_TOKEN GH_TOKEN HOMEBREW_GITHUB_API_TOKEN ANTHROPIC_API_KEY \
+             LLM_API_KEY OPENAI_API_KEY OPENROUTER_API_KEY GEMINI_API_KEY \
+             OPENCODE_API_KEY SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_USER_TOKEN \
+             TELEGRAM_BOT_TOKEN; do
+        v="${!n:-}"
+        [[ -n "$v" && ${#v} -ge 8 ]] && s="${s//"$v"/<redacted:value>}"
+    done
+    printf '%s' "$s" | LC_ALL=C sed -E \
+        -e 's/ghp_[A-Za-z0-9]{20,}/<redacted:github-token>/g' \
+        -e 's/github_pat_[A-Za-z0-9_]{20,}/<redacted:github-token>/g' \
+        -e 's/gh[ours]_[A-Za-z0-9]{20,}/<redacted:github-token>/g' \
+        -e 's/xox[baprs]-[A-Za-z0-9-]{10,}/<redacted:slack-token>/g' \
+        -e 's/sk-[A-Za-z0-9_-]{20,}/<redacted:api-key>/g'
+}
