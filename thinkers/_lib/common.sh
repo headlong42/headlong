@@ -745,17 +745,24 @@ _build_shellm_flags() {
 # name list in sync with traj_redact in bin/traj.
 prompt_redact() {
     local s="$1" v n
-    for n in GITHUB_TOKEN GH_TOKEN HOMEBREW_GITHUB_API_TOKEN ANTHROPIC_API_KEY \
-             LLM_API_KEY OPENAI_API_KEY OPENROUTER_API_KEY GEMINI_API_KEY \
-             OPENCODE_API_KEY SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_USER_TOKEN \
-             TELEGRAM_BOT_TOKEN; do
+    for n in GITHUB_TOKEN GH_TOKEN HOMEBREW_GITHUB_API_TOKEN GITHUB_PAT \
+             ANTHROPIC_API_KEY LLM_API_KEY OPENAI_API_KEY OPENROUTER_API_KEY \
+             GEMINI_API_KEY GOOGLE_API_KEY OPENCODE_API_KEY SLACK_BOT_TOKEN \
+             SLACK_APP_TOKEN SLACK_USER_TOKEN SLACK_TOKEN TELEGRAM_BOT_TOKEN \
+             HF_TOKEN HUGGING_FACE_HUB_TOKEN AWS_SECRET_ACCESS_KEY \
+             AWS_SESSION_TOKEN AWS_ACCESS_KEY_ID STRIPE_SECRET_KEY \
+             SENDGRID_API_KEY TWILIO_AUTH_TOKEN DATABASE_URL REDIS_URL; do
         v="${!n:-}"
         [[ -n "$v" && ${#v} -ge 8 ]] && s="${s//"$v"/<redacted:value>}"
     done
     printf '%s' "$s" | LC_ALL=C sed -E \
-        -e 's/ghp_[A-Za-z0-9]{20,}/<redacted:github-token>/g' \
+        -e 's/gh[pousr]_[A-Za-z0-9]{20,}/<redacted:github-token>/g' \
         -e 's/github_pat_[A-Za-z0-9_]{20,}/<redacted:github-token>/g' \
-        -e 's/gh[ours]_[A-Za-z0-9]{20,}/<redacted:github-token>/g' \
-        -e 's/xox[baprs]-[A-Za-z0-9-]{10,}/<redacted:slack-token>/g' \
-        -e 's/sk-[A-Za-z0-9_-]{20,}/<redacted:api-key>/g'
+        -e 's/xox[a-z]-[A-Za-z0-9_.-]{10,}/<redacted:slack-token>/g' \
+        -e 's/sk-[A-Za-z0-9_.=-]{20,}/<redacted:api-key>/g' \
+        -e 's/hf_[A-Za-z0-9]{20,}/<redacted:hf-token>/g' \
+        -e 's/AIza[A-Za-z0-9_-]{30,}/<redacted:google-key>/g' \
+        -e 's/(AKIA|ASIA)[A-Z0-9]{16}/<redacted:aws-key>/g' \
+        -e 's/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/<redacted:jwt>/g' \
+        -e 's#://[^/@[:space:]]+:[^/@[:space:]]+@#://<redacted:basic-auth>@#g'
 }
