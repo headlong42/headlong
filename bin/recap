@@ -703,6 +703,136 @@ _ctx_assemble() {
 # moment cut0 crosses a FANOUT^k boundary (at 10k steps, all summarized
 # life before 10k vanishes). So: descend into the F children one tier down
 # and emit whatever exists; only a tier-1 miss is truly absent history.
+# Supersede fan-out. A rollup window can be corrected by a later window: the
+# older one carries "[SUPERSEDED by window ...]" in its summary and a
+# structured .supersede[] pointer. Emitting only the window it appears in
+# would hand the mind a debunked claim with the correction out of sight, so
+# emitting a window also emits every window reachable through those links in
+# both directions, following chains to their end. Same reader as the
+# standalone bin/supersede-surface. Nothing below is allowed to be fatal:
+# a missing index or a broken pointer must never cost the mind its context.
+_SS_INDEX="$ROLLUP_DIR/.ss-index.json"
+
+_ss_index() {
+    # Links index for every window, rebuilt only when a rollup file is newer
+    # than the index, and at most once per process. (if-form, not `&&`: a
+    # false test as the last command returns 1 and trips set -e.)
+    if [[ "${_SS_BUILT:-}" == "1" ]]; then return 0; fi
+    _SS_BUILT=1
+    if [[ -f "$_SS_INDEX" && -z "$(find "$ROLLUP_DIR" -mindepth 2 -name '*.json' -newer "$_SS_INDEX" -print -quit 2>/dev/null)" ]]; then
+        return 0
+    fi
+    python3 - "$ROLLUP_DIR" "$_SS_INDEX" <<'PYIDX' || return 0
+import json, os, re, sys
+root, out = sys.argv[1], sys.argv[2]
+STEM = re.compile(r"(\d+)-(\d+)")
+wins = []
+for tier in sorted(os.listdir(root)):
+    d = os.path.join(root, tier)
+    if not (tier.startswith("t") and os.path.isdir(d)):
+        continue
+    for fn in sorted(os.listdir(d)):
+        m = STEM.match(fn)
+        if not m or not fn.endswith(".json"):
+            continue
+        try:
+            w = json.load(open(os.path.join(d, fn)))
+        except Exception:
+            continue
+        w["_tier"], w["_stem"] = tier, "%s-%s" % (m.group(1), m.group(2))
+        wins.append(w)
+
+def resolve(ptr, prefer):
+    # A tier qualified pointer resolves only inside that tier, so a window
+    # with the same stem elsewhere can never stand in for the one named.
+    # A bare pointer prefers the pointer's own tier, then any tier.
+    s = (ptr or "").strip()
+    tier = None
+    if "/" in s:
+        t, b = s.split("/", 1)
+        if re.match(r"^t\d+$", t.strip()):
+            tier, s = t.strip(), b
+    m = STEM.search(s)
+    if not m:
+        return None
+    stem = "%s-%s" % (m.group(1), m.group(2))
+    hits = [w for w in wins if w["_stem"] == stem and (tier is None or w["_tier"] == tier)]
+    if not hits:
+        return None
+    pref = [w for w in hits if w["_tier"] == prefer]
+    return (pref or hits)[0]
+
+def key(w):
+    return "%s/%s" % (w["_tier"], w["_stem"])
+
+idx = {}
+for w in wins:
+    idx[key(w)] = {
+        "start": w.get("start"),
+        "end": w.get("end"),
+        "summary": re.sub(r"\s+", " ", w.get("summary") or "").strip(),
+        "correctors": [],
+        "namers": [],
+    }
+for w in wins:
+    for e in (w.get("supersede") or []):
+        raw = e.get("by", "")
+        t = resolve(raw, w["_tier"])
+        idx[key(w)]["correctors"].append(key(t) if t is not None else "?" + raw)
+        if t is not None and key(t) != key(w):
+            idx[key(t)]["namers"].append(key(w))
+tmp = out + ".tmp"
+json.dump(idx, open(tmp, "w"))
+os.replace(tmp, out)
+PYIDX
+}
+
+_ctx_supersede_fanout() {
+    _ss_index || return 0
+    python3 - "$_SS_INDEX" "$1" "$2" "$3" <<'PYFAN' || return 0
+import json, sys
+try:
+    idx = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+tier, s, e = sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+seed = "t%s/%012d-%012d" % (int(tier), s, e)
+if seed not in idx:
+    sys.exit(0)
+seen, queue = {seed}, [seed]
+
+def line(kind, k, note, summary):
+    print("  [%s] %s: %s   (%s)" % (kind, k, (summary or "")[:260], note))
+
+i = 0
+while i < len(queue):
+    cur = queue[i]
+    i += 1
+    v = idx.get(cur) or {}
+    for ptr in v.get("correctors", []):
+        if ptr.startswith("?"):
+            print("  [dangling supersede pointer: %s points at %s, which resolves to nothing]"
+                  % (cur, ptr[1:]))
+            continue
+        if ptr in seen:
+            continue
+        seen.add(ptr)
+        queue.append(ptr)
+        t = idx.get(ptr) or {}
+        kind = ("superseded by, read this before trusting the window above"
+                if cur == seed else "superseded by, chain")
+        line(kind, ptr, "corrects %s" % cur, t.get("summary", ""))
+    for namer in v.get("namers", []):
+        if namer in seen:
+            continue
+        seen.add(namer)
+        queue.append(namer)
+        t = idx.get(namer) or {}
+        kind = "this window supersedes" if cur == seed else "supersedes, chain"
+        line(kind, namer, "superseded by %s" % cur, t.get("summary", ""))
+PYFAN
+}
+
 _ctx_emit_seg() {
     local tier=$1 s=$2 e=$3 bf blk c
     # Prune segments wholly before the enable marker: nothing there is built
@@ -721,6 +851,7 @@ _ctx_emit_seg() {
         jq -r '"[t\(.tier) · steps \(.start)–\(.end)] \(.summary)   (\(.step_ids | join(" ")))"' \
             "$bf" 2>/dev/null \
             || printf '[t%s · steps %s–%s] (unreadable rollup block)\n' "$tier" "$s" "$e"
+        _ctx_supersede_fanout "$tier" "$s" "$e"
         return 0
     fi
     (( tier <= 1 )) && return 0
