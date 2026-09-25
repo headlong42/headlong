@@ -241,6 +241,19 @@ _outbound_section() {
 # post, not one per lost window. Local HH:MM strings and minutes of the day
 # only: no date parsing, so GNU and BSD date both work.
 _fm() { awk -v k="$2: " 'NR==1 && /^---$/{f=1; next} f && /^---$/{exit} f && index($0, k)==1{print substr($0, length(k)+1)}' "$1"; }
+# Evidence that a scheduled window was sent even when the chat send carried no
+# --key. bin/papers-receipt writes <id>_<day>-<time>.receipt when a send is
+# complete; a completed receipt has key=, sent= and ids= lines, while a claim
+# alone carries no sent= or ids=, so a claimed-but-unsent window is never
+# reported as done. Prints the send time as HH:MMZ, nothing otherwise.
+# Override the directory with PAPERS_RECEIPTS_DIR.
+_receipt_sent() {
+    local key="$1" dir r
+    dir="${PAPERS_RECEIPTS_DIR:-${SHELLM_WORKDIR:-${WORKDIR:-${IDENTITY_DIR:-.}/workdir}}/notes/daily-papers/sent-receipts}"
+    r="$dir/$(printf %s "$key" | tr / _).receipt"
+    [[ -f "$r" ]] || return 0
+    awk -F= '/^sent=/{v=substr($0,6)} /^ids=/{ok=1} END{if (ok && length(v)>=16) print substr(v,12,5) "Z"}' "$r"
+}
 _schedule_signals() {
     local mem_dir="${1:-$MEM_DIR}" tz="${HEADLONG_TZ:-UTC}" grace="${SCHEDULE_GRACE_MIN:-360}"
     local f sched gtz until id title day now now_m zone sent t t_m key at due next said
@@ -257,9 +270,10 @@ _schedule_signals() {
         for t in $sched; do
             t_m=$(( 10#${t%:*} * 60 + 10#${t#*:} )); key="$id/$day-${t/:/}"
             at=$(printf '%s\n' "$sent" | awk -v k="$key" '$1==k{v=$2} END{print v}')
+            [[ -n "$at" ]] || at=$(_receipt_sent "$key")
             if (( t_m > now_m )); then
                 if [[ -z "$next" ]]; then next="$t $zone, in $(( (t_m - now_m) / 60 ))h$(( (t_m - now_m) % 60 ))m"; fi
-            elif [[ -n "$at" ]]; then said="${said}the $t window was sent at $at; "; due=""
+            elif [[ -n "$at" ]]; then said="${said}the $t window was sent at $at; "
             elif (( now_m - t_m <= grace )); then due="$t $key"
             else said="${said}the $t window was missed, let it go; "; fi
         done
