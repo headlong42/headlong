@@ -402,6 +402,28 @@ cmd_new() {
 # append
 # ---------------------------------------------------------------------------
 
+
+# Redact credentials at the write point. The log is append only and rewriting
+# it has crashed the dispatcher before, so the only safe place to stop a secret
+# is before the line lands. Shape rules cover credential formats whatever their
+# origin, value rules cover the tokens this machine holds in its environment.
+traj_redact() {
+    local s="$1" v n
+    for n in GITHUB_TOKEN GH_TOKEN HOMEBREW_GITHUB_API_TOKEN ANTHROPIC_API_KEY \
+             LLM_API_KEY OPENAI_API_KEY OPENROUTER_API_KEY GEMINI_API_KEY \
+             OPENCODE_API_KEY SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_USER_TOKEN \
+             TELEGRAM_BOT_TOKEN; do
+        v="${!n:-}"
+        [[ -n "$v" && ${#v} -ge 8 ]] && s="${s//"$v"/<redacted:value>}"
+    done
+    printf '%s' "$s" | LC_ALL=C sed -E \
+        -e 's/ghp_[A-Za-z0-9]{20,}/<redacted:github-token>/g' \
+        -e 's/github_pat_[A-Za-z0-9_]{20,}/<redacted:github-token>/g' \
+        -e 's/gh[ours]_[A-Za-z0-9]{20,}/<redacted:github-token>/g' \
+        -e 's/xox[baprs]-[A-Za-z0-9-]{10,}/<redacted:slack-token>/g' \
+        -e 's/sk-[A-Za-z0-9_-]{20,}/<redacted:api-key>/g'
+}
+
 cmd_append() {
     local traj_dir_opt="" traj_id_opt=""
     local -a fields=()
@@ -608,6 +630,7 @@ cmd_append() {
         fi
         sleep 0.01
     done
+    compact=$(traj_redact "$compact")
     printf '%s\n' "$compact" >> "$traj_file"
     rmdir "$lock_dir" 2>/dev/null || true
 
