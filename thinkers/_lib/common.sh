@@ -248,11 +248,31 @@ _fm() { awk -v k="$2: " 'NR==1 && /^---$/{f=1; next} f && /^---$/{exit} f && ind
 # reported as done. Prints the send time as HH:MMZ, nothing otherwise.
 # Override the directory with PAPERS_RECEIPTS_DIR.
 _receipt_sent() {
-    local key="$1" dir r
-    dir="${PAPERS_RECEIPTS_DIR:-${SHELLM_WORKDIR:-${WORKDIR:-${IDENTITY_DIR:-.}/workdir}}/notes/daily-papers/sent-receipts}"
+    local key="$1" dir r src
+    # bin/papers-receipt names the same directory PAPERS_RECEIPTS, so accept both
+    # spellings, and when neither is set anchor the default on this file's own
+    # location (<identity>/thinkers/_lib/../../workdir) instead of on env that a
+    # nested shell may not carry: a bare env resolved to ./notes/... and silently
+    # found nothing. A window then reads as unsent and raises a false DUE NOW.
+    dir="${PAPERS_RECEIPTS_DIR:-${PAPERS_RECEIPTS:-}}"
+    if [[ -z "$dir" ]]; then
+        # Anchor on the workdir beside this file when it is really there; a
+        # source checkout has no workdir beside it, and a miss must not become
+        # a path under / that shadows the env chain into finding nothing.
+        src="${BASH_SOURCE[0]:-}"
+        if [[ -n "$src" ]]; then
+            dir="$(cd "$(dirname "$src")/../../workdir" 2>/dev/null && pwd)/notes/daily-papers/sent-receipts"
+            [[ -d "$dir" ]] || dir=""
+        fi
+        [[ -n "$dir" ]] || dir="${SHELLM_WORKDIR:-${WORKDIR:-${IDENTITY_DIR:-.}/workdir}}/notes/daily-papers/sent-receipts"
+    fi
     r="$dir/$(printf %s "$key" | tr / _).receipt"
     [[ -f "$r" ]] || return 0
-    awk -F= '/^sent=/{v=substr($0,6)} /^ids=/{ok=1} END{if (ok && length(v)>=16) print substr(v,12,5) "Z"}' "$r"
+    # A receipt counts as sent only with a well-formed stamp and a non-empty ids
+    # line. A claim file or a half-written receipt has neither, and must never
+    # mark a window spent.
+    awk -F= '/^sent=/{v=substr($0,6)} /^ids=/{if (length($0)>4) ok=1}
+        END{if (ok && v ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z$/) print substr(v,12,5) "Z"}' "$r"
 }
 _schedule_signals() {
     local mem_dir="${1:-$MEM_DIR}" tz="${HEADLONG_TZ:-UTC}" grace="${SCHEDULE_GRACE_MIN:-360}"
@@ -278,8 +298,8 @@ _schedule_signals() {
             else said="${said}the $t window was missed, let it go; "; fi
         done
         if [[ -n "$due" ]]; then
-            printf -- '- DUE NOW: "%s", the %s %s window of %s. Send it once, this wake, with: chat send --to <name> --key %s <<"MSG" (the message on stdin as a quoted heredoc). The key marks this window done; a second send with it is refused.\n' \
-                "$title" "${due%% *}" "$zone" "$day" "${due#* }"
+            printf -- '- DUE NOW: "%s", the %s %s window of %s. Send it once, this wake, with: chat send --to <name> --key %s <<"MSG" (the message on stdin as a quoted heredoc). The key marks this window done; a second send with it is refused.%s\n' \
+                "$title" "${due%% *}" "$zone" "$day" "${due#* }" "${said:+ (${said%; })}"
         else
             printf -- '- Scheduled "%s": %snext window %s. Nothing to send for this goal before then.\n' \
                 "$title" "$said" "${next:-tomorrow at ${sched%% *} $zone}"
