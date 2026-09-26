@@ -776,5 +776,5 @@ prompt_redact() {
         -e 's/(^|[^A-Za-z0-9])(SG\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})/\1<redacted:sendgrid-key>/g' \
         -e 's/(^|[^A-Za-z0-9])(SK[0-9a-f]{32})/\1<redacted:twilio-key>/g' \
         -e 's/(^|[^A-Za-z0-9])(key-[A-Za-z0-9]{20,})/\1<redacted:mailgun-key>/g' \
-        -e 's/((aws|AWS)_secret_access_key)[[:space:]]*[=:][[:space:]]*[^[:space:]]+/\1=<redacted:aws-secret>/g'
+        -e "s/([aA][wW][sS]_[sS][eE][cC][rR][eE][tT]_[aA][cC][cC][eE][sS][sS]_[kK][eE][yY][\"']?[[:space:]]*[:=][[:space:]]*[\"']?)([^\"'[:space:]]+)/\1<redacted:aws-secret>/g"
 }
