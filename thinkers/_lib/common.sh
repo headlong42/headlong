@@ -247,8 +247,8 @@ _fm() { awk -v k="$2: " 'NR==1 && /^---$/{f=1; next} f && /^---$/{exit} f && ind
 # alone carries no sent= or ids=, so a claimed-but-unsent window is never
 # reported as done. Prints the send time as HH:MMZ, nothing otherwise.
 # Override the directory with PAPERS_RECEIPTS_DIR.
-_receipt_sent() {
-    local key="$1" dir r src
+_receipts_dir() {
+    local dir src
     # bin/papers-receipt names the same directory PAPERS_RECEIPTS, so accept both
     # spellings, and when neither is set anchor the default on this file's own
     # location (<identity>/thinkers/_lib/../../workdir) instead of on env that a
@@ -266,6 +266,12 @@ _receipt_sent() {
         fi
         [[ -n "$dir" ]] || dir="${SHELLM_WORKDIR:-${WORKDIR:-${IDENTITY_DIR:-.}/workdir}}/notes/daily-papers/sent-receipts"
     fi
+    printf '%s' "$dir"
+}
+_receipt_sent() {
+    local key="$1" dir r
+    dir=$(_receipts_dir)
+    [[ -n "$dir" ]] || return 0
     r="$dir/$(printf %s "$key" | tr / _).receipt"
     [[ -f "$r" ]] || return 0
     # A receipt counts as sent only with a well-formed stamp and a non-empty ids
@@ -274,9 +280,24 @@ _receipt_sent() {
     awk -F= '/^sent=/{v=substr($0,6)} /^ids=/{if (length($0)>4) ok=1}
         END{if (ok && v ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z$/) print substr(v,12,5) "Z"}' "$r"
 }
+# Why a window was skipped on purpose, from the <key>.skip record bin/papers-skip
+# writes beside the receipts. A deliberately skipped window must stop raising
+# DUE NOW for its whole grace period and must not read as missed afterwards:
+# nothing failed, the team asked for no post. Prints the reason (the skip record
+# always carries one), nothing when there is no record. The caller checks the
+# sent ledger and the receipt first, so a send always wins over a skip.
+_receipt_skip_reason() {
+    local key="$1" dir s why
+    dir=$(_receipts_dir)
+    [[ -n "$dir" ]] || return 0
+    s="$dir/$(printf %s "$key" | tr / _).skip"
+    [[ -f "$s" ]] || return 0
+    why=$(awk -F= '/^reason=/{print substr($0,8); exit}' "$s")
+    printf '%s' "${why:-no reason given}"
+}
 _schedule_signals() {
     local mem_dir="${1:-$MEM_DIR}" tz="${HEADLONG_TZ:-UTC}" grace="${SCHEDULE_GRACE_MIN:-360}"
-    local f sched gtz until id title day now now_m zone sent t t_m key at due next said
+    local f sched gtz until id title day now now_m zone sent t t_m key at due next said skip
     printf -- '- Now: %s (%s).\n' "$(TZ="$tz" date +'%A %Y-%m-%d %H:%M %Z')" "$(date -u +'%Y-%m-%d %H:%MZ')"
     [[ -d "$mem_dir" ]] || return 0
     sent=$(chat sent --since 2d -n 500 --json 2>/dev/null | jq -r '.[] | select(.key != null and .state != "failed" and .state != "skipped") | "\(.key) \(.ts[11:16])Z"' 2>/dev/null) || sent=""
@@ -291,6 +312,15 @@ _schedule_signals() {
             t_m=$(( 10#${t%:*} * 60 + 10#${t#*:} )); key="$id/$day-${t/:/}"
             at=$(printf '%s\n' "$sent" | awk -v k="$key" '$1==k{v=$2} END{print v}')
             [[ -n "$at" ]] || at=$(_receipt_sent "$key")
+            # A send always wins: only look for a skip record when nothing says
+            # the window went out. Checked before the due/missed arithmetic, so
+            # a skipped window never fires and never reads as missed.
+            skip=""
+            if [[ -z "$at" ]]; then skip=$(_receipt_skip_reason "$key"); fi
+            if [[ -n "$skip" ]]; then
+                said="${said}the $t window was skipped on purpose: ${skip:0:80}; "
+                continue
+            fi
             if (( t_m > now_m )); then
                 if [[ -z "$next" ]]; then next="$t $zone, in $(( (t_m - now_m) / 60 ))h$(( (t_m - now_m) % 60 ))m"; fi
             elif [[ -n "$at" ]]; then said="${said}the $t window was sent at $at; "
