@@ -387,7 +387,19 @@ _redact_keys() {
         -e 's/AIza[A-Za-z0-9_-]{25,}/[redacted]/g' \
         -e 's/(AKIA|ASIA)[A-Z0-9]{16}/[redacted]/g' \
         -e 's/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/[redacted]/g' \
-        -e 's#://[^/@[:space:]]+:[^/@[:space:]]+@#://[redacted]@#g'
+        -e 's#://[^/@[:space:]]+:[^/@[:space:]]+@#://[redacted]@#g' \
+        -e '/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/,/-----END [A-Z0-9 ]*PRIVATE KEY-----/c\
+[redacted]' \
+        -e 's#"auth"[[:space:]]*:[[:space:]]*"[A-Za-z0-9+/=]{16,}"#"auth": "[redacted]"#g' \
+        -e 's/(^|[^A-Za-z0-9])((sk|rk)_live_[A-Za-z0-9]{8,})/\1[redacted]/g' \
+        -e 's/(^|[^A-Za-z0-9])(whsec_[A-Za-z0-9]{8,})/\1[redacted]/g' \
+        -e 's/(^|[^A-Za-z0-9])(npm_[A-Za-z0-9]{20,})/\1[redacted]/g' \
+        -e 's/(^|[^A-Za-z0-9])(glpat-[A-Za-z0-9_-]{10,})/\1[redacted]/g' \
+        -e 's/(^|[^A-Za-z0-9])(dckr_pat-[A-Za-z0-9_.-]{10,})/\1[redacted]/g' \
+        -e 's/(^|[^A-Za-z0-9])(SG\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})/\1[redacted]/g' \
+        -e 's/(^|[^A-Za-z0-9])(SK[0-9a-f]{32})/\1[redacted]/g' \
+        -e 's/(^|[^A-Za-z0-9])(key-[A-Za-z0-9]{20,})/\1[redacted]/g' \
+        -e 's/((aws|AWS)_secret_access_key)[[:space:]]*[=:][[:space:]]*[^[:space:]]+/\1=[redacted]/g'
 }
 _update_person_notes() {
     local key="$1" person="$2" hist prev_body prev_file system user new_body

@@ -431,7 +431,19 @@ redact_sensitive() {
         -e 's/AIza[A-Za-z0-9_-]{25,}/<redacted:google-key>/g' \
         -e 's/(AKIA|ASIA)[A-Z0-9]{16}/<redacted:aws-key>/g' \
         -e 's/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/<redacted:jwt>/g' \
-        -e 's#://[^/@[:space:]]+:[^/@[:space:]]+@#://<redacted:basic-auth>@#g'
+        -e 's#://[^/@[:space:]]+:[^/@[:space:]]+@#://<redacted:basic-auth>@#g' \
+        -e '/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/,/-----END [A-Z0-9 ]*PRIVATE KEY-----/c\
+<redacted:private-key>' \
+        -e 's#"auth"[[:space:]]*:[[:space:]]*"[A-Za-z0-9+/=]{16,}"#"auth": "<redacted:docker-auth>"#g' \
+        -e 's/(^|[^A-Za-z0-9])((sk|rk)_live_[A-Za-z0-9]{8,})/\1<redacted:stripe-key>/g' \
+        -e 's/(^|[^A-Za-z0-9])(whsec_[A-Za-z0-9]{8,})/\1<redacted:stripe-hook>/g' \
+        -e 's/(^|[^A-Za-z0-9])(npm_[A-Za-z0-9]{20,})/\1<redacted:npm-token>/g' \
+        -e 's/(^|[^A-Za-z0-9])(glpat-[A-Za-z0-9_-]{10,})/\1<redacted:gitlab-token>/g' \
+        -e 's/(^|[^A-Za-z0-9])(dckr_pat-[A-Za-z0-9_.-]{10,})/\1<redacted:docker-token>/g' \
+        -e 's/(^|[^A-Za-z0-9])(SG\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})/\1<redacted:sendgrid-key>/g' \
+        -e 's/(^|[^A-Za-z0-9])(SK[0-9a-f]{32})/\1<redacted:twilio-key>/g' \
+        -e 's/(^|[^A-Za-z0-9])(key-[A-Za-z0-9]{20,})/\1<redacted:mailgun-key>/g' \
+        -e 's/((aws|AWS)_secret_access_key)[[:space:]]*[=:][[:space:]]*[^[:space:]]+/\1=<redacted:aws-secret>/g'
 }
 
 # ---------------------------------------------------------------------------
