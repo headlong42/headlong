@@ -12,6 +12,12 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 MAX_DEPTH = 6
+# Directory names that ARE the identities root. A symlink with one of these
+# names directly under the serve root is followed one level (the box keeps
+# its identities outside the checkout and links them back here, layer 0 of
+# design/runtime_isolation.md); every other symlink is still a candidate
+# identity at most, never a path the walk recurses through.
+IDENTITIES_ROOT_NAMES = {".identities", "identities"}
 PRUNE_DIRS = {
     "trajectories",
     "workdir",
@@ -104,7 +110,14 @@ def scan_identities(root: Path) -> list[IdentityInfo]:
             if not child.is_dir() or child.name in PRUNE_DIRS:
                 continue
             if child.is_symlink():
-                link_candidates.append(child)
+                if depth == 0 and child.name in IDENTITIES_ROOT_NAMES and not (child / "info.txt").is_file():
+                    # The identities root itself, linked out of the checkout.
+                    # Walk it by its link path so ids and paths keep the
+                    # familiar `.identities/<name>` shape; children that are
+                    # links are still only candidates.
+                    walk(child, depth + 1)
+                else:
+                    link_candidates.append(child)
             else:
                 walk(child, depth + 1)
 

@@ -78,6 +78,16 @@ if [[ "$cached" -eq 0 ]]; then
 #     (any command in that run naming the memory), names edited or
 #     forgotten within a day of being shown, `mem search` commands, and the
 #     section's bytes. The judged relevance sample is deploy/scripts/audel-recall-judge.
+#   - model tiers (design/monolith_backoff.md, second lever): per day and
+#     tier, runs, runs with visible work, failed runs, requests resolved,
+#     ledger calls and tokens (in, cached, out, thinking) per model. A run's
+#     tier is read off the wake reason on its shellm-run row: "request" when
+#     it ends in /request (MONOLITH_REQUEST_MODEL served it), else
+#     "reactive" or "think" by the wake mode (the pre-split proxy). Ledger
+#     calls whose run_id is not a monolith run (responder, rollups, nested
+#     runs) are "other". Requests: every responder deferral (action with a
+#     trigger_step) by the day it was made, how many an observation with
+#     resolves= closed, the hours that took, and which tier closed them.
     onbox_script="IDENT_DIR=/opt/shellm/app/.identities/$IDENT
 $(cat <<'ONBOX'
 set -euo pipefail
@@ -188,6 +198,17 @@ rel_recent = {}         # name -> ts last shown (for the fixed-within-a-day rate
 rel_fetched_seen = set(); rel_fixed_seen = set()
 day_distinct = {}       # day -> set of names shown
 TOK = ("calls", "in", "out", "think", "bf")
+TIER_DAYS = 14          # payload budget: tiers/requests cover the last N days only
+run_tier = {}           # run_id -> "request" | "reactive" | "think"
+run_day = {}            # run_id -> day of the shellm-run row
+run_work = {}           # run_id -> {"visible": bool, "error": bool, "resolved": n}
+deferrals = {}          # trigger_step -> ts the responder deferred it
+resolved_at = {}        # trigger_step -> (ts, run_id) of the resolving observation
+tier_daily = {}         # day -> tier -> {"runs","work","err","resolved","models":{model:{calls,in,cache,out,think}}}
+TTOK = ("calls", "in", "cache", "out", "think")
+
+def tier_of(day, tier):
+    return tier_daily.setdefault(day, {}).setdefault(tier, {"runs": 0, "work": 0, "err": 0, "resolved": 0, "models": {}})
 
 # Responder context metrics (design/conversation_memory.md, part 6): every
 # decision observation the responder writes carries context_msgs (earlier
@@ -197,6 +218,7 @@ TOK = ("calls", "in", "out", "think", "bf")
 CTX_BUCKETS = (("<2m", 0, 120), ("2-15m", 120, 900), ("15-60m", 900, 3600),
                ("1-6h", 3600, 21600), ("6-48h", 21600, 172800))
 ctx_rows = []   # (ts, context_msgs, gap_s or None, decision)
+rsp_rows = []   # (ts, decision, failure or None, llm_ms or None, served_by or None, truncated, timed_out, out_tok or None)
 
 def day_key(ts):
     return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d")
@@ -242,6 +264,11 @@ with open(path, encoding="utf-8", errors="replace") as fh:
             # the run's step_id is the run_id its reasoning/final steps carry
             if step.get("step_id"):
                 run_model[step["step_id"]] = str(step.get("model") or "?")
+                w = str(step.get("wake") or "")
+                tier = "request" if w.endswith("/request") else ("reactive" if w.startswith("reactive") else "think")
+                run_tier[step["step_id"]] = tier
+                run_day[step["step_id"]] = day_key(ts)
+                tier_of(day_key(ts), tier)["runs"] += 1
         if rid and t not in ("shellm-run", "trajectory"):
             r = runs.setdefault(rid, [ts, ts, None, 0])
             r[0] = min(r[0], ts)
@@ -250,6 +277,18 @@ with open(path, encoding="utf-8", errors="replace") as fh:
                 r[2] = ts
             elif t == "reasoning":
                 r[3] += 1
+        if rid and rid in run_tier:
+            rw = run_work.setdefault(rid, {"visible": False, "error": False, "resolved": 0})
+            if t in ("action", "observation", "merge", "message"):
+                rw["visible"] = True
+            elif t == "error":
+                rw["error"] = True
+            if t == "observation" and step.get("resolves"):
+                rw["resolved"] += 1
+        if t == "observation" and step.get("resolves") and step["resolves"] not in resolved_at:
+            resolved_at[step["resolves"]] = (ts, rid)
+        if t == "action" and step.get("source") == "responder" and step.get("trigger_step"):
+            deferrals.setdefault(step["trigger_step"], ts)
         if t == "message":
             frm, to = step.get("from") or "", step.get("to") or ""
             if to == ident and frm and frm != ident:
@@ -262,6 +301,18 @@ with open(path, encoding="utf-8", errors="replace") as fh:
             fb_marked.add(step["trigger_step"])
             fb_events.append((step["trigger_step"], ts))
         elif (t == "observation" and step.get("source") == "responder"
+              and step.get("decision") in ("replied", "no-reply", "reply-failed")):
+            # Every decision, with what the reply call did (llm_ms, served_by,
+            # truncated, timed_out, failure kind) once the 2026-09-22 step is
+            # deployed; older observations count as decisions with no call data.
+            rsp_rows.append((
+                ts, step.get("decision"), step.get("failure"),
+                step.get("llm_ms") if isinstance(step.get("llm_ms"), (int, float)) else None,
+                step.get("served_by") if isinstance(step.get("served_by"), str) else None,
+                bool(step.get("truncated")), bool(step.get("timed_out")),
+                step.get("out_tok") if isinstance(step.get("out_tok"), int) else None,
+            ))
+        if (t == "observation" and step.get("source") == "responder"
               and step.get("decision") in ("replied", "no-reply")
               and isinstance(step.get("context_msgs"), int)):
             gap = step.get("gap_s")
@@ -398,6 +449,13 @@ for lts, rec in ledger_recs:
         if rec.get("_backfilled"):
             ld["bf"] += 1
             lm["bf"] += 1
+        rid = rec.get("run_id") or ""
+        tm = tier_of(day_key(lts), run_tier.get(rid, "other"))["models"].setdefault(
+            str(rec.get("model") or "?"), dict.fromkeys(TTOK, 0))
+        tm["calls"] += 1
+        for key, short in (("in_tok", "in"), ("cache_tok", "cache"), ("out_tok", "out"), ("think_tok", "think")):
+            if isinstance(rec.get(key), (int, float)):
+                tm[short] += int(rec[key])
 
 # Per day, the ledger wins when it has at least as many calls as the stamps
 # (a complete ledger is a superset of them); otherwise the stamps stand (days
@@ -497,6 +555,58 @@ for label, lo, hi in CTX_BUCKETS:
         "forgot": sum(1 for r in rows if r[1] == 0),
         "median_ctx": pct([r[1] for r in rows]).get("p50") if rows else None,
     })
+# Responder calls: failures by kind, call latency, and the upstream host
+# (served_by) each call landed on, with that host's truncation and timeout
+# counts. One model id on OpenRouter is two dozen hosts at different speeds.
+_with_call = [r for r in rsp_rows if r[3] is not None]
+_hosts = {}
+for r in _with_call:
+    h = _hosts.setdefault(r[4] or "(unknown)", {"calls": 0, "truncated": 0, "timed_out": 0, "ms": []})
+    h["calls"] += 1
+    h["truncated"] += 1 if r[5] else 0
+    h["timed_out"] += 1 if r[6] else 0
+    h["ms"].append(r[3])
+_fail_kinds = {}
+for r in rsp_rows:
+    if r[1] == "reply-failed":
+        _fail_kinds[r[2] or "(unspecified)"] = _fail_kinds.get(r[2] or "(unspecified)", 0) + 1
+responder_calls = {
+    "decisions": len(rsp_rows),
+    "replied": sum(1 for r in rsp_rows if r[1] == "replied"),
+    "no_reply": sum(1 for r in rsp_rows if r[1] == "no-reply"),
+    "failed": sum(1 for r in rsp_rows if r[1] == "reply-failed"),
+    "failures": _fail_kinds,
+    "with_call_data": len(_with_call),
+    "since": (datetime.fromtimestamp(min(r[0] for r in _with_call), timezone.utc).strftime("%Y-%m-%d")
+              if _with_call else None),
+    "llm_ms": pct([r[3] for r in _with_call]) if _with_call else {},
+    "out_tok": pct([r[7] for r in _with_call if r[7] is not None]) if _with_call else {},
+    "hosts": sorted(
+        ({"host": k, "calls": v["calls"], "truncated": v["truncated"], "timed_out": v["timed_out"],
+          "llm_ms": pct(v["ms"])} for k, v in _hosts.items()),
+        key=lambda h: -h["calls"]),
+}
+# Fold the per-run work flags into the tier of the run's day, then keep only
+# the last TIER_DAYS days (the SSM payload cap).
+for rid, rw in run_work.items():
+    tv = tier_of(run_day[rid], run_tier[rid])
+    tv["work"] += 1 if rw["visible"] else 0
+    tv["err"] += 1 if rw["error"] else 0
+    tv["resolved"] += rw["resolved"]
+tiers = {d: tier_daily[d] for d in sorted(tier_daily)[-TIER_DAYS:]}
+requests = {}           # deferral day -> {"n","resolved","hours":[...],"by":{tier:n}}
+for trig, dts in deferrals.items():
+    rq = requests.setdefault(day_key(dts), {"n": 0, "resolved": 0, "hours": [], "by": {}})
+    rq["n"] += 1
+    hit = resolved_at.get(trig)
+    if hit and hit[0] >= dts:
+        rq["resolved"] += 1
+        rq["hours"].append(round((hit[0] - dts) / 3600.0, 2))
+        by = run_tier.get(hit[1] or "", "other")
+        rq["by"][by] = rq["by"].get(by, 0) + 1
+for rq in requests.values():
+    rq["hours"] = pct(rq["hours"]) or {}
+requests = {d: requests[d] for d in sorted(requests)[-TIER_DAYS:]}
 context = {
     "decisions": len(ctx_rows),
     "first_contact": sum(1 for r in ctx_rows if r[2] is None),
@@ -525,10 +635,13 @@ out = {
     },
     "injections": injections,
     "context": context,
+    "responder_calls": responder_calls,
     "daily": [[d, daily[d]] for d in sorted(daily)],
     "rel_distinct": {d: len(v) for d, v in day_distinct.items()},
     "by_model": by_model,
     "ledger": {"rows": ledger_rows, "since": ledger_since},
+    "tiers": tiers,
+    "requests": requests,
 }
 blob = base64.b64encode(gzip.compress(json.dumps(out, separators=(",", ":")).encode())).decode()
 if len(blob) > 23000:
@@ -672,6 +785,30 @@ else:
     print("  (gap = time since the previous message with that person; forgot = the prompt held")
     print("   none of the earlier conversation; median_ctx = earlier messages in the prompt, cap 12)")
 
+rc = d.get("responder_calls") or {}
+print()
+print("responder calls (every decision; call data from the 2026-09-22 step on)")
+if not rc.get("decisions"):
+    print("  none recorded")
+else:
+    fails = ", ".join("%s %d" % (k, v) for k, v in sorted((rc.get("failures") or {}).items(), key=lambda kv: -kv[1])) or "-"
+    print("  decisions: %d   replied: %d   no_reply: %d   failed: %d (%s)"
+          % (rc["decisions"], rc.get("replied", 0), rc.get("no_reply", 0), rc.get("failed", 0), fails))
+    if rc.get("with_call_data"):
+        ms = rc.get("llm_ms") or {}
+        ot = rc.get("out_tok") or {}
+        print("  calls with data: %d since %s   llm_s p50/p90/max: %s/%s/%s   out_tok p50/p90/max: %s/%s/%s"
+              % (rc["with_call_data"], rc.get("since"),
+                 *(("%.0f" % (ms[k] / 1000.0)) if ms.get(k) is not None else "-" for k in ("p50", "p90", "max")),
+                 *((ot[k]) if ot.get(k) is not None else "-" for k in ("p50", "p90", "max"))))
+        print("  %-22s %6s %9s %9s %10s" % ("served_by", "calls", "truncated", "timed_out", "llm_s p50"))
+        for h in rc.get("hosts") or []:
+            p50 = h.get("llm_ms", {}).get("p50")
+            print("  %-22s %6d %9d %9d %10s" % (h["host"][:22], h["calls"], h["truncated"], h["timed_out"],
+                  ("%.0f" % (p50 / 1000.0)) if p50 is not None else "-"))
+        print("  (served_by = the upstream host OpenRouter routed the reply call to; truncated = hit the")
+        print("   token cap; timed_out = hit the wall clock cap; llm_s = the reply call alone, not the wake)")
+
 daily = d.get("daily") or []
 if daily:
     print()
@@ -693,6 +830,84 @@ if daily:
         print("  (tok_in backfills %d of %d ledger calls (%d%%) whose stream shellm cut before the usage"
               % (bf_calls, bf_of, round(100.0 * bf_calls / max(bf_of, 1))))
         print("   event, from the nearest metered call of the same run; those calls are billed in full)")
+
+# Model tiers. Dollar estimates use OpenRouter list prices per million tokens
+# (input, cached input, output; read 2026-09-23). out_tok already includes
+# thinking. The ledger sees about 70% of billed spend (calls cut at the fence
+# are backfilled; nested runs and retries are not), so treat the figure as a
+# floor. Unknown model = no estimate.
+PRICES = {
+    "openai/gpt-6-astra": (10.0, 1.0, 50.0), "openai/gpt-6-astra-pro": (10.0, 1.0, 50.0),
+    "xiaomi/mimo-v2.6-pro": (0.435, 0.0036, 0.87),
+    "nvidia/nemotron-3-ultra-550b-a55b": (0.6, 0.12, 2.4),
+    "x-ai/grok-4.6": (2.0, 0.5, 6.0), "z-ai/glm-5.3": (0.84, 0.156, 2.64), "z-ai/glm-5.2": (0.65, 0.12, 2.04),
+    "z-ai/glm-5.3-flash": (0.15, 0.05, 0.5), "deepseek/deepseek-v4-pro-0813": (0.66, 0.022, 1.98),
+    "anthropic/claude-sonnet-5": (2.0, 0.2, 10.0), "anthropic/claude-opus-5.5": (4.0, 0.2, 20.0),
+    "google/gemini-2.5-flash-lite": (0.1, 0.01, 0.4),
+}
+def usd(models):
+    total, known = 0.0, True
+    for m, v in models.items():
+        pr = PRICES.get(m)
+        if not pr:
+            known = False
+            continue
+        total += ((v["in"] - v["cache"]) * pr[0] + v["cache"] * pr[1] + v["out"] * pr[2]) / 1e6
+    return total, known
+tiers = d.get("tiers") or {}
+if tiers:
+    TIER_ORDER = ("request", "reactive", "think", "other")
+    def tier_line(label, tier, rows):
+        runs = sum(v["runs"] for v in rows); work = sum(v["work"] for v in rows)
+        err = sum(v["err"] for v in rows); res = sum(v["resolved"] for v in rows)
+        models = {}
+        for v in rows:
+            for m, mv in v["models"].items():
+                acc = models.setdefault(m, dict.fromkeys(("calls", "in", "cache", "out", "think"), 0))
+                for k in acc:
+                    acc[k] += mv.get(k, 0)
+        calls = sum(m["calls"] for m in models.values()); tin = sum(m["in"] for m in models.values())
+        cache = sum(m["cache"] for m in models.values()); tout = sum(m["out"] for m in models.values())
+        dollars, known = usd(models)
+        names = ",".join(sorted(set(m.split("/")[-1][:18] for m in models))) or "-"
+        return "  %-11s %-8s %5d %5s %4d %4d %6d %11s %6s %9s %8s  %s" % (
+            label, tier, runs, ("%d%%" % round(100.0 * work / runs)) if runs else "-", err, res, calls,
+            "{:,}".format(tin), ("%d%%" % round(100.0 * cache / tin)) if tin else "-", "{:,}".format(tout),
+            ("$%.2f%s" % (dollars, "" if known else "+")) if models else "-", names)
+    print()
+    print("model tiers (design/monolith_backoff.md; MONOLITH_REQUEST_MODEL)")
+    print("  %-11s %-8s %5s %5s %4s %4s %6s %11s %6s %9s %8s  %s" % (
+        "", "tier", "runs", "work", "err", "res", "calls", "tok_in", "cached", "tok_out", "est_usd", "models"))
+    days_sorted = sorted(tiers)
+    for label, span in (("last 7 days", days_sorted[-7:]), ("prior 7", days_sorted[-14:-7])):
+        for tier in TIER_ORDER:
+            rows = [tiers[dd][tier] for dd in span if tier in tiers[dd]]
+            if rows:
+                print(tier_line(label, tier, rows))
+        label = ""
+    for dd in days_sorted[-7:]:
+        for tier in TIER_ORDER:
+            if tier in tiers[dd]:
+                print(tier_line(dd, tier, [tiers[dd][tier]]))
+    print("  (tier from the wake reason on the run row: request = served by MONOLITH_REQUEST_MODEL,")
+    print("   reactive/think = wake mode when no request model is set; other = ledger calls outside a")
+    print("   monolith run: responder, rollups, nested runs. work = runs that wrote an action,")
+    print("   observation, merge or message; err = runs that ended in an error step; res = pending")
+    print("   requests resolved; est_usd = OpenRouter list price on ledger tokens, a floor (+ = a")
+    print("   model with no price in the table))")
+rq = d.get("requests") or {}
+if rq:
+    print()
+    print("requests (responder deferrals by the day they were made)")
+    print("  %-12s %5s %9s %8s %8s %8s  %s" % ("day", "made", "resolved", "h_p50", "h_p90", "h_max", "resolved by"))
+    for dd in sorted(rq)[-14:]:
+        v = rq[dd]; h = v.get("hours") or {}
+        by = ", ".join("%s %d" % kv for kv in sorted(v.get("by", {}).items())) or "-"
+        print("  %-12s %5d %9d %8s %8s %8s  %s" % (
+            dd, v["n"], v["resolved"],
+            *(("%.1f" % h[k]) if h.get(k) is not None else "-" for k in ("p50", "p90", "max")), by))
+    print("  (resolved = an observation with resolves=<trigger> followed; hours from the deferral to it;")
+    print("   resolved by = tier of the run that wrote the observation)")
 
 ob = [(day, v) for day, v in daily if v.get("outs")]
 if ob:

@@ -53,6 +53,13 @@ case "$mode" in
     obs)     printf '{"type":"observation","step_id":"o-%s","content":"did a thing","source":"monolith"}\n' "$n" >> "$STUB_TRAJ" ;;
     thought) printf '{"type":"thought","step_id":"t-%s","content":"nothing changed","source":"monolith"}\n' "$n" >> "$STUB_TRAJ" ;;
     fail)    exit 3 ;;
+    fail-diag) printf 'diag-run-0001' > "$SHELLM_RUN_ID_OUT"
+               printf '{"type":"shell-output","step_id":"diag-so-1","run_id":"diag-run-0001","stdout":"boom: the actual diagnostic","exit":1,"source":"monolith"}\n' >> "$STUB_TRAJ"
+               printf '{"type":"shell-output","step_id":"diag-so-2","run_id":"diag-run-0001","stdout":"=== me === benign status read after the failure","exit":0,"source":"monolith"}\n' >> "$STUB_TRAJ"
+               exit 3 ;;
+    fail-diag-noexit) printf 'diag-run-0002' > "$SHELLM_RUN_ID_OUT"
+               printf '{"type":"shell-output","step_id":"diag-so-3","run_id":"diag-run-0002","stdout":"hang then killed, no exit code recorded","source":"monolith"}\n' >> "$STUB_TRAJ"
+               exit 3 ;;
     none)    : ;;
 esac
 exit 0
@@ -158,6 +165,40 @@ if [[ "$(lvl)" = 1 ]] && near "$(delay)" 5 && grep -q '"type":"error"' "$TRAJ"; 
     ok "failed run: error step, immediate descent"
 else
     bad "failed run: error step, immediate descent" "level=$(lvl) delay=$(delay)"
+fi
+
+# --- 6b. failed run WITH a shell-output: error step carries diagnostic_step ---
+reset_state
+echo fail-diag > "$STUB_MODE_FILE"
+run_step "$WAKE"
+diag=$(jq -Rr 'fromjson? // empty | select(.type=="error") | .diagnostic_step // empty' "$TRAJ" | tail -n 1)
+if [[ "$diag" == "diag-so-1" ]]; then
+    ok "failed run with shell-output: error step carries diagnostic_step"
+else
+    bad "failed run with shell-output: error step carries diagnostic_step" "diag=$diag"
+fi
+
+# --- 6c. bare failed run (no shell-output): error step has NO diagnostic_step ---
+reset_state
+echo fail > "$STUB_MODE_FILE"
+run_step "$WAKE"
+bare=$(jq -Rr 'fromjson? // empty | select(.type=="error") | .diagnostic_step // "absent"' "$TRAJ" | tail -n 1)
+if [[ "$bare" == "absent" ]]; then
+    ok "bare failed run: error step has no diagnostic_step (nothing to reference)"
+else
+    bad "bare failed run: error step has no diagnostic_step" "got=$bare"
+fi
+
+# --- 6d. failed run whose only shell-output has no exit code: diagnostic_step
+#      falls back to the last non-empty step (inference-layer death) ---
+reset_state
+echo fail-diag-noexit > "$STUB_MODE_FILE"
+run_step "$WAKE"
+fb=$(jq -Rr 'fromjson? // empty | select(.type=="error") | .diagnostic_step // empty' "$TRAJ" | tail -n 1)
+if [[ "$fb" == "diag-so-3" ]]; then
+    ok "failed run with no-exit shell-output: diagnostic_step falls back to last non-empty"
+else
+    bad "failed run with no-exit shell-output: diagnostic_step falls back to last non-empty" "fb=$fb"
 fi
 
 # --- 7. share nudge: every N spontaneous wakes, then counter resets ----------

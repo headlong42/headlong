@@ -493,3 +493,59 @@ def test_unwritable_trajectory_disables_notices_after_one_error(tmp_path, monkey
     assert bot.sent == ["a", "b"]
     assert len(calls) == 1
     assert sum("delivery notices disabled" in r.message for r in caplog.records) == 1
+
+
+def test_run_survives_unreadable_trajectory(tmp_path, monkeypatch):
+    """A PermissionError while opening or following the trajectory must not
+    end the outbound thread: it retries and delivers once the file is
+    readable again (2026-09-22: the mind chmod 700'd its own trajectory dir
+    and every reply for 19 hours stayed in the log)."""
+    steps = [
+        {"type": "message", "from": "audel", "to": "telegram-1-1",
+         "source": "chat", "content": "late but delivered", "step_id": "aaa"},
+    ]
+    calls = {"find": 0, "follow": 0}
+
+    def find_trajectory(_d):
+        calls["find"] += 1
+        if calls["find"] < 3:
+            raise PermissionError(13, "Permission denied", str(tmp_path / "t.jsonl"))
+        return tmp_path / "t.jsonl"
+
+    def follow(*_a, **_k):
+        calls["follow"] += 1
+        if calls["follow"] == 1:
+            raise PermissionError(13, "Permission denied", str(tmp_path / "t.jsonl"))
+        yield from steps
+
+    monkeypatch.setattr(outbound.mindlog, "find_trajectory", find_trajectory)
+    monkeypatch.setattr(outbound.mindlog, "follow", follow)
+    monkeypatch.setattr(outbound, "RETRY_SECS", 0.01)
+
+    sent = []
+
+    class FakeBot:
+        def send_message(self, chat, text, html=False):
+            sent.append(text)
+
+    class ApproveAll:
+        def is_approved(self, user):
+            return True
+
+    outbound.run(_cfg(tmp_path), FakeBot(), ApproveAll(), threading.Event())
+    assert sent == ["late but delivered"]
+    assert calls == {"find": 4, "follow": 2}
+
+
+def test_run_stops_while_trajectory_is_unreadable(tmp_path, monkeypatch):
+    """The retry loop honours stop_event, so a bridge shutdown never hangs
+    on a trajectory it cannot read."""
+    stop = threading.Event()
+
+    def find_trajectory(_d):
+        stop.set()
+        raise PermissionError(13, "Permission denied", "t.jsonl")
+
+    monkeypatch.setattr(outbound.mindlog, "find_trajectory", find_trajectory)
+    monkeypatch.setattr(outbound, "RETRY_SECS", 0.01)
+    outbound.run(_cfg(tmp_path), object(), object(), stop)

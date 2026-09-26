@@ -34,6 +34,10 @@ fi
 # Framework var: HEADLONG_ first, legacy SHELLM_ fallback (the box .env still
 # carries the old name until it is rewritten).
 ALERT_CHANNEL="${HEADLONG_ALERT_CHANNEL:-${SHELLM_ALERT_CHANNEL:-}}"
+# Posting token: HEADLONG_ALERT_TOKEN (seeded by deploy/split-bridge-env.sh;
+# ideally a dedicated alert-only app). The bridge's own token is in
+# .env.bridge, which this script cannot read inside the thinkers sandbox.
+ALERT_TOKEN="${HEADLONG_ALERT_TOKEN:-${SLACK_BOT_TOKEN:-}}"
 
 unit="headlong-thinkers@${IDENT}.service"
 info=$(systemctl show "$unit" \
@@ -48,8 +52,8 @@ ${log_tail}
 \`\`\`
 Investigate first, then restart: \`sudo headlong-thinkersctl start ${IDENT}\` on the box."
 
-if [[ -z "${SLACK_BOT_TOKEN:-}" || -z "$ALERT_CHANNEL" ]]; then
-    printf '%s [thinkers-alert] %s failed; Slack not configured (need SLACK_BOT_TOKEN + HEADLONG_ALERT_CHANNEL in %s/.env)\n' \
+if [[ -z "$ALERT_TOKEN" || -z "$ALERT_CHANNEL" ]]; then
+    printf '%s [thinkers-alert] %s failed; Slack not configured (need HEADLONG_ALERT_TOKEN + HEADLONG_ALERT_CHANNEL in %s/.env)\n' \
         "$(date -u +%FT%TZ)" "$unit" "$APP_DIR" >> "$FALLBACK_LOG"
     exit 0
 fi
@@ -57,7 +61,7 @@ fi
 payload=$(jq -nc --arg ch "$ALERT_CHANNEL" --arg text "$text" \
     '{channel: $ch, text: $text}')
 resp=$(curl -sS -m 15 -X POST https://slack.com/api/chat.postMessage \
-    -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+    -H "Authorization: Bearer $ALERT_TOKEN" \
     -H "Content-Type: application/json; charset=utf-8" \
     --data "$payload" 2>&1 || true)
 if ! printf '%s' "$resp" | jq -e '.ok == true' >/dev/null 2>&1; then

@@ -21,6 +21,10 @@ WorkingDirectory=@SHELLM_HOME@/app
 # '-' prefix: missing .env (first boot, before the SSM fetch lands) must not
 # fail the unit — the bridge exits and Restart=always retries until it works.
 EnvironmentFile=-@SHELLM_HOME@/app/.env
+# The bridge tokens live apart from the root .env so the mind never sees
+# them (deploy/split-bridge-env.sh); later files win, so a token still in
+# .env is overridden by .env.bridge.
+EnvironmentFile=-@SHELLM_HOME@/app/.env.bridge
 Environment="PATH=@SHELLM_HOME@/.local/bin:@SHELLM_HOME@/.bun/bin:/usr/local/bin:/usr/bin:/bin"
 ExecStart=@SHELLM_HOME@/app/tools/headlong-slack-bridge @SHELLM_HOME@/app
 Restart=always

@@ -1,0 +1,23 @@
+# headlong-thinkers-silence@<identity> systemd template unit. Installed by
+# deploy/setup.sh (re-synced by deploy/update.sh), which substitutes
+# @SHELLM_HOME@. Driven by headlong-thinkers-silence@<identity>.timer.
+#
+# Posts to Slack when the identity's dispatcher is up but its trajectory has
+# not grown for HEADLONG_SILENCE_SECS (default 30 min), and again when steps
+# resume. The death/failure alerts cover a dispatcher that dies; this covers
+# one that is alive and doing nothing (2026-09-14: six silent hours behind
+# a wedged step, every unit "active"). The same script posts when the disk
+# passes HEADLONG_DISK_ALERT_PCT (default 90), and the second ExecStart
+# sweeps stale shellm-owned temp files (2026-09-17: 24 GB of trajectory
+# copies filled the root disk and silenced every alert path).
+
+[Unit]
+Description=headlong silence check for identity %i
+
+[Service]
+Type=oneshot
+User=shellm
+WorkingDirectory=@SHELLM_HOME@/app
+EnvironmentFile=-@SHELLM_HOME@/app/.env
+ExecStart=/bin/bash @SHELLM_HOME@/app/deploy/thinkers-silence-alert.sh @SHELLM_HOME@/app %i
+ExecStart=/bin/bash @SHELLM_HOME@/app/deploy/thinkers-tmp-reaper.sh @SHELLM_HOME@/app %i

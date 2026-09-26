@@ -104,6 +104,14 @@ CHAT_REPEAT_WINDOW=0 chat send --to slack-C0BMVH6LM4K "brand new text" >/dev/nul
 # An old identical send (outside the window) does not block.
 chat send --to slack-C0BMVH6LM4K "two days ago" >/dev/null 2>&1 && ok "an identical send outside the window does not block" || bad "old send does not block"
 
+# Inbound is never a repeat: a bridge delivering a person's second "great"
+# of the day must reach the mind (2026-09-21: 22 of Andy's messages came
+# back 409 and the two bridges posted each other's error text in a loop).
+before=$(grep -c '"type":"message"' "$TRAJ")
+chat send --from slack-U0614H65RN3-C0BMVH6LM4K --to "$ME" "great" >/dev/null 2>&1 && ok "a person's message is delivered" || bad "inbound first"
+chat send --from slack-U0614H65RN3-C0BMVH6LM4K --to "$ME" "great" >/dev/null 2>&1 && ok "the same text from the same person is delivered again (inbound is never a repeat)" || bad "inbound repeat delivered"
+[[ $(grep -c '"type":"message"' "$TRAJ") -eq $((before + 2)) ]] && ok "both inbound copies are on the trajectory" || bad "inbound copies" "$(grep -c '"type":"message"' "$TRAJ") vs $((before + 2))"
+
 # reply: answering a specific inbound is exempt; a proactive reply is checked.
 THEM=slack-U0BFD9NDVE3-D0BNW58GP5W
 msg in2 "$THEM" "$ME" "status?" 30

@@ -10,7 +10,15 @@ set -euo pipefail
 
 APP_DIR="${1:-/opt/shellm/app}"
 cd "$APP_DIR"
-export PATH="$APP_DIR/bin:$PATH"
+# bin/ holds the mind's commands (thinkers, traj, chat); tools/ holds the
+# operator commands (identity, persona). The 2026-08-20 bin/ -> tools/ move
+# left `identity` off this PATH, which broke every fresh persona boot with
+# "identity: command not found" (first seen on the Harris box, 2026-09-14;
+# Audel's identity already existed so its box never re-ran that step).
+export PATH="$APP_DIR/bin:$APP_DIR/tools:$PATH"
+for cmd in identity thinkers; do
+    command -v "$cmd" >/dev/null 2>&1 || { echo "error: '$cmd' not on PATH ($PATH)" >&2; exit 1; }
+done
 
 # Root .env carries SHELLM_SLACK_IDENTITY (and the API keys thinkers need)
 if [[ -f "$APP_DIR/.env" ]]; then
@@ -32,9 +40,14 @@ if [[ ! -d "$IDENTITY_DIR/$name" ]]; then
     identity new "$name"
 fi
 
-if [[ ! -f "$IDENTITY_DIR/$name/core_identity_prompt.md" && -f "$APP_DIR/deploy/slack-persona.md" ]]; then
-    echo "==> Installing persona prompt"
-    cp "$APP_DIR/deploy/slack-persona.md" "$IDENTITY_DIR/$name/core_identity_prompt.md"
+# Persona prompt: a per-identity file under deploy/personas/ wins (Harris has
+# its own; Audel predates the directory), else the shared template. Copied
+# once at creation only — the live copy is edited in the identity dir.
+persona_src="$APP_DIR/deploy/personas/$name.md"
+[[ -f "$persona_src" ]] || persona_src="$APP_DIR/deploy/slack-persona.md"
+if [[ ! -f "$IDENTITY_DIR/$name/core_identity_prompt.md" && -f "$persona_src" ]]; then
+    echo "==> Installing persona prompt from ${persona_src#"$APP_DIR"/}"
+    cp "$persona_src" "$IDENTITY_DIR/$name/core_identity_prompt.md"
 fi
 
 # Activate the identity (exports IDENTITY_NAME, TRAJ_DIR, THINKERS_DIR, ...).

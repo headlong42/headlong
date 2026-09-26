@@ -1,0 +1,53 @@
+{
+  "display_information": {
+    "name": "Harris",
+    "description": "Harris, Laude's second Headlong agent — DM me or @mention me in a channel",
+    "long_description": "Harris is an experimental AI agent built on Headlong. It runs continuously on its own machine, and this app connects it to Slack. DM it or @mention it in a channel and your message goes into its running mind. It can use its shell and tools to actually do things, and it replies in the same conversation when it's done.\n\nHarris is under active development. Expect bugs, slow or missing replies, restarts, and the occasional strange decision.\n\nTreat anything you post to Harris as potentially public. Every conversation with every person feeds one shared memory, so what you tell it may surface in its replies to other people. Its full memory is also viewable by everyone at Laude on its dashboard. Don't share credentials, secrets, or anything you wouldn't post in a public channel."
+  },
+  "features": {
+    "app_home": {
+      "messages_tab_enabled": true,
+      "messages_tab_read_only_enabled": false
+    },
+    "bot_user": {
+      "display_name": "harris",
+      "always_online": true
+    }
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": [
+        "app_mentions:read",
+        "chat:write",
+        "files:write",
+        "im:history",
+        "im:read",
+        "im:write",
+        "channels:history",
+        "channels:read",
+        "groups:history",
+        "groups:read",
+        "users:read",
+        "reactions:read",
+        "reactions:write"
+      ]
+    }
+  },
+  "settings": {
+    "event_subscriptions": {
+      "bot_events": [
+        "app_mention",
+        "message.im",
+        "message.channels",
+        "message.groups",
+        "reaction_added"
+      ]
+    },
+    "interactivity": {
+      "is_enabled": false
+    },
+    "org_deploy_enabled": true,
+    "socket_mode_enabled": true,
+    "token_rotation_enabled": false
+  }
+}

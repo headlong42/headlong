@@ -87,13 +87,14 @@ Create a .chatrc file with:
 }
 
 cmd_send() {
-    local message="" from="" to="${IDENTITY_NAME:-}" source_url="" force=0
+    local message="" from="" to="${IDENTITY_NAME:-}" source_url="" force=0 key=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --from) from="${2:?--from requires a name}"; shift 2 ;;
             --to)   to="${2:?--to requires a name}"; shift 2 ;;
             --source-url) source_url="${2:?--source-url requires a URL}"; shift 2 ;;
             --force) force=1; shift ;;
+            --key)  key="${2:?--key requires a key}"; shift 2 ;;
             *)      message="${message:+$message }$1"; shift ;;
         esac
     done
@@ -115,7 +116,15 @@ cmd_send() {
 To message someone else: chat reply <their-name> <message>
 To keep a note for yourself, append a thought step instead of a message."
 
-    [[ "$force" -eq 1 ]] || _refuse_repeat "$from" "$to" "$message"
+    [[ "$force" -eq 1 || -z "$key" ]] || _refuse_key "$key"
+    # The repeat check guards the identity's OWN sends. A message a person
+    # sends in (a bridge delivering "great" for the second time today) is
+    # never a repeat to refuse: on 2026-09-21 the check ran on inbound
+    # deliveries too, 22 of Andy's messages came back 409 and never reached
+    # the mind, and the two bridges posted each other's error text in a loop.
+    if [[ "$force" -ne 1 ]] && ! _inbound_from "$from"; then
+        _refuse_repeat "$from" "$to" "$message"
+    fi
 
     # source_url records where a bridged message came from. It is optional
     # metadata for operators and never affects routing or model context.
@@ -123,9 +132,10 @@ To keep a note for yourself, append a thought step instead of a message."
         | jq -Rsc \
         --arg from "$from" \
         --arg to "$to" \
-        --arg source_url "$source_url" \
+        --arg source_url "$source_url" --arg key "$key" \
         '{type:"message", content:., from:$from, to:$to, source:"chat"}
-         + (if $source_url == "" then {} else {source_url:$source_url} end)' \
+         + (if $source_url == "" then {} else {source_url:$source_url} end)
+         + (if $key == "" then {} else {key:$key} end)' \
         | _chat_append
 
     printf 'Message sent.\n' >&2
@@ -462,17 +472,56 @@ _deliveries_path() { printf '%s/deliveries.jsonl' "$(dirname "$1")"; }
 # _index_update <trajectory file> <index file>
 # Brings the index up to date. Only complete lines are consumed: a line still
 # being appended is left for the next call, so a message is never skipped.
+# The offset file records where the last update stopped: byte offset, the
+# trajectory's header id, and (since 2026-09-15) the file's inode and size at
+# that moment. The index is only as good as the assumption that the bytes
+# before the offset are the bytes it already read. A trajectory rewritten in
+# place breaks that: on 2026-09-12 a `grep -v > tmp && mv` kept the header
+# but shrank the file, so the offset pointed past the end, the index stalled
+# silently, then resumed at a stale byte position once the file had regrown,
+# and every message and deferral appended in between fell into a gap. Two
+# days later a header-changing rewrite forced the first full rebuild, the
+# gap surfaced all at once as OVERDUE pending requests, and the mind
+# delivered month-old replayed work into an August thread. Now a changed
+# inode (mv over the file) or a size below the offset (truncate and rewrite)
+# rebuilds the index from byte zero: one scan instead of a silent gap.
+# The header id is the first JSON value in the file, which is normally line 1.
+# On 2026-09-14 an identity rewrote its header as a pretty-printed object over
+# six lines; `head -n 1` then parsed nothing, the offset record got an empty
+# header field, `read` shifted the inode into its place, and every call saw
+# "trajectory header changed" and rebuilt the whole index. So: parse the first
+# value however many lines it spans, and never record an empty field ("-").
+_traj_header_id() {
+    local id
+    id=$(head -c 65536 -- "$1" 2>/dev/null | jq -rn 'first(inputs) | .step_id // .traj_id // ""' 2>/dev/null) || id=""
+    printf '%s' "${id:--}"
+}
+
+_file_ino() { stat -c %i -- "$1" 2>/dev/null || stat -f %i -- "$1" 2>/dev/null || echo ""; }
+
 _index_update() {
     local tf="$1" idx="$2" off="$2.offset" lock="$2.lock"
-    local header have_off have_header size
-    header=$(head -n 1 -- "$tf" 2>/dev/null | jq -r '.step_id // .traj_id // ""' 2>/dev/null) || header=""
-    have_off=0; have_header=""
+    local header have_off have_header have_ino size ino why=""
+    header=$(_traj_header_id "$tf")
+    have_off=0; have_header=""; have_ino=""
     if [[ -f "$off" ]]; then
-        read -r have_off have_header < "$off" || true
+        read -r have_off have_header have_ino _ < "$off" || true
         [[ "$have_off" =~ ^[0-9]+$ ]] || have_off=0
     fi
+    size=$(wc -c < "$tf" | tr -d ' ')
+    ino=$(_file_ino "$tf")
     local dfr dlv; dfr=$(_deferrals_path "$idx"); dlv=$(_deliveries_path "$idx")
-    if [[ ! -f "$idx" || ! -f "$dfr" || ! -f "$dlv" || "$have_header" != "$header" ]]; then
+    if [[ ! -f "$idx" || ! -f "$dfr" || ! -f "$dlv" ]]; then
+        why="no index yet"
+    elif [[ "$have_header" != "$header" ]]; then
+        why="trajectory header changed"
+    elif [[ -n "$have_ino" && -n "$ino" && "$have_ino" != "$ino" ]]; then
+        why="trajectory file replaced (inode $have_ino -> $ino)"
+    elif (( have_off > 0 && size < have_off )); then
+        why="trajectory shrank below the index offset ($size < $have_off)"
+    fi
+    if [[ -n "$why" ]]; then
+        [[ "$why" != "no index yet" ]] && printf 'chat: rebuilding the message index from the start: %s\n' "$why" >&2
         have_off=0
         : > "$idx.rebuild" || return 1
         mv -f "$idx.rebuild" "$idx"
@@ -481,8 +530,14 @@ _index_update() {
         : > "$dlv.rebuild" || return 1
         mv -f "$dlv.rebuild" "$dlv"
     fi
-    size=$(wc -c < "$tf" | tr -d ' ')
-    (( size > have_off )) || return 0
+    if (( size <= have_off )); then
+        # Nothing new. Upgrade a pre-inode offset record in passing so the
+        # next replacement is caught.
+        if [[ -z "$have_ino" && -n "$ino" ]]; then
+            printf '%s %s %s %s\n' "$have_off" "$header" "$ino" "$size" > "$off" 2>/dev/null || true
+        fi
+        return 0
+    fi
     # One updater at a time; a concurrent reader just uses what is there.
     mkdir "$lock" 2>/dev/null || return 0
     _index_apply "$tf" "$idx" "$off" "$header" "$have_off"
@@ -492,27 +547,42 @@ _index_update() {
 }
 
 # The locked part of _index_update: read the new bytes, index the complete
-# message lines among them, advance the offset.
+# message lines among them, advance the offset. The new bytes are read straight
+# from the trajectory as a fixed byte range, never copied to a temp file: a
+# full rebuild on a 1.6 GB trajectory used to need 1.6 GB free in /tmp, and on
+# 2026-09-17 a nearly full disk left all three indexes empty. The trajectory is
+# append-only, so the same range reads the same bytes on every pass.
 _index_apply() {
     local tf="$1" idx="$2" off="$3" header="$4" have_off="$5"
-    local new_bytes tmp partial
-    tmp=$(mktemp) || return 1
-    tail -c +"$((have_off + 1))" -- "$tf" > "$tmp"
-    new_bytes=$(wc -c < "$tmp" | tr -d ' ')
+    local size new_bytes partial probe len
+    size=$(wc -c < "$tf" | tr -d ' ')
+    new_bytes=$((size - have_off))
+    (( new_bytes > 0 )) || return 0
+    # Length of a trailing line that is still being appended: look at the end
+    # of the range only. No newline in the probe at all means one very long
+    # unfinished line; leave it for the next call.
+    probe=$(( new_bytes < 4194304 ? new_bytes : 4194304 ))
     partial=0
-    if [[ "$new_bytes" -gt 0 && "$(tail -c 1 "$tmp" | wc -l | tr -d ' ')" -eq 0 ]]; then
-        partial=$(tail -n 1 "$tmp" | wc -c | tr -d ' ')
+    if [[ "$(tail -c +"$((size - probe + 1))" -- "$tf" | head -c "$probe" | tail -c 1 | wc -l | tr -d ' ')" -eq 0 ]]; then
+        if [[ "$(tail -c +"$((size - probe + 1))" -- "$tf" | head -c "$probe" | wc -l | tr -d ' ')" -eq 0 ]]; then
+            (( probe == new_bytes )) || return 0
+            partial=$new_bytes
+        else
+            partial=$(tail -c +"$((size - probe + 1))" -- "$tf" | head -c "$probe" | tail -n 1 | wc -c | tr -d ' ')
+        fi
     fi
-    if (( new_bytes - partial > 0 )); then
-        head -c "$((new_bytes - partial))" "$tmp" \
+    len=$((new_bytes - partial))
+    _index_range() { tail -c +"$((have_off + 1))" -- "$tf" 2>/dev/null | head -c "$len"; }
+    if (( len > 0 )); then
+        _index_range \
             | grep -F '"type":"message"' \
             | jq -c --argjson cap "$_INDEX_CONTENT_CAP" 'fromjson? // empty
                 | select(.type == "message" and (.from // "") != "" and (.to // "") != "")
-                | {step_id, ts, from, to, reply_to, filename,
+                | {step_id, ts, from, to, reply_to, filename, key,
                    content: ((.content // "") | tostring
                              | if length > $cap then .[0:$cap] + "…[truncated]" else . end)}
                 | with_entries(select(.value != null))' -R >> "$idx" 2>/dev/null || true
-        head -c "$((new_bytes - partial))" "$tmp" \
+        _index_range \
             | grep -F -e '"trigger_step"' -e '"resolves":' \
             | jq -c --argjson cap "$_INDEX_CONTENT_CAP" 'fromjson? // empty
                 | if .type == "action" and .source == "responder" and (.trigger_step // "") != "" then
@@ -523,15 +593,15 @@ _index_apply() {
                     {kind: "resolve", step_id, ts, resolves}
                   else empty end
                 | with_entries(select(.value != null))' -R >> "$(_deferrals_path "$idx")" 2>/dev/null || true
-        head -c "$((new_bytes - partial))" "$tmp" \
+        _index_range \
             | grep -F '"type":"delivery"' \
             | jq -c 'fromjson? // empty
                 | select(.type == "delivery" and (.trigger_step // "") != "")
                 | {step_id, ts, trigger_step, status, transport, reason, permalink, channel, message_ts}
                 | with_entries(select(.value != null))' -R >> "$(_deliveries_path "$idx")" 2>/dev/null || true
     fi
-    printf '%s %s\n' "$((have_off + new_bytes - partial))" "$header" > "$off"
-    rm -f "$tmp"
+    # Record the inode and the size the offset refers to (see _index_update).
+    printf '%s %s %s %s\n' "$((have_off + len))" "$header" "$(_file_ino "$tf")" "$size" > "$off"
 }
 
 # Parse "7d" / "36h" / "90m" / "3600" (seconds) into seconds.
@@ -728,12 +798,35 @@ cmd_sent() {
                       state: ($n.status // (if ($m.to | test($confirming)) then "pending" else "unconfirmed" end)),
                       reason: $n.reason, permalink: $n.permalink, transport: $n.transport}
               | with_entries(select(.value != null)))
-        | if $json == 1 then map({step_id, ts, to, content, state, reason, permalink, transport, age_s, reply_to, filename})
+        | if $json == 1 then map({step_id, ts, to, content, state, reason, permalink, transport, age_s, reply_to, filename, key})
           else .[] | "\(.ts // "?") \(.to)  \(.state)"
                      + (if .state == "pending" then " \(.age_s | age_text)" else "" end)
                      + (if .reason then " (\(.reason))" else "" end)
+                     + (if .key then " [\(.key)]" else "" end)
                      + "  " + ((.filename // .content // "") | gsub("\n"; " ") | if length > 80 then .[0:80] + "…" else . end)
           end' -R < "$idx"
+}
+
+# _refuse_key <key>: die if a send with this key already went out and did not
+# fail. A key names the one duty a send fulfils (a scheduled window, say), so
+# the check holds however the text is reworded and has no time window: on
+# 2026-09-18 the same papers post went out five times in three hours, reworded
+# each time, past the exact-text check below (design/scheduled_goals.md).
+_refuse_key() {
+    local hit
+    hit=$(cmd_sent --json -n 1000000 2>/dev/null | jq -r --arg k "$1" '
+        [.[] | select((.key // "") == $k and .state != "failed" and .state != "skipped")]
+        | last // empty | "\(.ts) to \(.to) (\(.state), step \(.step_id))"' 2>/dev/null) || hit=""
+    [[ -z "$hit" ]] && return 0
+    die "refusing to send: '$1' was already sent at $hit. That duty is done; do not send it again.
+\`chat sent\` shows recent sends. If a second send is deliberate, add --force."
+}
+
+# _inbound_from <from>: true when the sender is someone other than the
+# identity itself, i.e. a person's message being delivered in. With no
+# IDENTITY_NAME (hand use outside an identity) every send counts as outbound.
+_inbound_from() {
+    [[ -n "${IDENTITY_NAME:-}" && "$1" != "$IDENTITY_NAME" ]]
 }
 
 # _refuse_repeat <from> <to> <message>: die if this exact message already went
@@ -787,12 +880,16 @@ usage() {
 chat — Messaging for an activated identity
 
 Usage:
-  chat send [--from <name>] [--to <name>] [--source-url <url>] [--force] <message>
+  chat send [--from <name>] [--to <name>] [--source-url <url>] [--key <key>] [--force] <message>
                              Send a message (from defaults to .chatrc
                              default_send_from, to defaults to $IDENTITY_NAME).
                              Refuses a message identical to one sent to the
                              same destination in the last 24h
-                             (CHAT_REPEAT_WINDOW) unless --force.
+                             (CHAT_REPEAT_WINDOW) unless --force. Only the
+                             identity's own sends are checked; a person's
+                             message delivered in is never refused.
+                             --key names the one duty this send fulfils;
+                             a second send with the same key is refused.
                              A slack-* destination must be a form the bridge
                              delivers: slack-<user>-<channel>[-<ts>],
                              slack-C<id> (channel), or slack-U<id> (DM)

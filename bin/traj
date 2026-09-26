@@ -1234,6 +1234,188 @@ TAILHELP
 # search
 # ---------------------------------------------------------------------------
 
+
+# The serialized lines `traj search` prefilters are JSON, so every field
+# value jq wrote has quotes, backslashes, tabs, and control characters
+# escaped. A pattern that matches a decoded field does not necessarily
+# match its escaped form, so prefiltering on the raw pattern silently
+# drops rows the search should return: a quoted literal, a literal tab or
+# backslash, a regex dot or character class over an escaped character,
+# an anchor at the value open or at an interior decoded line. The two
+# translators below emit a pattern that matches the serialized line
+# whenever the original matches the decoded field: a fixed string through
+# the escape table (a decoded match always appears contiguously in its
+# escaped form), and a regex into a per-node superset that admits the
+# escaped image of anything the node can match. The translated pattern
+# can only widen the candidate set; the per-row decoded grep above stays
+# the judge of truth.
+
+# REPLY := the bytes one character takes inside a jq-serialized string.
+_jq_image() {
+    local c="$1" code
+    if [[ "$c" == '\' ]]; then REPLY='\\'
+    elif [[ "$c" == '"' ]]; then REPLY='\"'
+    elif [[ "$c" == $'\n' ]]; then REPLY='\n'
+    elif [[ "$c" == $'\r' ]]; then REPLY='\r'
+    elif [[ "$c" == $'\t' ]]; then REPLY='\t'
+    elif [[ "$c" == $'\b' ]]; then REPLY='\b'
+    elif [[ "$c" == $'\f' ]]; then REPLY='\f'
+    else
+        LC_ALL=C printf -v code '%d' "'$c"
+        # Bash 3.2 can report a negative value for a high-bit byte.
+        # Only ASCII controls are escaped; preserve non-ASCII text as-is.
+        if (( (code >= 0 && code < 32) || code == 127 )); then
+            LC_ALL=C printf -v REPLY '\\u%04x' "$code"
+        else
+            REPLY="$c"
+        fi
+    fi
+}
+
+# REPLY := s with every ERE metacharacter backslash-escaped, so a literal
+# fragment can be spliced into a translated regex.
+_ere_quote() {
+    local s="$1" out="" i c
+    for (( i=0; i<${#s}; i++ )); do
+        c="${s:i:1}"
+        if [[ "$c" == '\' || "$c" == '.' || "$c" == '[' || "$c" == '(' \
+           || "$c" == ')' || "$c" == '*' || "$c" == '+' || "$c" == '?' \
+           || "$c" == '{' || "$c" == '|' || "$c" == '^' || "$c" == '$' ]]; then
+            out+="\\$c"
+        else
+            out+="$c"
+        fi
+    done
+    REPLY="$out"
+}
+
+# REPLY := a -F pattern translated for the serialized line. A newline in
+# the pattern splits it into alternatives the way grep reads it, so each
+# line is translated on its own and the images stay newline-free.
+_traj_prefilter_literal() {
+    # REPLY := a -F pattern translated for the serialized line. A newline
+    # in the pattern splits it into alternatives the way grep reads it,
+    # so each line is translated on its own and the images stay
+    # newline-free.
+    local p="$1"
+    local rest="$p"
+    local line piece i c
+    local -a pieces=()
+    while :; do
+        line="${rest%%$'\n'*}"
+        piece=""
+        for (( i=0; i<${#line}; i++ )); do
+            c="${line:i:1}"
+            _jq_image "$c"
+            piece+="$REPLY"
+        done
+        pieces+=("$piece")
+        if [[ "$rest" == *$'\n'* ]]; then rest="${rest#*$'\n'}"; else break; fi
+    done
+    local IFS=$'\n'
+    REPLY="${pieces[*]}"
+}
+
+
+_traj_prefilter_regex() {
+    # REPLY := an -E pattern translated into a superset that matches the
+    # serialized line whenever the original matches the decoded field.
+    # Anchors are dropped (the decoded grep re-imposes them, including at
+    # interior decoded lines, which the serialized line cannot see); . and
+    # character classes admit the escaped image of any character they can
+    # match; \w is kept because jq never escapes word characters. Nodes
+    # the translator cannot make tight are widened, never dropped: \b and
+    # friends are zero-width and vanish, a backreference becomes .*, a
+    # class it cannot parse bypasses the prefilter, and an unterminated
+    # class is the literal text GNU grep takes it for. A trailing backslash,
+    # which makes the decoded grep itself error, also yields the empty
+    # pattern. Every branch widens or preserves the
+    # candidate set, so none can silently drop a row the search should
+    # return, and the widening stays local so common patterns keep a
+    # tight prefilter.
+    local p="$1"
+    local rest="$p"
+    local line out i n c nxt k j neg complex raw delimiter
+    local -a pieces=()
+    while :; do
+        line="${rest%%$'\n'*}"
+        out="" i=0 n=${#line}
+        while (( i < n )); do
+            c="${line:i:1}"
+            if [[ "$c" == '\' ]]; then
+                if (( i+1 >= n )); then out=""; break; fi
+                nxt="${line:i+1:1}"
+                i=$((i+2))
+                case "$nxt" in
+                    w) out+='\w' ;;
+                    s|W|S) out+='(.|\\.|\\u[0-9a-f]{4})' ;;
+                    b|B|'<'|'>') : ;;
+                    [0-9]) out+='.*' ;;
+                    *) _jq_image "$nxt"; _ere_quote "$REPLY"
+                       # An escaped character is one regex atom, even when
+                       # its serialized image occupies several characters.
+                       if (( ${#REPLY} > 1 )); then REPLY="($REPLY)"; fi
+                       out+="$REPLY" ;;
+                esac
+            elif [[ "$c" == '.' ]]; then
+                out+='(.|\\.|\\u[0-9a-f]{4})'; i=$((i+1))
+            elif [[ "$c" == '^' || "$c" == '$' ]]; then
+                i=$((i+1))
+            elif [[ "$c" == '[' ]]; then
+                k=$((i+1)); neg=0; complex=0
+                if [[ "${line:k:1}" == '^' ]]; then neg=1; k=$((k+1)); fi
+                if [[ "${line:k:1}" == ']' ]]; then k=$((k+1)); fi
+                while (( k < n )) && [[ "${line:k:1}" != ']' ]]; do
+                    if [[ "${line:k:1}" == '\' ]]; then
+                        # Backslash in a bracket expression is not a portable
+                        # escape (BSD grep may end the class at the next ]).
+                        # Do not guess where it ends: bypass the prefilter.
+                        REPLY=""; return
+                    elif [[ "${line:k:1}" == '[' ]]; then
+                        delimiter="${line:k+1:1}"
+                        if [[ "$delimiter" == ':' || "$delimiter" == '.' || "$delimiter" == '=' ]]; then
+                            j=$((k+2))
+                            while (( j+1 < n )) && [[ "${line:j:2}" != "$delimiter]" ]]; do j=$((j+1)); done
+                            # Do not leave an inner terminator's ] behind as
+                            # a required literal. If parsing is uncertain,
+                            # admit every candidate; decoded grep is the judge.
+                            if (( j+1 >= n )); then REPLY=""; return; fi
+                            complex=1; k=$((j+2))
+                        else
+                            complex=1; k=$((k+1))
+                        fi
+                    else
+                        k=$((k+1))
+                    fi
+                done
+                if (( k >= n )); then
+                    _ere_quote '['; out+="$REPLY"; i=$((i+1))
+                else
+                    if (( neg )) || (( complex )); then
+                        out+='(.|\\.|\\u[0-9a-f]{4})'
+                    else
+                        raw="${line:i:k-i+1}"
+                        out+='('"${raw}"'|\\.|\\u[0-9a-f]{4})'
+                    fi
+                    i=$((k+1))
+                fi
+            elif [[ "$c" == '(' || "$c" == ')' || "$c" == '|' || "$c" == '*' \
+                 || "$c" == '+' || "$c" == '?' || "$c" == '{' || "$c" == '}' ]]; then
+                out+="$c"; i=$((i+1))
+            else
+                _jq_image "$c"; _ere_quote "$REPLY"
+                if (( ${#REPLY} > 1 )); then REPLY="($REPLY)"; fi
+                out+="$REPLY"; i=$((i+1))
+            fi
+        done
+        pieces+=("$out")
+        if [[ "$rest" == *$'\n'* ]]; then rest="${rest#*$'\n'}"; else break; fi
+    done
+    local IFS=$'\n'
+    REPLY="${pieces[*]}"
+}
+
+
 cmd_search() {
     local pattern="" field="all" case_flag="" context_lines=0 use_regex=0 traj_dir_opt="" traj_id_opt="" recursive=0 tail_n=0
     while [[ $# -gt 0 ]]; do
@@ -1295,41 +1477,50 @@ cmd_search() {
         local blob_base
         blob_base="$(dirname "$_sf")"
 
-        # Only rows that can match are parsed: one grep over the file keeps the
-        # rows containing the pattern, plus rows whose searched text lives in
-        # a blob (a *_ref field), and --tail N looks at the last N rows only.
-        # Before this every row went through several jq calls (136K rows on
-        # Audel: killed by timeout, 2026-09-09).
-        local _cand _pre
+        # Two prefilters, one per pass. The row pass below searches rows whose
+        # serialized text already matches the pattern and that carry no blob
+        # reference. The reference pass after it searches every row with a
+        # *_ref key, because matching serialized JSON is not the same as
+        # matching a decoded field: an anchored or quoted pattern can match
+        # the decoded text while never matching the escaped row, so reference
+        # rows cannot be prefiltered on the pattern at all. Before this,
+        # every _ref row was re-parsed with several jq and grep calls per row
+        # per field, so a pattern matching nothing still walked every blob
+        # row: ~859 rows here at ~60ms each, ~52s of silence, past the 30s
+        # inactivity watchdog (2026-09-23; the same shape killed a 136K-row
+        # search 2026-09-09).
+        local _cand _pre _pfilter
         _cand=$(mktemp) || die "search: mktemp failed"
         _pre=("$grep_mode")
         [[ -n "$case_flag" ]] && _pre+=("$case_flag")
-        if [[ "$tail_n" -gt 0 ]]; then
-            tail -n "$tail_n" -- "$_sf" | grep "${_pre[@]}" -e "$pattern" -e '_ref":' > "$_cand" || true
+        # Prefilter with the translated pattern, never the raw one: a match
+        # in a decoded field appears in the serialized line only in its
+        # escaped form, so the raw pattern silently drops candidate rows.
+        # The translation can only widen the candidate set.
+        if [[ "$use_regex" -eq 1 ]]; then
+            _traj_prefilter_regex "$pattern"
         else
-            grep "${_pre[@]}" -e "$pattern" -e '_ref":' -- "$_sf" > "$_cand" || true
+            _traj_prefilter_literal "$pattern"
+        fi
+        _pfilter="$REPLY"
+        if [[ "$tail_n" -gt 0 ]]; then
+            tail -n "$tail_n" -- "$_sf" | grep "${_pre[@]}" -e "$_pfilter" > "$_cand" || true
+        else
+            grep "${_pre[@]}" -e "$_pfilter" -- "$_sf" > "$_cand" || true
         fi
 
-        # Iterate over each candidate row.
+        # Row pass: inline candidates that carry no reference, in row order.
+        # Reference rows are left entirely to the reference pass, so a row is
+        # never searched twice.
         while IFS= read -r row; do
+            if [[ "$row" == *'_ref":'* ]]; then continue; fi
             local step_id
             step_id=$(printf '%s' "$row" | jq -r '.step_id // empty')
             [[ -n "$step_id" ]] || continue
 
             for f in $fields_to_search; do
                 local content=""
-
-                # For stdout/stderr, check if there's a blob and use that for full search.
-                local ref_key="${f}_ref"
-                local ref_val
-                ref_val=$(printf '%s' "$row" | jq -r ".${ref_key} // empty" 2>/dev/null)
-
-                if [[ -n "$ref_val" ]] && [[ -f "$blob_base/$ref_val" ]]; then
-                    content=$(cat "$blob_base/$ref_val")
-                else
-                    content=$(printf '%s' "$row" | jq -r ".${f} // empty")
-                fi
-
+                content=$(printf '%s' "$row" | jq -r ".${f} // empty")
                 [[ -n "$content" ]] || continue
 
                 # Search the content.
@@ -1348,6 +1539,68 @@ cmd_search() {
             done
         done < "$_cand"
         rm -f "$_cand"
+
+        # Reference pass, batched. One jq over the prefiltered reference rows
+        # emits, for every searched field of every row, one metadata line
+        # (step id, field, ref, line count of the decoded text) followed by
+        # the decoded text itself; the line count is what tells the reader
+        # where the text ends, so the stream stays in sync whatever the text
+        # contains, and no per-row jq is ever spawned. A field whose blob file
+        # exists is searched in the blob, which holds the full text while the
+        # inline copy is only a truncated prefix; a field whose blob is
+        # missing falls back to the decoded inline text; a field with no ref
+        # of its own is searched inline, which is what keeps a merge row's
+        # content searchable.
+        local -a _refpre
+        _refpre=(-F)
+        [[ -n "$case_flag" ]] && _refpre+=(-i)
+        local _refrows _chunks _fl_json _sep
+        _refrows=$(mktemp) || die "search: mktemp failed"
+        _chunks=$(mktemp) || die "search: mktemp failed"
+        if [[ "$tail_n" -gt 0 ]]; then
+            tail -n "$tail_n" -- "$_sf" | grep "${_refpre[@]}" -e '_ref":' > "$_refrows" || true
+        else
+            grep "${_refpre[@]}" -e '_ref":' -- "$_sf" > "$_refrows" || true
+        fi
+        _fl_json="" _sep=""
+        for f in $fields_to_search; do
+            _fl_json+="$_sep\"$f\""
+            _sep=","
+        done
+        _fl_json="[$_fl_json]"
+        jq -r --argjson fl "$_fl_json" '
+            ($fl[]) as $f |
+            ((.[$f] // "") | if type == "string" then . else tostring end) as $c |
+            (.[$f + "_ref"] // "") as $r |
+            select($c != "" or $r != "") |
+            "\(.step_id // "")\u001f\($f)\u001f\($r)\u001f\(($c | split("\n") | length) | if . < 1 then 1 else . end)\n\($c)"
+        ' "$_refrows" > "$_chunks" 2>/dev/null || true
+        local _csid _cfld _cref _cn _k _bl _buf _first _m _ml
+        while IFS=$'\x1f' read -r _csid _cfld _cref _cn; do
+            [[ "$_cn" =~ ^[0-9]+$ ]] || break
+            _buf="" _first=1
+            for (( _k=0; _k<_cn; _k++ )); do
+                IFS= read -r _bl || _bl=""
+                if (( _first )); then _buf="$_bl" _first=0; else _buf+=$'\n'"$_bl"; fi
+            done
+            [[ -n "$_csid" ]] || continue
+            if [[ -n "$_cref" && -f "$blob_base/$_cref" ]]; then
+                _m=$(grep "${grep_args[@]}" -- "$pattern" "$blob_base/$_cref" 2>/dev/null || true)
+            elif [[ -n "$_buf" ]]; then
+                _m=$(printf '%s\n' "$_buf" | grep "${grep_args[@]}" -- "$pattern" 2>/dev/null || true)
+            else
+                _m=""
+            fi
+            [[ -n "$_m" ]] || continue
+            while IFS= read -r _ml; do
+                if [[ "$recursive" -eq 1 ]]; then
+                    printf '%s:%s:%s:%s\n' "$_traj_hex" "$_csid" "$_cfld" "$_ml"
+                else
+                    printf '%s:%s:%s\n' "$_csid" "$_cfld" "$_ml"
+                fi
+            done <<< "$_m"
+        done < "$_chunks"
+        rm -f "$_refrows" "$_chunks"
     done <<< "$_search_files"
 }
 

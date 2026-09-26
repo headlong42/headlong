@@ -268,6 +268,73 @@ with the command it was going to run, instead of a ten minute stall and a
 dead run. A loop that starts before any block closes is not caught; a
 repeated-line guard would be the next net if the timeouts persist.
 
+## Issue D — a step that never exits leaves the mind silent
+
+### Evidence
+
+2026-09-14 18:34Z: a wake answered a Telegram question about identity
+creation by creating one on the box, and inside the run it started two
+`headlong-web` servers with `nohup ... &`. The run finished normally and
+wrote its final step at 18:45:37Z. The monolith step then sat in `read()`
+for six hours. The dispatcher was alive and ticking, every unit reported
+active, and Audel's trajectory did not grow until an operator killed the
+servers at 01:40Z the next day.
+
+### Root cause
+
+The step captured the run with `run_response=$( ... shellm ... )`, which is
+a pipe. A pipe reaches end of file only when every holder of its write end
+closes it, and a backgrounded process inherits every fd the run had open.
+The servers held the pipe, so the command substitution never returned, the
+step never reached its EXIT trap, and `arm_wake` never wrote the next
+`wake_at`. Under `trigger_self:false` the EXIT trap is the only source of
+the next wake, and no watchdog covers a monolith subscription (the
+liveness watchdog applies to `trigger_self` thinkers only). Nothing
+noticed: the death and failure alerts watch the unit, and the unit was
+fine.
+
+### Fixes (built 2026-09-15)
+
+1. **Files, not pipes** (`thinkers/monolith/step`). shellm's stdout and
+   stderr go to temp files; a `tail -F` streams stderr to the step log
+   while the run works. The step now waits only for its direct child.
+   After the run it lists any process still alive in its process group
+   (Linux, where setsid gives each step its own) as a WARNING in the log.
+   Leftovers are reported, not killed: a backgrounded sub-run can be
+   deliberate.
+2. **Stuck-step guard** (`bin/thinkers`, `THINKERS_STEP_GRACE`, default
+   300s, 0 disables). The dispatcher remembers which thinker launched each
+   `shellm-run` (its `launched_by`; shellm blanks it for nested runs) and,
+   when the matching `final` arrives while that step is still alive,
+   starts a grace clock. A step alive past the grace gets TERM (bash runs
+   its EXIT trap on TERM, so the monolith still arms its next wake), KILL
+   15s later, one `error` step with `reason: step-stuck`, and a STUCK line
+   in the dispatcher log naming what else was alive in its group. A step
+   with no final, or a final from a run it did not launch, is left alone.
+3. **Silence alert** (`deploy/thinkers-silence-alert.sh`,
+   `headlong-thinkers-silence@<identity>.timer`, every 5 min). If the
+   dispatcher pid is alive, no deliberate stop is marked, and the root
+   trajectory has not been touched for `HEADLONG_SILENCE_SECS` (default
+   1800s, six times the 300s backoff cap), post one "gone quiet" message
+   to the alert channel and write `run/silent_since`; post "is back" and
+   drop the marker when steps resume. A dead dispatcher is the death
+   alert's job and posts nothing here. The timer is armed by
+   `headlong-thinkersctl start|restart` and by `deploy/update.sh` for
+   every identity with a thinkers unit.
+
+Tests: `tests/test_monolith_run_capture.sh` (a stub run leaves a
+background process holding every fd; the step must still return, keep
+both streams, arm the wake and name the leftover),
+`tests/test_thinkers_stuck_step.sh` (guard fires after the grace, EXIT trap
+runs, error step appended; no final or a foreign final leaves the step
+alone; grace 0 disables), `tests/test_thinkers_silence_alert.sh` (alert,
+one per episode, recovery, dead dispatcher and deliberate stop are silent,
+missing config degrades to the fallback log).
+
+Not done here, still open: a scratch home for the mind's experiments so a
+nested identity never lands in the production `.identities/` (the same
+class of incident as 2026-09-08, 09-09 and 09-12).
+
 ## Rollout & testing
 
 Order matters — B before A, so we can *see* the effect, and cheap/high-leverage

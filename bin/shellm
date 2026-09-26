@@ -145,6 +145,15 @@ SHELLM_REQUIRE_DOCKER="${SHELLM_REQUIRE_DOCKER:-0}"
 SHELLM_TEMP_DOCKER="${SHELLM_TEMP_DOCKER:-0}"
 SHELLM_INACTIVITY_TIMEOUT="${SHELLM_INACTIVITY_TIMEOUT:-30}"
 SHELLM_INACTIVITY_MAX="${SHELLM_INACTIVITY_MAX:-900}"
+# Kill a command whose output file grows past this many bytes, even while it is
+# actively producing output (a runaway loop resets the inactivity counter every
+# check, so silence-based watchdogs never catch it). 0 disables the guard.
+SHELLM_MAX_OUTPUT_SIZE="${SHELLM_MAX_OUTPUT_SIZE:-104857600}"
+# Kill a block that has run this many seconds, however it behaves. A command
+# that prints a heartbeat while it waits on something that never finishes
+# passes every other guard (Audel 2026-09-25: a scan blocked 3.5 h reading a
+# fifo behind an `echo; sleep 5` loop). 0 disables the guard.
+SHELLM_MAX_EXEC_TIME="${SHELLM_MAX_EXEC_TIME:-3600}"
 SHELLM_BEACON_INTERVAL="${SHELLM_BEACON_INTERVAL:-5}"
 VERBOSE=0
 QUIET=0
@@ -349,6 +358,10 @@ Environment:
   SHELLM_INACTIVITY_TIMEOUT  Seconds before killing idle execution (default: 30)
   SHELLM_INACTIVITY_MAX   Seconds before killing execution that is silent but
                           has a live nested shellm run (default: 900)
+  SHELLM_MAX_OUTPUT_SIZE  Bytes of output before killing a command that keeps
+                          producing output (default: 104857600; 0 disables)
+  SHELLM_MAX_EXEC_TIME    Seconds before killing a block no matter what it is
+                          doing (default: 3600; 0 disables)
   SHELLM_BEACON_INTERVAL  Seconds between activity beacon touches (default: 5)
   SHELLM_WORKDIR          (Internal) Working directory for current run
 
@@ -527,6 +540,28 @@ build_inactivity_feedback() {
 
     local last_output
     last_output=$(truncate_output "$output")
+
+    # A runaway command that kept producing output was not idle and not at a
+    # prompt, so none of the interactive/nested advice below applies.
+    if [[ "$reason" == "wall" ]]; then
+        printf 'Execution was KILLED after running for %s seconds, the limit for one block\n' "$timeout"
+        printf '(it was still producing output, so something in it was waiting forever or\n'
+        printf 'the work is too big for one block).\n'
+        printf '\nLast output before the kill:\n%s\n' "$last_output"
+        printf '\nCheck what the block was waiting on (a pipe, a fifo, a lock, the network)\n'
+        printf 'and bound it with timeout. Split long work across steps: start it in the\n'
+        printf 'background with output in a file, then check the file in a later step.\n'
+        return 0
+    fi
+
+    if [[ "$reason" == "output" ]]; then
+        printf 'Execution was KILLED after its output grew past %s bytes\n' "$timeout"
+        printf '(a command producing unbounded output, e.g. an infinite loop).\n'
+        printf '\nLast output before the kill:\n%s\n' "$last_output"
+        printf '\nBound the output: add a limit (head -c, timeout, a loop guard),\n'
+        printf 'fix the loop condition, or redirect bulk output to a file.\n'
+        return 0
+    fi
 
     # A block that ran a nested shellm run was not sitting at a prompt, so the
     # interactive-input advice below would send the model looking for a flag
@@ -1484,14 +1519,59 @@ make_env_name() {
 # Code execution
 # ---------------------------------------------------------------------------
 
+# Stop parents before discovering children, so a producer cannot keep forking
+# while we kill its tree. Linux exposes children in /proc (no procps dependency
+# in a minimal container); macOS has ps. Walk all Linux threads, since a worker
+# thread can create children too. This also reaches nested shellm process groups.
+_kill_exec_tree() {
+    local pid="$1" children="" child task
+    kill -STOP "$pid" 2>/dev/null || return 0
+    if [[ -d "/proc/$pid/task" ]]; then
+        for task in /proc/"$pid"/task/*/children; do
+            children=""
+            read -r children < "$task" 2>/dev/null || true
+            for child in $children; do _kill_exec_tree "$child"; done
+        done
+    else
+        children=$(ps -axo pid=,ppid= | awk -v parent="$pid" '$2 == parent {print $1}')
+        for child in $children; do _kill_exec_tree "$child"; done
+    fi
+    kill -KILL "$pid" 2>/dev/null || true
+}
+
+# Only this supervisor gets TERM. Keep it alive until the producer's tree has
+# been killed and the direct child reaped. A Docker supervisor publishes its PID
+# so the host can cancel inside the container, not just disconnect its client.
+_supervise_exec() {
+    local code="$1" control_dir="${2:-}" child="" rc=0
+    _terminate_exec() {
+        trap '' TERM INT HUP
+        if [[ -n "$child" ]]; then
+            _kill_exec_tree "$child"
+            wait "$child" 2>/dev/null || true
+        fi
+        exit 143
+    }
+    trap _terminate_exec TERM INT HUP
+    if [[ -n "$control_dir" ]]; then
+        mkdir -m 700 "$control_dir" || return 1
+        printf '%s\n' "$$" > "$control_dir/pid"
+    fi
+    bash -e -c "$code" </dev/null &
+    child=$!
+    wait "$child" || rc=$?
+    trap - TERM INT HUP
+    return "$rc"
+}
+
 # execute_code WORKSPACE CODE [NAME=VALUE ...]
 #
 # env_vars carries API keys (the nested-run key, `--var` forwards from the
 # thinkers). Command lines are world-readable (`ps`, /proc/*/cmdline), so the
 # values must never ride on one — not as `env NAME=VALUE ...` and not as
-# `docker exec -e NAME=VALUE`. Both branches export the variables in a
-# subshell and exec from there; docker gets bare `-e NAME` flags, which the
-# docker CLI fills in from its own environment.
+# `docker exec -e NAME=VALUE`. Both branches export the variables in the
+# execution subprocess; docker gets bare `-e NAME` flags, which the docker
+# CLI fills in from its own environment. Call this function in the background.
 execute_code() {
     local workspace="$1" wrapped_code="$2"
     shift 2
@@ -1509,14 +1589,44 @@ execute_code() {
         done
         docker_env_flags+=(-e "PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin")
         docker_env_flags+=(-e "HOME=$workspace")
-        (
-            if [[ ${#exports[@]} -gt 0 ]]; then export "${exports[@]}"; fi
-            exec docker exec \
-                "${docker_env_flags[@]}" \
-                -w "$workspace" \
-                "$_SHELLM_CONTAINER" \
-                bash -e -c "$wrapped_code"
-        ) </dev/null 2>&1
+        local control_dir client="" rc=0
+        control_dir=$(mktemp -d "${TMPDIR:-/tmp}/shellm-exec.XXXXXX") || return 1
+        rmdir "$control_dir"
+        control_dir="/tmp/${control_dir##*/}"
+        _terminate_docker_exec() {
+            trap '' TERM INT HUP
+            # The remote wrapper writes its PID before starting generated code.
+            # Allow startup to finish if the watchdog fires during docker exec.
+            # Commands in the sandbox may use sudo. Cancel as container root
+            # so those descendants cannot outlive an unprivileged supervisor.
+            docker exec --user 0:0 "$_SHELLM_CONTAINER" bash -c "$(declare -f _kill_exec_tree)"'
+                for ((i=0; i<100; i++)); do
+                    if [[ -s "$1/pid" ]]; then
+                        read -r pid < "$1/pid"
+                        [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 ]] || exit 1
+                        _kill_exec_tree "$pid"
+                        exit 0
+                    fi
+                    sleep 0.1
+                done
+                exit 1
+            ' _ "$control_dir" || printf 'shellm: could not signal Docker execution\n' >&2
+            # Do not kill the client: its exit confirms the remote supervisor
+            # finished stopping the command. Keep the capture open until then.
+            wait "$client" 2>/dev/null || true
+            docker exec "$_SHELLM_CONTAINER" rm -rf "$control_dir" >/dev/null 2>&1 || true
+            exit 143
+        }
+        trap _terminate_docker_exec TERM INT HUP
+        if [[ ${#exports[@]} -gt 0 ]]; then export "${exports[@]}"; fi
+        docker exec "${docker_env_flags[@]}" -w "$workspace" \
+            "$_SHELLM_CONTAINER" bash -c "$(declare -f _kill_exec_tree _supervise_exec)
+_supervise_exec \"\$@\"" _ "$wrapped_code" "$control_dir" </dev/null 2>&1 &
+        client=$!
+        wait "$client" || rc=$?
+        trap - TERM INT HUP
+        docker exec "$_SHELLM_CONTAINER" rm -rf "$control_dir" >/dev/null 2>&1 || true
+        return "$rc"
     else
         local _extra_path=""
         for _bin_path in "${_SHELLM_EXTRA_BINS[@]+"${_SHELLM_EXTRA_BINS[@]}"}"; do
@@ -1535,11 +1645,9 @@ execute_code() {
             fi
         done
         [[ -n "$_extra_path" && "$_found_path" -eq 0 ]] && _patched_vars+=("PATH=$_extra_path:$PATH")
-        (
-            cd "$workspace" || exit 1
-            if [[ ${#_patched_vars[@]} -gt 0 ]]; then export "${_patched_vars[@]}"; fi
-            exec bash -e -c "$wrapped_code"
-        ) </dev/null 2>&1
+        cd "$workspace" || return 1
+        if [[ ${#_patched_vars[@]} -gt 0 ]]; then export "${_patched_vars[@]}"; fi
+        _supervise_exec "$wrapped_code"
     fi
 }
 
@@ -1613,8 +1721,165 @@ call_llm() {
 # Code extraction from LLM response
 # ---------------------------------------------------------------------------
 
+# script_parses SCRIPT — true when SCRIPT is complete, valid bash. Never runs
+# model code or startup files. Bash 3.2 silently accepts an unclosed heredoc
+# under -n, so an unmatched ) is appended too: if that also parses, the
+# trailer was swallowed as heredoc data and the script is incomplete.
+script_parses() {
+    local diagnostics
+    diagnostics=$(printf '%s\n' "$1" | BASH_ENV='' ENV='' bash --noprofile --norc -n 2>&1) &&
+        [[ -z "$diagnostics" ]] &&
+        ! { printf '%s\n)\n' "$1" | BASH_ENV='' ENV='' bash --noprofile --norc -n 2>/dev/null; }
+}
+
+# strip_markup_suffix — drop tool-call closing markup from the END of a script
+# on stdin: closing-tag lines, one-line extra parameters
+# (<parameter=timeout>30</parameter>), then the closing tags that end the last
+# code line. Only the suffix: a closing tag inside a heredoc or quoted string
+# earlier in the script is literal data.
+strip_markup_suffix() {
+    awk '
+        function blank(s) { return s ~ /^[[:space:]]*$/ }
+        { lines[++n] = $0 }
+        END {
+            close_run = "(<\\/(tool_call|function|parameter|bash|invoke|function_calls)>[[:space:]]*)+$"
+            while (n > 0 && (blank(lines[n]) || lines[n] ~ ("^[[:space:]]*" close_run) ||
+                            lines[n] ~ /^[[:space:]]*<parameter=[A-Za-z_]+>[^<]*<\/parameter>[[:space:]]*$/)) n--
+            if (n > 0 && sub(close_run, "", lines[n]))
+                while (n > 0 && blank(lines[n])) n--
+            for (i = 1; i <= n; i++) print lines[i]
+        }'
+}
+
+# normalize_toolcall_markup RESPONSE — Qwen-family models sometimes answer in
+# their native tool-call markup instead of a fence:
+#   <tool_call>            <tool_call>              <tool_call>
+#   <function=bash>        <function=bash>          set -e
+#   set -e … code …        <parameter=command>      … code …
+#   </function>            … code …                 </tool_call>
+#   </tool_call>           </parameter> …
+# (also the hybrid "<function=bash> … </bash>"). Run as-is, the first line is a
+# bash syntax error and the whole turn is wasted (4 of 46 responses on Custos,
+# 2026-09-09). MiMo writes the same markup inline: the opening tags lead the
+# first code line and the closing tags end the last one, with the command
+# parameter named command, cmd or code, sometimes followed by a one-line
+# <parameter=timeout>…</parameter> (1,642 of 3,272 Audel replies, 09-22 to
+# 09-25, none lifted before). When a response has NO fence but does have this
+# markup, lift the code inside the outer tags into a ```bash fence so it
+# executes, and tell the model on stderr what happened so it learns the
+# fence. Real fences win. Ambiguous wrappers are left alone rather than
+# risking script data becoming commands. Returns 0 when lifted, 2 when lifted
+# but later calls were dropped, 1 when the response is returned unchanged.
+normalize_toolcall_markup() {
+    local response="$1" markup="$1"
+    case "$response" in
+        *"<tool_call>"*|*"<function="*|*"<bash>"*) ;;
+        *) printf '%s' "$response"; return 1 ;;
+    esac
+    # MiMo sometimes glues a stray fence to the markup ("```<tool_call>…",
+    # closed by a lone ``` line). That is markup, not a fence: drop the two
+    # fence marks, but only when no real fence comes before it.
+    case "$markup" in
+        *'```<tool_call>'*|*'```<function=bash>'*)
+            markup=$(printf '%s\n' "$markup" | awk '
+                !seen && /^```<(tool_call|function=bash)>/ { sub(/^```/, ""); glued = 1 }
+                /^```/ { seen = 1 }
+                { lines[++n] = $0 }
+                END {
+                    while (n > 0 && lines[n] ~ /^[[:space:]]*$/) n--
+                    if (glued && n > 0 && lines[n] ~ /^```[[:space:]]*$/) n--
+                    for (i = 1; i <= n; i++) print lines[i]
+                }') ;;
+    esac
+    # Consume the whole response: grep -q can give printf SIGPIPE, making a
+    # matching fence look absent under pipefail on larger responses.
+    if printf '%s\n' "$markup" | grep -E '^```|```(bash|shell|sh)[[:space:]]*$' >/dev/null; then
+        printf '%s' "$response"; return 1
+    fi
+    local body lifted first
+    body=$(printf '%s\n' "$markup" | awk -v sq="'" '
+        # Drop the run of opening tags that leads a line; what is left is code.
+        function strip_open(s) {
+            while (match(s, /^[[:space:]]*<(tool_call|function=bash|bash|parameter=(command|cmd|code|commands|script|block))>/))
+                s = substr(s, RSTART + RLENGTH)
+            return s
+        }
+        function blank(s) { return s ~ /^[[:space:]]*$/ }
+        # Shell syntax that means a line is code, not prose.
+        function shellish(s) { return s ~ /[<>|$;&=]/ || index(s, "\\") }
+        BEGIN { started = 0; body = 0; ambiguous = 0; n = 0 }
+        # MiMo also appends the markup to a prose sentence on the same line
+        # ("…look at the evidence first.<tool_call><function=bash>…"). Accept
+        # that only when the prefix ends a sentence and has no shell syntax,
+        # so a quoted or redirected literal tag is never taken for markup.
+        !started && match($0, /<(tool_call|function=bash)>/) && RSTART > 1 {
+            pre = substr($0, 1, RSTART - 1)
+            if (pre ~ /[.:!?][[:space:]]*$/ && !shellish(pre)) $0 = substr($0, RSTART)
+        }
+        !started {
+            if ($0 ~ /^[[:space:]]*<(tool_call|function=bash|bash)>/) {
+                started = 1
+                rest = strip_open($0)
+                if (!blank(rest)) { body = 1; lines[++n] = rest }
+            } else if ((index($0, sq) || $0 ~ /["`\\<>]/) &&
+                       !($0 ~ /[.:!?)][[:space:]]*$/ && !shellish($0))) {
+                # Permit simple prose before the wrapper, but never scan past
+                # a quote, continuation, or redirection into possible data.
+                # A finished sentence with no shell syntax is prose even when
+                # it has an apostrophe or a `backticked` word.
+                ambiguous = 1
+            }
+            next
+        }
+        !body {
+            rest = strip_open($0)
+            if (blank(rest)) next
+            body = 1
+            lines[++n] = rest
+            next
+        }
+        { lines[++n] = $0 }
+        END {
+            if (ambiguous || !started) exit
+            for (i = 1; i <= n; i++) print lines[i]
+        }')
+    # Several calls in one reply: run only the first, as with fenced blocks,
+    # and return 2 so extract_code tells the model the rest was dropped. The
+    # first call ends at the first line closing a call, and only counts when
+    # another call opens after it and the first parses on its own; a cut
+    # inside a heredoc or quoted string never parses.
+    # MiMo usually opens the next call on the same line the last one closes.
+    first=$(printf '%s\n' "$body" | awk '
+        !cut && match($0, /<\/(function|tool_call)>[[:space:]]*<(tool_call|function=bash)>/) {
+            l[++n] = substr($0, 1, RSTART - 1); cut = n; more = 1; next
+        }
+        { l[++n] = $0 }
+        !cut && /<\/(function|tool_call)>[[:space:]]*$/ { cut = n; next }
+        cut && /^[[:space:]]*<(tool_call|function=bash)>/ { more = 1 }
+        END { if (cut && more) for (i = 1; i <= cut; i++) print l[i] }' | strip_markup_suffix)
+    if [[ "$first" =~ [^[:space:]] ]] && script_parses "$first"; then
+        printf '%s' $'```bash\n'"$first"$'\n```'
+        return 2
+    fi
+    lifted=$(printf '%s\n' "$body" | strip_markup_suffix)
+    if [[ "$lifted" =~ [^[:space:]] ]] && script_parses "$lifted"; then
+        printf '%s' $'```bash\n'"$lifted"$'\n```'
+        return 0
+    fi
+    printf '%s' "$response"
+    return 1
+}
+
 extract_code() {
     local response="$1"
+    local toolcall_lifted=0
+    local _normalized _rc calls_dropped=0
+    _rc=0; _normalized=$(normalize_toolcall_markup "$response") || _rc=$?
+    if [[ "$_rc" -ne 1 ]]; then
+        response="$_normalized"
+        toolcall_lifted=1
+        [[ "$_rc" -eq 2 ]] && calls_dropped=1
+    fi
 
     # Extract the FIRST fenced code block (```bash, ```sh, or bare ```).
     # Heredoc-aware: lines like ``` inside an open heredoc do NOT close the
@@ -1717,6 +1982,20 @@ extract_code() {
     truncation_signal=$(cat "$truncation_file" 2>/dev/null || true)
     rm -f "$truncation_file"
 
+    # MiMo often opens a real ```bash fence and still ends the code with its
+    # tool-call closing tags ("done</parameter></function></tool_call>"), a
+    # syntax error that killed 263 fenced replies on Audel (09-22 to 09-25).
+    # Strip that suffix only when it turns a broken script into a valid one.
+    if [[ "$toolcall_lifted" -eq 0 && "$code" == *"</"* ]]; then
+        local _trimmed
+        _trimmed=$(printf '%s\n' "$code" | strip_markup_suffix)
+        if [[ "$_trimmed" != "$code" && "$_trimmed" =~ [^[:space:]] ]] &&
+            ! script_parses "$code" && script_parses "$_trimmed"; then
+            code="$_trimmed"
+            toolcall_lifted=1
+        fi
+    fi
+
     # If no fenced blocks at all, use the whole response as code.
     # Strip [cmd]/[thought] markers that the model may emit instead of fences.
     local no_fence=0
@@ -1734,8 +2013,16 @@ extract_code() {
     # Prepend notices to stderr. Stderr is captured and shown back to the model
     # on its next turn, so these teach it what shellm did with its last reply.
     # Prepend rather than append so a notice fires even if the code exits early.
-    if [[ "$truncation_signal" == *TRUNCATED* ]]; then
+    if [[ "$truncation_signal" == *TRUNCATED* || "$calls_dropped" -eq 1 ]]; then
         code=$'echo "[rest of model response truncated after first code block]" >&2\n'"$code"
+    fi
+    if [[ "$toolcall_lifted" -eq 1 ]]; then
+        local toolcall_notice
+        toolcall_notice=$(cat <<'NOTICE'
+printf '%s\n' '[shellm: your reply used <tool_call>/<function=bash> markup. This runtime only reads ```bash fences; it lifted your code into one and ran it this time. Next time put the script inside a ```bash block, nothing else: start the reply with a line that is exactly ```bash and end the block with a line that is exactly ```.]' >&2
+NOTICE
+)
+        code="$toolcall_notice"$'\n'"$code"
     fi
     if [[ "$no_fence" -eq 1 ]]; then
         local nofence_notice
@@ -1765,6 +2052,7 @@ build_system_prompt() {
 You are running in shellm, headlong's bash agent loop: you solve tasks by generating and executing bash code.
 
 IMPORTANT: End your response with exactly ONE ```bash code block. Your response is NOT streamed — code blocks are not executed until your entire response is complete. Combine multiple steps into a single script. Only the first code block is executed; all others are silently discarded.
+Never use <tool_call>, <function=bash>, <parameter=...> or <bash> tags: this runtime is not a tool-calling API and only reads ```bash fences.
 
 CRITICAL — the opening ```bash fence MUST start on its OWN new line. Put a
 newline after your prose, THEN the fence on a line by itself. Never append the
@@ -1805,7 +2093,7 @@ cat /tmp/approach_a.txt /tmp/approach_b.txt
 
 Always redirect a sub-run's stdout and stderr to a file, as above. A backgrounded sub-run that writes to the pipes it inherited loses its output once the step that started it ends.
 
-A sub-run is silent while its own model call is thinking, and the inactivity watchdog knows about that: while a sub-run is alive the block is treated as working, so waiting on sub-runs does not get you killed at SHELLM_INACTIVITY_TIMEOUT. The limit that still applies is SHELLM_INACTIVITY_MAX (default 900s) of no output at all from the block, so size sub-work to finish inside it. For longer work, give each sub-run a smaller task, cap it with `--max-iterations`, or start it in one step and read its output file in a later step rather than waiting here.
+A sub-run is silent while its own model call is thinking, and the inactivity watchdog knows about that: while a sub-run is alive the block is treated as working, so waiting on sub-runs does not get you killed at SHELLM_INACTIVITY_TIMEOUT. The limit that still applies is SHELLM_INACTIVITY_MAX (default 900s) of no output at all from the block, so size sub-work to finish inside it. No block may run longer than SHELLM_MAX_EXEC_TIME (default 3600s) even while it prints. For longer work, give each sub-run a smaller task, cap it with `--max-iterations`, or start it in one step and read its output file in a later step rather than waiting here.
 
 Pass context to sub-runs with `-f FILE` or via stdin. Always give sub-runs a clear, self-contained task description — they have no memory of your conversation.
 
@@ -2216,6 +2504,14 @@ run_loop() {
 
     # Create a temp dir for transient state (exec pids, output, watchdog, etc.)
     rundir=$(mktemp -d "${TMPDIR:-/tmp}/shellm-run.XXXXXX")
+    # Every temp file this run and its commands make (mktemp, sort, python)
+    # lands under the run dir and dies with it in cleanup. A command killed
+    # by the watchdog never cleans up its own, and wakes share the real /tmp
+    # (2026-09-17: 24 GB of mktemp trajectory copies filled a box). Nested
+    # runs nest their run dir here too; they die with the exec tree anyway.
+    if [[ -n "$rundir" && -d "$rundir" ]] && mkdir -p "$rundir/tmp"; then
+        export TMPDIR="$rundir/tmp"
+    fi
 
     # Track root rundir for the run tree
     if [[ -n "${_SHELLM_PARENT_TRAJ_ID:-}" ]]; then
@@ -2459,7 +2755,7 @@ run_loop() {
                 pid=$(cat "$pid_file" 2>/dev/null || true)
                 if [[ -n "$pid" ]]; then
                     kill "$pid" 2>/dev/null || true
-                    kill -9 "$pid" 2>/dev/null || true
+                    wait "$pid" 2>/dev/null || true
                 fi
                 rm -f "$pid_file"
             fi
@@ -2742,9 +3038,17 @@ exit \$__shellm_rc
         local _exec_t0
         _exec_t0=$(date +%s)
         set +eo pipefail
-        set +m  # suppress "Terminated" job-control messages
+        # The execution tree gets its own process group (set -m for the one
+        # launch). _kill_exec_tree stops processes before it kills them, and a
+        # group that is orphaned while it holds stopped members gets SIGHUP
+        # from the kernel: on macOS that hang-up reached this shell and killed
+        # the whole run (rc=129, CI 2026-09-17). In its own group the hang-up
+        # can only land on the tree being killed. Monitor mode goes straight
+        # back off, which also keeps "Terminated" job messages quiet.
+        set -m
         execute_code "$workdir" "$wrapped_code" "${env_vars[@]}" >> "$output_file" 2>&1 &
         local exec_pid=$!
+        set +m
         printf '%s' "$exec_pid" > "$exec_pid_file"
         set -eo pipefail
 
@@ -2756,6 +3060,7 @@ exit \$__shellm_rc
             local last_beacon=""
             local kill_reason=""
             local kill_limit=""
+            local started=$SECONDS
             while kill -0 "$exec_pid" 2>/dev/null; do
                 sleep 1
                 local cur_size
@@ -2778,7 +3083,16 @@ exit \$__shellm_rc
                     last_beacon="$cur_beacon"
                     stale_seconds=0
                 fi
-                if [[ "$stale_seconds" -ge "$SHELLM_INACTIVITY_TIMEOUT" ]]; then
+                # A command that never stops producing output (e.g. a runaway
+                # loop printing the same line) resets stale_seconds every check,
+                # so the silence guards above never fire. Cap total output size.
+                if [[ "$SHELLM_MAX_OUTPUT_SIZE" -gt 0 && "$cur_size" -ge "$SHELLM_MAX_OUTPUT_SIZE" ]]; then
+                    kill_reason="output"
+                    kill_limit="$SHELLM_MAX_OUTPUT_SIZE"
+                elif [[ "$SHELLM_MAX_EXEC_TIME" -gt 0 && $((SECONDS - started)) -ge "$SHELLM_MAX_EXEC_TIME" ]]; then
+                    kill_reason="wall"
+                    kill_limit="$SHELLM_MAX_EXEC_TIME"
+                elif [[ "$stale_seconds" -ge "$SHELLM_INACTIVITY_TIMEOUT" ]]; then
                     kill_reason="idle"
                     kill_limit="$SHELLM_INACTIVITY_TIMEOUT"
                 elif [[ "$quiet_seconds" -ge "$SHELLM_INACTIVITY_MAX" ]]; then
@@ -2790,12 +3104,13 @@ exit \$__shellm_rc
                     # Name the target: a silent watchdog kill is
                     # indistinguishable from an external one in a
                     # post-mortem (2026-08-12 dispatcher death).
-                    printf '%s [shellm-watchdog] %s timeout (%ss): killing exec pid %s\n' \
-                        "$(date -u +%FT%TZ)" "$kill_reason" "$kill_limit" "$exec_pid" >&2
+                    local unit=s
+                    [[ "$kill_reason" == output ]] && unit=bytes
+                    printf '%s [shellm-watchdog] %s timeout (%s %s): killing exec pid %s\n' \
+                        "$(date -u +%FT%TZ)" "$kill_reason" "$kill_limit" "$unit" "$exec_pid" >&2
                     kill "$exec_pid" 2>/dev/null || true
-                    # Give it a moment, then force-kill if needed
-                    sleep 2
-                    kill -9 "$exec_pid" 2>/dev/null || true
+                    # execute_code handles escalation and reaping. Killing
+                    # that supervisor here would orphan the output producer.
                     break
                 fi
             done
@@ -2846,7 +3161,9 @@ exit \$__shellm_rc
 
         # Show exit status
         if [[ "$timed_out" -eq 1 ]]; then
-            if [[ "$kill_reason" == "nested" ]]; then
+            if [[ "$kill_reason" == "output" ]]; then
+                progress "\033[1;31mKILLED — output exceeded ${kill_limit} bytes\033[0m"
+            elif [[ "$kill_reason" == "nested" ]]; then
                 progress "\033[1;31mKILLED — sub-run silent for ${kill_limit}s\033[0m"
             else
                 progress "\033[1;31mKILLED — inactivity timeout (${kill_limit}s)\033[0m"

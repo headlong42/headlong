@@ -40,9 +40,11 @@ def main() -> None:
     app = App(token=cfg.bot_token)
     auth = app.client.auth_test()
     bot_user_id = auth["user_id"]
+    peers = ",".join(sorted(cfg.peer_bot_users)) or "none"
     print(
         f"headlong-slack-bridge: identity={cfg.identity} bot={auth['user']} "
-        f"({bot_user_id}) web={cfg.web_url}",
+        f"({bot_user_id}) web={cfg.web_url} peers={peers} "
+        f"(max {cfg.peer_max_turns} in a row, {cfg.peer_hourly_cap}/h)",
         file=sys.stderr,
     )
 

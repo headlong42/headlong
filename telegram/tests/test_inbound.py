@@ -206,3 +206,39 @@ def test_poll_loop_survives_a_malformed_api_response(tmp_path, monkeypatch):
 
     ib.run(should_stop)  # must return, not raise
     assert slept == [5]
+
+
+def test_refused_delivery_is_not_retried_and_posts_no_error(bridge, monkeypatch):
+    """A 409 is the mind's `chat send` refusing on purpose (a repeat, a bad
+    target): retrying cannot help and 'couldn't reach my mind' is untrue."""
+    ib, bot, posts = bridge
+    ib.allowlist.approve(7)
+    calls = []
+
+    def refused(url, json=None, timeout=None):
+        calls.append(json)
+        return httpx.Response(
+            409, request=httpx.Request("POST", url), json={"detail": {"message": "refusing"}}
+        )
+
+    monkeypatch.setattr(inbound_mod.httpx, "post", refused)
+    monkeypatch.setattr(inbound_mod.time, "sleep", lambda _s: None)
+    ib._handle(dm(7, "great"))
+    assert len(calls) == 1
+    assert bot.sent == []
+
+
+def test_other_failures_still_retry_and_post_the_error(bridge, monkeypatch):
+    ib, bot, posts = bridge
+    ib.allowlist.approve(7)
+    calls = []
+
+    def down(url, json=None, timeout=None):
+        calls.append(json)
+        return httpx.Response(503, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(inbound_mod.httpx, "post", down)
+    monkeypatch.setattr(inbound_mod.time, "sleep", lambda _s: None)
+    ib._handle(dm(7, "great"))
+    assert len(calls) == inbound_mod.DELIVERY_ATTEMPTS
+    assert bot.sent == [(7, inbound_mod.DELIVERY_ERROR_TEXT)]

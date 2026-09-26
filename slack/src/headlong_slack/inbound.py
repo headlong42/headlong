@@ -21,7 +21,7 @@ from slack_bolt import App
 from . import naming
 from .config import Config
 from .slackfmt import clean_inbound
-from .state import ActiveThreads, Deduper
+from .state import ActiveThreads, Deduper, PeerGuard
 
 log = logging.getLogger(__name__)
 
@@ -29,6 +29,17 @@ DELIVERY_ATTEMPTS = 3
 DELIVERY_ERROR_TEXT = (
     "(bridge error: I couldn't reach my mind just now — please try again in a bit)"
 )
+
+
+def _refusal_reason(response: httpx.Response) -> str:
+    """The one-line reason behind a 409 from the web API, for the log."""
+    try:
+        detail = response.json().get("detail")
+    except Exception:
+        return response.text[:200]
+    if isinstance(detail, dict):
+        return str(detail.get("message") or detail)[:200]
+    return str(detail)[:200]
 # Bound reaction parent-lookups so a hung reactions.get cannot stall
 # the single inbound drain thread. Fail open rather than wait.
 ITEM_LOOKUP_TIMEOUT = 2
@@ -70,6 +81,8 @@ class InboundMessage:
     # First @mention in a thread: drain worker prepends capped prior lines.
     # Bolt must not wait on conversations.replies.
     backfill: bool = False
+    # Posted by another Headlong persona's bot (config.peer_bot_users).
+    is_peer: bool = False
 
 
 class SlackNames:
@@ -155,6 +168,7 @@ class Inbound:
         self.threads = threads
         self.names = SlackNames(app.client)
         self.dedupe = Deduper()
+        self.peers = PeerGuard(cfg.peer_max_turns, cfg.peer_hourly_cap)
         self.queue: queue.Queue[InboundMessage | None] = queue.Queue()
         self._chat_url = (
             f"{cfg.web_url}/api/identities/{cfg.identity_api_id}/chat"
@@ -268,9 +282,14 @@ class Inbound:
         return found or None
 
     def _on_event(self, event: dict[str, Any], logger: logging.Logger) -> None:
-        if event.get("bot_id") or event.get("subtype"):
-            return
         user = event.get("user")
+        # Bot posts are dropped, except from a listed peer persona. Peers
+        # then pass the same mention / active-thread gate as people, plus
+        # the loop guard below. Legacy bot_message posts carry no user id
+        # and never qualify.
+        is_peer = bool(event.get("bot_id")) and bool(user) and user in self.cfg.peer_bot_users
+        if (event.get("bot_id") and not is_peer) or event.get("subtype"):
+            return
         text = event.get("text") or ""
         if not user or user == self.bot_user_id:
             return
@@ -287,6 +306,10 @@ class Inbound:
             from_name = naming.encode(user, channel)
             thread_ts = None
         else:
+            if not is_peer:
+                # Any person speaking in a thread lets the peers take turns
+                # again, whether or not this message is for us.
+                self.peers.human_spoke(channel, event.get("thread_ts") or ts)
             mentioned = event.get("type") == "app_mention" or self.bot_mention in text
             if mentioned:
                 # Anchor the conversation at the existing thread, or start
@@ -298,6 +321,15 @@ class Inbound:
                 thread_ts = event["thread_ts"]
             else:
                 return
+            if is_peer:
+                ok, reason = self.peers.allow(channel, thread_ts)
+                if not ok:
+                    if reason:
+                        logger.warning(
+                            "peer %s in %s/%s not forwarded: %s",
+                            user, channel, thread_ts, reason,
+                        )
+                    return
             from_name = naming.encode(user, channel, thread_ts)
             # First @mention in an existing thread: fetch prior lines on
             # the drain worker. Already-active threads have been fed
@@ -312,7 +344,8 @@ class Inbound:
 
         self.queue.put(
             InboundMessage(
-                from_name, user, channel, thread_ts, ts, text, backfill=first_join
+                from_name, user, channel, thread_ts, ts, text,
+                backfill=first_join, is_peer=is_peer,
             )
         )
 
@@ -458,11 +491,22 @@ class Inbound:
         content = clean_inbound(msg.text, self.bot_user_id)
         if not content:
             return
+        # A peer's bridge error is the other bridge talking, not the other
+        # persona. Forwarding it made two minds answer an error string at each
+        # other every seven seconds on 2026-09-21.
+        if msg.is_peer and DELIVERY_ERROR_TEXT in content:
+            log.info("peer bridge error text from %s not forwarded", msg.from_name)
+            return
         # The reply-to name is spelled out because agent-typed replies (the
         # agentic path, unlike the mechanical fast-reply) must use the full
         # routing key, not the human display name.
+        # A peer is named as what it is: the mind should know it is talking
+        # to another persona, not a person, and that the exchange is bounded.
+        who = self.names.user(msg.user)
+        if msg.is_peer:
+            who = f"{who}, a Headlong persona like you, not a person"
         header = (
-            f"(Slack: {self.names.user(msg.user)} in {self.names.place(msg.channel)}"
+            f"(Slack: {who} in {self.names.place(msg.channel)}"
             f" — reply with: chat reply {msg.from_name})"
         )
         body = {"content": f"{header} {content}", "from_name": msg.from_name}
@@ -482,6 +526,25 @@ class Inbound:
                 response = httpx.post(self._chat_url, json=body, timeout=30)
                 response.raise_for_status()
                 return
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 409:
+                    # The mind's tool refused the message on purpose (a
+                    # duplicate or a bad target); it will refuse it again,
+                    # and "couldn't reach my mind" would be untrue.
+                    log.warning(
+                        "chat POST refused for %s: %s",
+                        msg.from_name,
+                        _refusal_reason(exc.response),
+                    )
+                    return
+                log.warning(
+                    "chat POST failed (attempt %d/%d)",
+                    attempt,
+                    DELIVERY_ATTEMPTS,
+                    exc_info=True,
+                )
+                if attempt < DELIVERY_ATTEMPTS:
+                    time.sleep(2 * attempt)
             except httpx.HTTPError:
                 log.warning(
                     "chat POST failed (attempt %d/%d)",

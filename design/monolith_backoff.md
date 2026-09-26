@@ -331,19 +331,40 @@ is `0`, so an active conversation is deliberately *not* throttled — that spend
 is the price of the responsiveness you asked for, and it ends as soon as the
 work runs dry.
 
-### Optional second lever: cheaper spontaneous wakes
+### Second lever: two model tiers (implemented 2026-09-23)
 
-Reactivity keeps the full model (chat must be sharp). Spontaneous wakes needn't,
-gated by `level`:
+The cadence backoff alone does not reach the cap on a mature identity: Audel
+writes a bookkeeping observation on most wakes, an observation is visible
+work, and visible work resets the ladder. Measured on Audel over 2026-09-18
+to 09-21: 660 to 890 idle wakes a day, one every 100 to 130 seconds against a
+300 second cap, and on a quiet day nearly every model call is one of them.
 
-- **Downgrade the model** for `monolith-wake` runs past some level
-  (`MONOLITH_SPONTANEOUS_MODEL`).
-- **Peek before you think**: at high `level`, run one cheap yes/no
-  ("anything genuinely worth doing right now?") and only escalate to a full
-  router run on "yes".
+So the model is split by what the wake is for, not by `level`:
 
-Keep these optional; the cadence backoff is the primary mechanism and suffices
-on its own.
+| variable | default | effect |
+|----------|---------|--------|
+| `SHELLM_MODEL` | provider default | the think tier: every spontaneous timer wake with nothing pending |
+| `MONOLITH_REQUEST_MODEL` | unset (= `SHELLM_MODEL`) | the request tier: a reactive wake (an observation, action or merge from outside the head, usually the responder reporting an inbound message) or ANY wake while a PENDING REQUEST is open |
+
+The step already classifies each wake as reactive or spontaneous and already
+renders open deferrals from `chat pending`, so the tier is decided from those
+two facts just before the shellm run. The run's wake reason gets a `/request`
+suffix on the request tier, so the run row in the mind log and the llm ledger
+(which records the model per call) show which tier answered. The step loads
+`.env` on every wake, so setting the variable on a box needs no dispatcher
+restart. Caching is per model on the provider side, so alternating models
+costs nothing extra.
+
+What it buys, from the same ledger days: on a quiet day the request tier sees
+a few dozen wakes and the expensive model's share of spend drops by 70 to 80
+percent; on a heavy chat day most calls are request-driven runs and the
+saving is nearer 30 percent. A frontier model at 10x the price becomes
+affordable as the request tier while the cheap model keeps the inner life
+going.
+
+Not yet done, still optional: **peek before you think** (at high `level`, one
+cheap yes/no before a full router run), and counting observation-only wakes as
+rest rather than engagement so the cadence cap is actually reached.
 
 ## Alternatives considered
 

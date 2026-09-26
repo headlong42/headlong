@@ -8,7 +8,8 @@
 # deploy/scripts/update afterwards to install/restart the bridge.
 #
 # The file also pins the identity the bridge serves
-# (HEADLONG_TELEGRAM_IDENTITY, default audel). Without the pin the bridge
+# (HEADLONG_TELEGRAM_IDENTITY, default: the stack's persona, audel for
+# terraform-slack, harris for terraform-harris). Without the pin the bridge
 # follows whatever `.identities/default` points at, and on 2026-09-08 a
 # nested test run of Audel's repointed that link to a scratch identity, so
 # the next bridge restart silently served the wrong mind and Nick's
@@ -24,7 +25,7 @@ export SHELLM_TF_STACK="${SHELLM_TF_STACK:-terraform-slack}"
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 yes=0
-identity=audel
+identity=$(stack_identity)
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -h|--help) sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;

@@ -44,6 +44,14 @@ printf 'test-token\n' > "$ID/run/dispatcher.token"
 mkdir -p "$WORK/stub"
 cat > "$WORK/stub/llm" <<'STUB'
 #!/usr/bin/env bash
+# Records every call's args; refuses the schema flag when STUB_SCHEMA_FAIL=1
+# (a provider without structured output); answers with STUB_REPLY_FILE.
+_model=""; _schema=0; _prev=""
+for _a in "$@"; do [[ "$_prev" == "-m" ]] && _model="$_a"; [[ "$_a" == "--json-schema" ]] && _schema=1; _prev="$_a"; done
+printf 'CALL model=%s schema=%s\n' "$_model" "$_schema" >> "${STUB_ARGS_FILE:-/dev/null}"
+if [[ "${STUB_SCHEMA_FAIL:-0}" == "1" && "$_schema" == "1" ]]; then
+    echo "stub: response_format not supported" >&2; exit 1
+fi
 cat "$STUB_REPLY_FILE"
 STUB
 cat > "$WORK/stub/shellm" <<'STUB'
@@ -53,12 +61,15 @@ for a in "$@"; do [[ "$prev" == "--prompt-file" ]] && cp "$a" "$STUB_CAPTURE"; p
 exit 0
 STUB
 chmod +x "$WORK/stub/llm" "$WORK/stub/shellm"
-export STUB_REPLY_FILE="$WORK/reply" STUB_CAPTURE="$WORK/prompt"
+export STUB_REPLY_FILE="$WORK/reply" STUB_CAPTURE="$WORK/prompt" STUB_ARGS_FILE="$WORK/llm-args"
 
 ENV_COMMON=(PATH="$WORK/stub:$REPO/bin:$REPO/tools:$PATH" IDENTITY_DIR="$ID" IDENTITY_NAME="$ME"
     MEM_DIR="$ID/memories" TRAJ_DIR="$ID/trajectories" TRAJ_ID="$TRAJ_ID" HOME="$WORK/home"
     SHELLM_MODEL=stub-model THINK_CONTEXT_TAIL=30 RESPONDER_PERSON_NOTES=0 MONOLITH_TIERED_MEMORY=0)
 run_responder() { printf '%s' "$1" | env "${ENV_COMMON[@]}" "$RESPONDER" >> "$WORK/step.log" 2>&1; }
+# Structured mode: a reply model whose provider enforces a JSON Schema.
+run_responder_s() { : > "$STUB_ARGS_FILE"; printf '%s' "$1" | env "${ENV_COMMON[@]}" MONOLITH_REPLY_MODEL=deepseek/stub-pro "${@:2}" "$RESPONDER" >> "$WORK/step.log" 2>&1; }
+last_llm_args() { grep "^CALL " "$STUB_ARGS_FILE" | tail -n 1; }
 run_monolith()  { printf '%s' "$1" | env "${ENV_COMMON[@]}" MONOLITH_SHARE_HINT_EVERY=0 "$MONOLITH" >> "$WORK/step.log" 2>&1; }
 now() { date -u +%Y-%m-%dT%H:%M:%S.000Z; }
 
@@ -231,6 +242,131 @@ sent=$(jq -r 'select(.type=="message" and .from=="testid" and .reply_to=="trig-4
 [[ "$sent" == "Let me look into that and get back to you." ]] && ok "a DEFER after a blank line sends the holding line, not the DEFER text" || bad "a DEFER after a blank line sends the holding line, not the DEFER text" "got '$sent'"
 act=$(jq -c 'select(.type=="action" and .source=="responder" and .trigger_step=="trig-4")' "$TRAJ" | tail -1)
 [[ -n "$act" && "$(printf '%s' "$act" | jq -r .request)" == "check the workspace for test goal conflicts" ]] && ok "a DEFER after a blank line still appends the action" || bad "a DEFER after a blank line still appends the action" "got '$act'"
+
+# --- 6. DEFER emitted twice, holding text glued onto the first copy
+#        (Nemotron, 2026-09-14: line 2 "DEFER: ..." was sent to Nick) --------
+printf '{"step_id":"trig-5","type":"message","from":"%s","to":"%s","content":"can you please open a PR on github?","ts":"%s","source":"chat"}\n' "$THEM" "$ME" "$(now)" >> "$TRAJ"
+printf 'DEFER: open a PR for commit 1adc15cLet me open that PR for you.\nDEFER: open a PR for commit 1adc15c\n' > "$STUB_REPLY_FILE"
+run_responder "$(grep -F '"step_id":"trig-5"' "$TRAJ")"
+sent=$(jq -r 'select(.type=="message" and .from=="testid" and .reply_to=="trig-5") | .content' "$TRAJ" | tail -1)
+[[ "$sent" == "Let me look into that and get back to you." ]] && ok "a duplicated DEFER never reaches the person" || bad "a duplicated DEFER never reaches the person" "got '$sent'"
+act=$(jq -c 'select(.type=="action" and .source=="responder" and .trigger_step=="trig-5")' "$TRAJ" | tail -1)
+[[ -n "$act" && "$(printf '%s' "$act" | jq -r .request)" == "open a PR for commit 1adc15c" ]] && ok "the clean copy of a glued DEFER becomes the request" || bad "the clean copy of a glued DEFER becomes the request" "got '$act'"
+
+# --- 7. holding text first, DEFER on a later line ---------------------------
+printf '{"step_id":"trig-6","type":"message","from":"%s","to":"%s","content":"what does the box say?","ts":"%s","source":"chat"}\n' "$THEM" "$ME" "$(now)" >> "$TRAJ"
+printf 'Let me check the box and get back to you.\nDEFER: read the box status and report it\n' > "$STUB_REPLY_FILE"
+run_responder "$(grep -F '"step_id":"trig-6"' "$TRAJ")"
+sent=$(jq -r 'select(.type=="message" and .from=="testid" and .reply_to=="trig-6") | .content' "$TRAJ" | tail -1)
+[[ "$sent" == "Let me check the box and get back to you." ]] && ok "a DEFER on a later line is stripped and the holding text is sent" || bad "a DEFER on a later line is stripped and the holding text is sent" "got '$sent'"
+act=$(jq -c 'select(.type=="action" and .source=="responder" and .trigger_step=="trig-6")' "$TRAJ" | tail -1)
+[[ -n "$act" && "$(printf '%s' "$act" | jq -r .request)" == "read the box status and report it" ]] && ok "a DEFER on a later line still appends the action" || bad "a DEFER on a later line still appends the action" "got '$act'"
+
+# --- 8. holding text glued in FRONT of the DEFER on one line, then repeated
+#        (Nemotron, 2026-09-15 23:58Z: the whole line went to Slack) --------
+printf '{"step_id":"trig-7","type":"message","from":"%s","to":"%s","content":"how do goals reach your wake prompt?","ts":"%s","source":"chat"}\n' "$THEM" "$ME" "$(now)" >> "$TRAJ"
+printf 'Let me look into the shellm architecture.DEFER: Investigate how goals are injected into the wake prompt\nLet me look into the shellm architecture.\n' > "$STUB_REPLY_FILE"
+run_responder "$(grep -F '"step_id":"trig-7"' "$TRAJ")"
+sent=$(jq -r 'select(.type=="message" and .from=="testid" and .reply_to=="trig-7") | .content' "$TRAJ" | tail -1)
+[[ "$sent" == "Let me look into the shellm architecture." ]] && ok "a DEFER glued after prose is split off and the holding text is sent once" || bad "a DEFER glued after prose is split off and the holding text is sent once" "got '$sent'"
+act=$(jq -c 'select(.type=="action" and .source=="responder" and .trigger_step=="trig-7")' "$TRAJ" | tail -1)
+[[ -n "$act" && "$(printf '%s' "$act" | jq -r .request)" == "Investigate how goals are injected into the wake prompt" ]] && ok "a DEFER glued after prose still becomes the request" || bad "a DEFER glued after prose still becomes the request" "got '$act'"
+
+# --- 9. talking ABOUT the protocol is not using it --------------------------
+printf '{"step_id":"trig-8","type":"message","from":"%s","to":"%s","content":"what was that plumbing you mentioned?","ts":"%s","source":"chat"}\n' "$THEM" "$ME" "$(now)" >> "$TRAJ"
+printf 'My outgoing chat showed the raw DEFER: handoff text. I am tracing it.\n' > "$STUB_REPLY_FILE"
+run_responder "$(grep -F '"step_id":"trig-8"' "$TRAJ")"
+sent=$(jq -r 'select(.type=="message" and .from=="testid" and .reply_to=="trig-8") | .content' "$TRAJ" | tail -1)
+[[ "$sent" == "My outgoing chat showed the raw DEFER: handoff text. I am tracing it." ]] && ok "a DEFER: after a space is prose and is sent as written" || bad "a DEFER: after a space is prose and is sent as written" "got '$sent'"
+act=$(jq -c 'select(.type=="action" and .source=="responder" and .trigger_step=="trig-8")' "$TRAJ" | tail -1)
+[[ -z "$act" ]] && ok "talking about DEFER appends no action" || bad "talking about DEFER appends no action" "got '$act'"
+
+# --- 10. tool-call markup is never sent (Nemotron, 2026-09-15 DM) -----------
+printf '{"step_id":"trig-9","type":"message","from":"%s","to":"%s","content":"which skills do you have?","ts":"%s","source":"chat"}\n' "$THEM" "$ME" "$(now)" >> "$TRAJ"
+printf '<function=skills>\n<parameter=command>\nshow\n</parameter>\n</function>\n' > "$STUB_REPLY_FILE"
+run_responder "$(grep -F '"step_id":"trig-9"' "$TRAJ")"
+sent=$(jq -r 'select(.type=="message" and .from=="testid" and .reply_to=="trig-9") | .content' "$TRAJ" | tail -1)
+[[ -z "$sent" ]] && ok "tool-call markup is not sent to the person" || bad "tool-call markup is not sent to the person" "got '$sent'"
+obs=$(jq -c 'select(.type=="observation" and .source=="responder" and .trigger_step=="trig-9")' "$TRAJ" | tail -1)
+[[ -n "$obs" && "$(printf '%s' "$obs" | jq -r .decision)" == "reply-failed" ]] && ok "tool-call markup leaves a reply-failed observation for the mind" || bad "tool-call markup leaves a reply-failed observation for the mind" "got '$obs'"
+
+# ===========================================================================
+# Structured deferral (2026-09-16): on a model whose provider enforces a JSON
+# Schema the reply is one object {action, message, request} and the decision
+# is a required field. Everything below the parse is the text protocol.
+# ===========================================================================
+
+# --- 11. a structured reply -------------------------------------------------
+printf '{"step_id":"trig-10","type":"message","from":"%s","to":"%s","content":"is the box up?","ts":"%s","source":"chat"}\n' "$THEM" "$ME" "$(now)" >> "$TRAJ"
+printf '{"action": "reply", "message": "Yes, all five units are active.", "request": ""}\n' > "$STUB_REPLY_FILE"
+run_responder_s "$(grep -F '"step_id":"trig-10"' "$TRAJ")"
+sent=$(jq -r 'select(.type=="message" and .from=="testid" and .reply_to=="trig-10") | .content' "$TRAJ" | tail -1)
+[[ "$sent" == "Yes, all five units are active." ]] && ok "structured: the message field is what gets sent" || bad "structured: the message field is what gets sent" "got '$sent'"
+[[ "$(last_llm_args)" == "CALL model=deepseek/stub-pro schema=1" ]] && ok "structured: llm is called with the reply schema" || bad "structured: llm is called with the reply schema" "got '$(last_llm_args)'"
+obs=$(jq -c 'select(.type=="observation" and .source=="responder" and .trigger_step=="trig-10")' "$TRAJ" | tail -1)
+[[ "$(printf '%s' "$obs" | jq -r .structured)" == "true" ]] && ok "structured: the observation records the shape" || bad "structured: the observation records the shape" "got '$obs'"
+
+# --- 12. a structured deferral -----------------------------------------------
+printf '{"step_id":"trig-11","type":"message","from":"%s","to":"%s","content":"what does the log say?","ts":"%s","source":"chat"}\n' "$THEM" "$ME" "$(now)" >> "$TRAJ"
+printf '{"action": "defer", "message": "Let me read the log and get back to you.", "request": "read the dispatcher log and report the last error"}\n' > "$STUB_REPLY_FILE"
+run_responder_s "$(grep -F '"step_id":"trig-11"' "$TRAJ")"
+sent=$(jq -r 'select(.type=="message" and .from=="testid" and .reply_to=="trig-11") | .content' "$TRAJ" | tail -1)
+[[ "$sent" == "Let me read the log and get back to you." ]] && ok "structured defer: the holding sentence is sent" || bad "structured defer: the holding sentence is sent" "got '$sent'"
+act=$(jq -c 'select(.type=="action" and .source=="responder" and .trigger_step=="trig-11")' "$TRAJ" | tail -1)
+[[ -n "$act" && "$(printf '%s' "$act" | jq -r .request)" == "read the dispatcher log and report the last error" ]] && ok "structured defer: the request field becomes the action" || bad "structured defer: the request field becomes the action" "got '$act'"
+
+# --- 13. a structured no_reply ----------------------------------------------
+printf '{"step_id":"trig-12","type":"message","from":"%s","to":"%s","content":"thanks!","ts":"%s","source":"chat"}\n' "$THEM" "$ME" "$(now)" >> "$TRAJ"
+printf '{"action": "no_reply", "message": "", "request": ""}\n' > "$STUB_REPLY_FILE"
+run_responder_s "$(grep -F '"step_id":"trig-12"' "$TRAJ")"
+sent=$(jq -r 'select(.type=="message" and .from=="testid" and .reply_to=="trig-12") | .content' "$TRAJ" | tail -1)
+obs=$(jq -c 'select(.type=="observation" and .source=="responder" and .trigger_step=="trig-12")' "$TRAJ" | tail -1)
+[[ -z "$sent" && "$(printf '%s' "$obs" | jq -r .decision)" == "no-reply" ]] && ok "structured no_reply: nothing is sent, decision recorded" || bad "structured no_reply: nothing is sent, decision recorded" "sent='$sent' obs='$obs'"
+
+# --- 14. a fenced object still parses ---------------------------------------
+printf '{"step_id":"trig-13","type":"message","from":"%s","to":"%s","content":"ping","ts":"%s","source":"chat"}\n' "$THEM" "$ME" "$(now)" >> "$TRAJ"
+printf '```json\n{"action": "reply", "message": "pong", "request": ""}\n```\n' > "$STUB_REPLY_FILE"
+run_responder_s "$(grep -F '"step_id":"trig-13"' "$TRAJ")"
+sent=$(jq -r 'select(.type=="message" and .from=="testid" and .reply_to=="trig-13") | .content' "$TRAJ" | tail -1)
+[[ "$sent" == "pong" ]] && ok "structured: a code-fenced object is read" || bad "structured: a code-fenced object is read" "got '$sent'"
+
+# --- 15. a model that ignored the format falls into the text parser ---------
+printf '{"step_id":"trig-14","type":"message","from":"%s","to":"%s","content":"check the bridge","ts":"%s","source":"chat"}\n' "$THEM" "$ME" "$(now)" >> "$TRAJ"
+printf 'DEFER: check the slack bridge status\nOn it, back shortly.\n' > "$STUB_REPLY_FILE"
+run_responder_s "$(grep -F '"step_id":"trig-14"' "$TRAJ")"
+sent=$(jq -r 'select(.type=="message" and .from=="testid" and .reply_to=="trig-14") | .content' "$TRAJ" | tail -1)
+act=$(jq -c 'select(.type=="action" and .source=="responder" and .trigger_step=="trig-14")' "$TRAJ" | tail -1)
+[[ "$sent" == "On it, back shortly." && "$(printf '%s' "$act" | jq -r .request)" == "check the slack bridge status" ]] && ok "structured: non-JSON output still goes through the DEFER parser" || bad "structured: non-JSON output still goes through the DEFER parser" "sent='$sent' act='$act'"
+
+# --- 16. a provider that refuses the schema: one retry as text ---------------
+printf '{"step_id":"trig-15","type":"message","from":"%s","to":"%s","content":"you there?","ts":"%s","source":"chat"}\n' "$THEM" "$ME" "$(now)" >> "$TRAJ"
+printf 'Here.\n' > "$STUB_REPLY_FILE"
+run_responder_s "$(grep -F '"step_id":"trig-15"' "$TRAJ")" STUB_SCHEMA_FAIL=1
+sent=$(jq -r 'select(.type=="message" and .from=="testid" and .reply_to=="trig-15") | .content' "$TRAJ" | tail -1)
+[[ "$sent" == "Here." ]] && ok "fallback: a refused schema call is retried as text and answered" || bad "fallback: a refused schema call is retried as text and answered" "got '$sent'"
+[[ "$(grep -c '^CALL ' "$STUB_ARGS_FILE")" == "2" && "$(last_llm_args)" == *"schema=0" ]] && ok "fallback: exactly two calls, the second without the schema" || bad "fallback: exactly two calls, the second without the schema" "$(cat "$STUB_ARGS_FILE")"
+obs=$(jq -c 'select(.type=="observation" and .source=="responder" and .trigger_step=="trig-15")' "$TRAJ" | tail -1)
+[[ "$(printf '%s' "$obs" | jq -r .structured)" == "false" ]] && ok "fallback: the observation records the text shape" || bad "fallback: the observation records the text shape" "got '$obs'"
+
+# --- 17. RESPONDER_STRUCTURED=0 forces text even on a schema model ----------
+printf '{"step_id":"trig-16","type":"message","from":"%s","to":"%s","content":"still there?","ts":"%s","source":"chat"}\n' "$THEM" "$ME" "$(now)" >> "$TRAJ"
+printf 'Still here.\n' > "$STUB_REPLY_FILE"
+run_responder_s "$(grep -F '"step_id":"trig-16"' "$TRAJ")" RESPONDER_STRUCTURED=0
+[[ "$(last_llm_args)" == *"schema=0" ]] && ok "RESPONDER_STRUCTURED=0 never sends the schema" || bad "RESPONDER_STRUCTURED=0 never sends the schema" "got '$(last_llm_args)'"
+
+# --- 18. the prompt carries the voice block and the matching protocol ------
+printf '{"step_id":"trig-17","type":"message","from":"%s","to":"%s","content":"hi","ts":"%s","source":"chat"}\n' "$THEM" "$ME" "$(now)" >> "$TRAJ"
+printf '{"action": "reply", "message": "hi", "request": ""}\n' > "$STUB_REPLY_FILE"
+run_responder_s "$(grep -F '"step_id":"trig-17"' "$TRAJ")" RESPONDER_LOG_PROMPT=1
+plog=$(ls -t "$ID/run/logs/responder-prompts/"*.txt 2>/dev/null | head -1)
+grep -q "No dashes of any kind" "$plog" && grep -q 'action "defer"' "$plog" && ! grep -q 'put `DEFER:' "$plog" \
+    && ok "structured prompt: voice block present, JSON protocol, no DEFER-line instruction" || bad "structured prompt: voice block present, JSON protocol, no DEFER-line instruction" "$plog"
+printf 'hi\n' > "$STUB_REPLY_FILE"
+printf '{"step_id":"trig-18","type":"message","from":"%s","to":"%s","content":"hello","ts":"%s","source":"chat"}\n' "$THEM" "$ME" "$(now)" >> "$TRAJ"
+printf '%s' "$(grep -F '"step_id":"trig-18"' "$TRAJ")" | env "${ENV_COMMON[@]}" RESPONDER_LOG_PROMPT=1 "$RESPONDER" >> "$WORK/step.log" 2>&1
+plog=$(ls -t "$ID/run/logs/responder-prompts/"*.txt 2>/dev/null | head -1)
+grep -q "No dashes of any kind" "$plog" && grep -q 'put `DEFER:' "$plog" && ! grep -q 'action "defer"' "$plog" \
+    && ok "text prompt: voice block present, DEFER-line protocol, no JSON instruction" || bad "text prompt: voice block present, DEFER-line protocol, no JSON instruction" "$plog"
 
 echo
 echo "$pass passed, $fail failed"

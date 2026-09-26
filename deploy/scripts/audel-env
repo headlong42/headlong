@@ -18,12 +18,13 @@
 #
 #   -y   skip the confirmation prompt
 #
-# Identity defaults to audel; override with SHELLM_ENV_IDENTITY.
+# Identity defaults to the stack's persona (audel for terraform-slack,
+# harris for terraform-harris); override with SHELLM_ENV_IDENTITY.
 
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-IDENT="${SHELLM_ENV_IDENTITY:-audel}"
+IDENT="${SHELLM_ENV_IDENTITY:-$(stack_identity)}"
 ENV_FILE="/opt/shellm/app/.env"
 SHOWN_KEYS='^(SHELLM_MODEL|SHELLM_FAST_MODEL|SHELLM_EFFORT|SHELLM_MAX_TOKENS|SHELLM_ROLLUP_MODEL|RECAP_MODEL|LLM_PROVIDER)='
 

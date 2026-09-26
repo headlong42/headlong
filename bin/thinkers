@@ -36,6 +36,16 @@ THINKERS_WATCHDOG_SECS="${THINKERS_WATCHDOG_SECS:-300}"
 # twice, and the responder answered month-old Slack threads for 22 hours.
 # 0 disables.
 THINKERS_REWIND_TOLERANCE="${THINKERS_REWIND_TOLERANCE:-600}"
+# Stuck-step guard. A step whose shellm run has written its final step is
+# done; the little that follows (state file, backoff, arming the next wake)
+# takes seconds. A step still alive this many seconds after its run's final
+# is wedged, and the dispatcher ends it (TERM, then KILL 15s later). A
+# wedged step is fatal to a trigger_self:false loop: the next wake is armed
+# by the step's EXIT trap, so a step that never exits leaves nothing to fire.
+# 2026-09-14: two web servers the mind had backgrounded held the monolith
+# step's output pipe open; the step outlived its final by six hours and the
+# mind was silent the whole time. 0 disables.
+THINKERS_STEP_GRACE="${THINKERS_STEP_GRACE:-300}"
 VERBOSE=0
 NO_SELF_TRIGGER=0
 
@@ -263,7 +273,7 @@ _start_dispatcher() {
     local run_dir="$IDENTITY_DIR/run"
     mkdir -p "$run_dir/logs" "$run_dir/thinkers"
 
-    local fifo="$run_dir/dispatch.fifo"
+    local fifo
     local pid_file="$run_dir/dispatcher.pid"
     local tail_pids_file="$run_dir/tail_pids"
 
@@ -277,9 +287,19 @@ _start_dispatcher() {
         rm -f "$pid_file"
     fi
 
-    # Create FIFO
-    rm -f "$fifo"
-    mkfifo "$fifo"
+    # Create the FIFO outside the identity dir. The mind walks its own
+    # identity dir, and anything that opens a fifo as a file blocks forever
+    # and steals step lines from the dispatcher (Audel 2026-09-25: a secret
+    # scan sat 3.5 h in read() on run/dispatch.fifo). /tmp, not $TMPDIR: a
+    # start from inside a shellm run gets a TMPDIR that dies with the run.
+    # run/fifo_path records where it is so stop and cleanup can find it.
+    _remove_fifo "$run_dir"
+    local fifo_dir
+    fifo_dir=$(mktemp -d "/tmp/headlong-dispatch.XXXXXX") \
+        || die "Could not create a fifo directory in /tmp"
+    fifo="$fifo_dir/dispatch.fifo"
+    mkfifo "$fifo" || die "Could not create $fifo"
+    printf '%s\n' "$fifo" > "$run_dir/fifo_path"
 
     # Fresh pending-trigger flags (steps that arrived while a thinker was busy)
     rm -rf "$run_dir/pending"
@@ -359,7 +379,7 @@ _start_dispatcher() {
     done < <(_list_thinker_dirs)
 
     if [[ -z "$sub_map" ]]; then
-        rm -f "$fifo"
+        _remove_fifo "$run_dir"
         die "No valid subscriptions found"
     fi
 
@@ -516,6 +536,7 @@ _start_dispatcher() {
         # tolerance window that tail re-emits before the swap detector
         # restarts the feeder. A step_id seen once is never dispatched twice.
         _nl=$'\n'
+        _tab=$'\t'
         _recent_ids="$_nl"
         _recent_n=0
         if (( _rewind_tol > 0 )); then
@@ -528,6 +549,17 @@ _start_dispatcher() {
 
         # Track thinker step PIDs as "name:pid" pairs (space-separated, bash 3.2 compat)
         _step_entries=""
+        # Stuck-step guard state (bash 3.2: no associative arrays, so
+        # newline-separated records). _run_owner maps a shellm-run step_id
+        # to the thinker whose step launched it (the run's launched_by), so a
+        # later final can be attributed to exactly that step and not to
+        # another busy thinker or a nested sub-run (shellm blanks
+        # SHELLM_LAUNCHED_BY for children). _stuck holds one record per
+        # thinker whose run has finished but whose step is still alive:
+        #   name<TAB>final_seen_SECONDS<TAB>run_id<TAB>traj_file<TAB>term_sent_SECONDS_or_empty
+        _run_owner=""
+        _run_owner_n=0
+        _stuck=""
         # A new dispatcher starts a fresh ledger, deliberately: the on-disk
         # prune below rewrites step_pids from _step_entries alone, so a dead
         # dispatcher's leftover lines would be dropped on the first prune
@@ -615,6 +647,7 @@ _start_dispatcher() {
                     # to wait for.
                     wait "$_pid" 2>/dev/null || true
                     _changed=1
+                    _stuck_forget "${_entry%%:*}"
                 fi
             done
             _step_entries="$_new"
@@ -665,6 +698,93 @@ _start_dispatcher() {
             _step_entries="${_step_entries}${_step_entries:+ }${_dname}:$!"
             printf '%s %s\n' "$!" "$_dname" >> "$run_dir/step_pids"
             _wd_touch "$_dname"
+            _stuck_forget "$_dname"
+        }
+
+        # --- stuck-step guard (THINKERS_STEP_GRACE) ---------------------------
+        _stuck_forget() {
+            local _fname="$1" _rec _new=""
+            [[ -n "$_stuck" ]] || return 0
+            while IFS= read -r _rec; do
+                [[ -z "$_rec" ]] && continue
+                [[ "${_rec%%$'\t'*}" == "$_fname" ]] && continue
+                _new="${_new}${_rec}${_nl}"
+            done <<< "$_stuck"
+            _stuck="$_new"
+        }
+
+        # A shellm-run step with launched_by names the thinker that owns the
+        # run; remember step_id -> thinker (bounded) so the run's final can be
+        # matched back. Only while that thinker is busy: a run attributed to a
+        # thinker with no live step is history or noise.
+        _stuck_note_run() {  # <step_id> <launched_by>
+            [[ -n "$1" && -n "$2" ]] || return 0
+            _thinker_busy "$2" || return 0
+            _run_owner="${_run_owner}${1}${_nl}${2}${_nl}"
+            if (( ++_run_owner_n > 64 )); then
+                _run_owner="$(printf '%s' "$_run_owner" | tail -n 32)${_nl}"
+                _run_owner_n=16
+            fi
+        }
+
+        # A final for a run we attributed: the owning step is done with its
+        # run. Start its grace clock unless one is already running.
+        _stuck_note_final() {  # <run_id> <traj_file>
+            local _rid="$1" _ftraj="$2" _oname="" _prev="" _l _rec
+            [[ -n "$_rid" && -n "$_run_owner" ]] || return 0
+            while IFS= read -r _l; do
+                if [[ "$_prev" == "$_rid" ]]; then _oname="$_l"; fi
+                _prev="$_l"
+            done <<< "$_run_owner"
+            [[ -n "$_oname" ]] || return 0
+            _thinker_busy "$_oname" || return 0
+            if [[ -n "$_stuck" ]]; then
+                while IFS= read -r _rec; do
+                    [[ "${_rec%%$'\t'*}" == "$_oname" ]] && return 0
+                done <<< "$_stuck"
+            fi
+            _stuck="${_stuck}${_oname}${_tab}${SECONDS}${_tab}${_rid}${_tab}${_ftraj}${_tab}${_nl}"
+        }
+
+        # Tick: end any step that has outlived its run's final by the grace
+        # period. TERM first — bash runs the step's EXIT trap on TERM, so the
+        # monolith still arms its next wake — then KILL if it is still there
+        # 15s later. One error step per incident so the operator sees it on
+        # the timeline; the dispatcher log carries the survivors.
+        _stuck_step_check() {
+            (( THINKERS_STEP_GRACE > 0 )) || return 0
+            [[ -n "$_stuck" ]] || return 0
+            local _rec _sname _sat _srid _straj _sterm _new="" _spid _e _age _left
+            while IFS=$'\t' read -r _sname _sat _srid _straj _sterm; do
+                [[ -n "$_sname" ]] || continue
+                if ! _thinker_busy "$_sname"; then continue; fi   # step ended on its own
+                _age=$(( SECONDS - _sat ))
+                _spid=""
+                for _e in $_step_entries; do
+                    [[ "${_e%%:*}" == "$_sname" ]] && _spid="${_e#*:}"
+                done
+                if [[ -z "$_sterm" ]]; then
+                    if (( _age < THINKERS_STEP_GRACE )); then
+                        _new="${_new}${_sname}${_tab}${_sat}${_tab}${_srid}${_tab}${_straj}${_tab}${_nl}"
+                        continue
+                    fi
+                    _left=$(ps -o pid=,etime=,args= -g "$_spid" 2>/dev/null | grep -v "^ *${_spid} " | cut -c1-120 | tr '\n' ';' || true)
+                    printf '%s [dispatcher] STUCK: %s step (pid %s) is still running %ss after its run %s wrote its final — sending TERM. Still alive in its process group: %s\n' \
+                        "$(date -u +%FT%TZ)" "$_sname" "$_spid" "$_age" "$_srid" "${_left:-none}" >&2
+                    _append_traj_error "$_straj" "step-stuck" \
+                        "dispatcher: the $_sname step (pid $_spid) was still running ${_age}s after its run's final step, so the dispatcher ended it (TERM). A step that never exits arms no next wake, and the mind goes silent. Usual cause: a process the run left in the background holding the step's output open. Do not background servers or long jobs inside a wake; hand them to a scratch identity or a systemd unit instead."
+                    [[ -n "$_spid" ]] && _kill_tree "$_spid" TERM
+                    _new="${_new}${_sname}${_tab}${_sat}${_tab}${_srid}${_tab}${_straj}${_tab}${SECONDS}${_nl}"
+                elif (( SECONDS - _sterm >= 15 )); then
+                    printf '%s [dispatcher] STUCK: %s step (pid %s) ignored TERM for 15s — sending KILL\n' \
+                        "$(date -u +%FT%TZ)" "$_sname" "$_spid" >&2
+                    [[ -n "$_spid" ]] && _kill_tree "$_spid" KILL
+                    # drop the record; prune reaps the pid on the next tick
+                else
+                    _new="${_new}${_sname}${_tab}${_sat}${_tab}${_srid}${_tab}${_straj}${_tab}${_sterm}${_nl}"
+                fi
+            done <<< "$_stuck"
+            _stuck="$_new"
         }
 
         # Fire the watchdog for watched thinkers whose window elapsed with no
@@ -800,6 +920,7 @@ _start_dispatcher() {
             fi
             _fire_pending
             _watchdog_check
+            _stuck_step_check
             _scheduled_wake_check
             _respawn_dead_feeders
         }
@@ -907,13 +1028,25 @@ _start_dispatcher() {
             # thinker was busy is delivered before this newer step
             _fire_pending
 
-            # Parse step
-            _step_type=$(printf '%s' "$_step_json" | jq -r '.type // empty' 2>/dev/null) || continue
-            _step_source=$(printf '%s' "$_step_json" | jq -r '.source // empty' 2>/dev/null) || true
+            # Parse step: one jq call for everything the loop reads. step_id,
+            # run_id and launched_by feed the stuck-step guard. Fields are
+            # joined with the unit separator (0x1f): unlike a tab, it is not
+            # IFS whitespace, so `read` keeps empty fields in place instead
+            # of collapsing a missing source into the step_id slot.
+            _step_type="" _step_source="" _step_sid="" _step_rid="" _step_lby=""
+            IFS=$'\x1f' read -r _step_type _step_source _step_sid _step_rid _step_lby < <(
+                printf '%s' "$_step_json" \
+                | jq -r '[.type, .source, .step_id, .run_id, .launched_by] | map(. // "" | tostring) | join("\u001f")' 2>/dev/null
+            ) || true
 
             if [[ -z "$_step_type" ]]; then continue; fi
 
             printf '%s [dispatcher] step: type=%s source=%s\n' "$(date -u +%FT%TZ)" "$_step_type" "$_step_source" >&2
+
+            case "$_step_type" in
+                shellm-run) _stuck_note_run "$_step_sid" "$_step_lby" ;;
+                final)      _stuck_note_final "$_step_rid" "$_traj_file" ;;
+            esac
 
             # Find matching thinkers by scanning sub_map
             while IFS=$'\t' read -r _name _straj _stypes _sself _swd; do
@@ -1051,8 +1184,26 @@ _cleanup_run_state() {
         rm -f "$tail_pids_file"
     fi
     _kill_traj_tails "$run_dir" ${2:+"$2"}
-    rm -f "$run_dir/dispatch.fifo" "$run_dir/sub_map" "$run_dir/traj_files" "$run_dir/dispatcher.token"
+    _remove_fifo "$run_dir"
+    rm -f "$run_dir/sub_map" "$run_dir/traj_files" "$run_dir/dispatcher.token"
     rm -rf "$run_dir/pending"
+}
+
+# Remove the dispatcher fifo named by run/fifo_path, and the run/dispatch.fifo
+# that dispatchers before 2026-09-26 kept inside the identity dir. Only a path
+# of the shape _start_dispatcher makes is removed, since fifo_path sits in a
+# directory the mind can write.
+_remove_fifo() {
+    local run_dir="$1" path=""
+    path=$(head -n 1 "$run_dir/fifo_path" 2>/dev/null) || true
+    case "$path" in
+        /tmp/headlong-dispatch.*/dispatch.fifo)
+            if [[ "$path" != *..* && -p "$path" ]]; then
+                rm -f "$path"
+                rmdir "${path%/dispatch.fifo}" 2>/dev/null || true
+            fi ;;
+    esac
+    rm -f "$run_dir/fifo_path" "$run_dir/dispatch.fifo"
 }
 
 _cleanup_dispatcher() {

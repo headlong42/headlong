@@ -23,6 +23,14 @@ class Config:
     thread_followups: bool
     # How many messages above a first @mention to prepend. 0 disables.
     thread_join_backfill: int = 20
+    # Peer hearing: bot user ids of other Headlong personas whose Slack
+    # posts may reach this mind. Empty (the default) keeps the old rule
+    # that every bot post is dropped. See design/peer_hearing.md.
+    peer_bot_users: frozenset[str] = frozenset()
+    # Loop guard: consecutive peer messages forwarded in one thread with no
+    # person speaking in between, and total peer messages per hour.
+    peer_max_turns: int = 4
+    peer_hourly_cap: int = 30
 
     @property
     def identity_api_id(self) -> str:
@@ -109,7 +117,36 @@ def load(serve_root: Path) -> Config:
         state_dir=state_dir,
         thread_followups=os.environ.get("SLACK_THREAD_FOLLOWUPS", "") not in ("", "0"),
         thread_join_backfill=_join_backfill_limit(),
+        peer_bot_users=_peer_bot_users(),
+        peer_max_turns=_int_env("SLACK_PEER_MAX_TURNS", 4, 0, 50),
+        peer_hourly_cap=_int_env("SLACK_PEER_HOURLY_CAP", 30, 0, 1000),
     )
+
+
+def _peer_bot_users() -> frozenset[str]:
+    """SLACK_PEER_BOT_USERS: comma-separated bot user ids (U...) of peers.
+
+    Anything that is not a Slack user id is ignored, so a stray bot id
+    (B...) or a display name cannot open the gate by accident.
+    """
+    raw = os.environ.get("SLACK_PEER_BOT_USERS", "")
+    ids = set()
+    for part in raw.replace(";", ",").split(","):
+        part = part.strip()
+        if part and part[0] in "UW" and part.isalnum() and part == part.upper():
+            ids.add(part)
+    return frozenset(ids)
+
+
+def _int_env(name: str, default: int, lo: int, hi: int) -> int:
+    raw = os.environ.get(name, "")
+    if raw == "":
+        return default
+    try:
+        n = int(raw)
+    except ValueError:
+        return default
+    return max(lo, min(hi, n))
 
 
 def _join_backfill_limit() -> int:

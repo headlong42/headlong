@@ -128,11 +128,45 @@ def _exc_reason(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"[:200]
 
 
+# Seconds between attempts to reopen the trajectory after an OSError.
+RETRY_SECS = 30.0
+
+
 def run(cfg: Config, bot: Bot, allowlist: Allowlist, stop_event: threading.Event) -> None:
-    traj = mindlog.find_trajectory(cfg.identity_dir)
+    """Follow the mind log and deliver outbound messages until stop_event is set.
+
+    An OSError from the trajectory (permission denied, file gone, disk
+    trouble) does not end the thread: it is logged once and the follow is
+    retried every RETRY_SECS from the persisted cursor. 2026-09-22: the mind
+    set its trajectory directory to 700 and this thread died on the next
+    stat; the process stayed up, inbound kept working, and 19 hours of
+    replies sat in the log until someone noticed. The silence check restores
+    the permissions; this loop picks up where it left off without a restart.
+    """
     cursor = cfg.state_dir / "cursor"
     recent = RecentPosts()
-    log.info("following %s", traj)
+    failing: str | None = None
+    while not stop_event.is_set():
+        try:
+            traj = mindlog.find_trajectory(cfg.identity_dir)
+            if failing is not None:
+                log.info("trajectory readable again after: %s", failing)
+                failing = None
+            log.info("following %s", traj)
+            _deliver(cfg, bot, allowlist, stop_event, traj, cursor, recent)
+            return
+        except OSError as exc:
+            reason = _exc_reason(exc)
+            if reason != failing:
+                log.error("cannot read the trajectory (%s); retrying every %ss", reason, RETRY_SECS)
+                failing = reason
+            stop_event.wait(RETRY_SECS)
+
+
+def _deliver(
+    cfg: Config, bot: Bot, allowlist: Allowlist, stop_event: threading.Event,
+    traj: Path, cursor: Path, recent: RecentPosts,
+) -> None:
     for step in mindlog.follow(traj, cursor, should_stop=stop_event.is_set):
         if step.get("type") != "message" or step.get("from") != cfg.identity:
             continue

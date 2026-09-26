@@ -23,5 +23,19 @@ grep -q '^type: goal$' "$f" && grep -q '^until: 2026-09-19$' "$f" && ok "type an
 grep -q '^Daily papers shortlist$' "$f" && ok "the text is the body" || bad "body" "$(cat "$f")"
 printf 'from stdin\n' | mem add --type note >/dev/null 2>&1 && ok "stdin text still works" || bad "stdin"
 
+# The 2026-09-22 `-h` slip: a single dash must die like a double one, and
+# the stdin path stays open for text that really starts with a dash.
+before=$(ls "$MEM_DIR" | wc -l)
+err=$(mem add --type note -h 2>&1 >/dev/null); rc=$?
+[[ $rc -ne 0 ]] && ok "a single-dash flag fails (rc=$rc)" || bad "single-dash flag fails"
+printf '%s' "$err" | grep -q "unknown option '-h'" && ok "the error names '-h'" || bad "error names -h" "$err"
+err=$(mem add -x stray 2>&1 >/dev/null); rc=$?
+[[ $rc -ne 0 ]] && ok "a bare single-dash first word fails" || bad "bare single-dash fails"
+after=$(ls "$MEM_DIR" | wc -l)
+[[ $before -eq $after ]] && ok "the refused adds wrote nothing" || bad "refused add wrote" "$(ls "$MEM_DIR")"
+printf -- '-h the real body\n' | mem add --type note >/dev/null 2>&1 && ok "leading-dash text still stores from stdin" || bad "stdin leading-dash"
+f=$(grep -l '^-h the real body$' "$MEM_DIR"/*.md 2>/dev/null | head -1)
+[[ -n "$f" ]] && ok "the stdin body is verbatim" || bad "stdin body verbatim" "$(tail -3 "$MEM_DIR"/*.md)"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ $fail -eq 0 ]]

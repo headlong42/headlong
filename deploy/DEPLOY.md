@@ -150,6 +150,79 @@ pre-demo backup. Two caveats:
   Uploads are also capped server-side via `HEADLONG_WEB_MAX_IMPORT_MB`
   (default 512).
 
+## Restoring an identity from a snapshot
+
+The persona boxes (terraform-slack, terraform-harris) snapshot their root
+volume every night through Data Lifecycle Manager (`backup.tf`): 14 daily
+and 8 weekly snapshots in the box's region, plus encrypted copies in
+`backup_copy_region` (default `ap-southeast-1`) kept 7 days and 8 weeks.
+The identities live on that volume under `/var/lib/headlong/identities`.
+Snapshots are crash consistent; the trajectory is append-only, so at worst
+its last line is torn.
+
+Everything below runs from a laptop with AWS SSO and changes nothing on
+the live identity. Set `R=ap-southeast-2` and `STACK=shellm-slack` (or
+`shellm-harris`).
+
+1. Pick a snapshot:
+
+   ```bash
+   aws --region $R ec2 describe-snapshots --owner-ids self \
+     --filters Name=tag:headlong-backup,Values=$STACK \
+     --query 'sort_by(Snapshots,&StartTime)[].[SnapshotId,StartTime,Tags[?Key==`headlong-backup-schedule`]|[0].Value]' \
+     --output table
+   ```
+
+   If the home region is gone or its snapshots are, list the copies with
+   `--region ap-southeast-1` and bring one back with
+   `aws --region $R ec2 copy-snapshot --source-region ap-southeast-1 --source-snapshot-id <snap>`.
+
+2. Make a volume from it in the box's availability zone and attach it as a
+   second disk (the box keeps running):
+
+   ```bash
+   I=$(terraform -chdir=deploy/terraform-slack output -raw instance_id)   # or read it from deploy/scripts/status
+   AZ=$(aws --region $R ec2 describe-instances --instance-ids $I --query 'Reservations[0].Instances[0].Placement.AvailabilityZone' --output text)
+   V=$(aws --region $R ec2 create-volume --snapshot-id <snap> --availability-zone $AZ --volume-type gp3 \
+         --tag-specifications 'ResourceType=volume,Tags=[{Key=Name,Value=restore-scratch}]' --query VolumeId --output text)
+   aws --region $R ec2 wait volume-available --volume-ids $V
+   aws --region $R ec2 attach-volume --volume-id $V --instance-id $I --device /dev/sdf
+   ```
+
+   The scratch volume has no `headlong-backup` tag, so DLM never snapshots it.
+
+3. Mount it read-only on the box. `noload` skips journal replay, which a
+   crash-consistent snapshot would otherwise need, and keeps the disk
+   untouched:
+
+   ```bash
+   deploy/scripts/run 'lsblk -o NAME,SIZE,MOUNTPOINT; sudo mkdir -p /mnt/restore && sudo mount -o ro,noload /dev/nvme1n1p1 /mnt/restore && ls /mnt/restore/var/lib/headlong/identities'
+   ```
+
+   Check the device name in the `lsblk` output first; it is the disk with
+   no mountpoint.
+
+4. Copy out what you need, for example
+   `sudo cp -a /mnt/restore/var/lib/headlong/identities/audel /opt/shellm/backups/audel-from-<snap>`.
+   Putting it back into a live identity is a separate decision: stop the
+   dispatcher first (`sudo headlong-thinkersctl stop audel`), because the
+   trajectory must never be replaced under a running feeder: the feeder
+   follows the file by name and replays a replaced file through the mind
+   (the 2026-09-12 replay incident).
+
+5. Clean up. Do this before any reboot: the clone carries the same
+   filesystem label as the root disk, and a box that boots with both
+   attached can pick the wrong one.
+
+   ```bash
+   deploy/scripts/run 'sudo umount /mnt/restore'
+   aws --region $R ec2 detach-volume --volume-id $V && aws --region $R ec2 wait volume-available --volume-ids $V
+   aws --region $R ec2 delete-volume --volume-id $V
+   ```
+
+If the whole box is gone, the same volume can be attached to any instance
+in that zone, or the snapshot registered as the root of a fresh one.
+
 ## Migrating a pre-rename box (one time)
 
 > Doing a *different* structural migration on a live box? Read
@@ -194,7 +267,13 @@ own migration and none of them need to happen for the unit rename.
 - `headlong-web` binds `127.0.0.1` and the tunnel is outbound-only, so the
   only path in is through Access. Don't "temporarily" bind `0.0.0.0`.
 - Secrets: root key in `/opt/shellm/app/.env` (mode 600); per-identity
-  overrides via the Config tab (stored in `<identity>/.env`).
+  overrides via the Config tab (stored in `<identity>/.env`). The Slack
+  bridge tokens are split out to `/opt/shellm/app/.env.bridge`, which
+  the mind cannot read (`deploy/split-bridge-env.sh`, run by `update.sh`).
+- Every wake runs under a systemd sandbox: filesystem read-only except
+  the shellm home, the identity's own directory and the temp dirs. `HEADLONG_SANDBOX=0` in the root `.env` plus `update.sh` and a
+  `headlong-thinkersctl restart <identity>` turns it off
+  (`deploy/thinkers-sandbox.sh`, see SECURITY.md).
 - Optional: install Docker (`apt install docker.io`, add `shellm` to the
   `docker` group) so generated code runs in shellm's Docker sandbox
   instead of directly on the host.

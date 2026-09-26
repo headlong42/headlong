@@ -761,3 +761,98 @@ def test_join_backfill_timeouts_share_one_worker(tmp_path, posted, monkeypatch):
     finally:
         ib.stop()
         ib._worker.join(timeout=1)
+
+
+class _RefusedResponse:
+    """A 409 from the web API: the mind's `chat send` refused the message."""
+
+    status_code = 409
+    text = '{"detail":{"message":"refusing to send: this exact message already went"}}'
+
+    def json(self):
+        return {"detail": {"message": "refusing to send: this exact message already went"}}
+
+    def raise_for_status(self):
+        raise httpx.HTTPStatusError(
+            "409", request=httpx.Request("POST", "http://headlong.test/chat"), response=self  # type: ignore[arg-type]
+        )
+
+
+def _dm_message(text="great", is_peer=False):
+    return inbound.InboundMessage(
+        "slack-U123-D123", "U123", "D123", None, "1788451200.123456", text, is_peer=is_peer
+    )
+
+
+def test_refused_delivery_is_not_retried_and_posts_no_error(monkeypatch):
+    """A 409 is the mind saying no on purpose. On 2026-09-21 the bridge retried
+    three times, posted 'couldn't reach my mind' 22 times, and the peers
+    answered each other's error text in a loop."""
+    posts = []
+    error_posts = []
+
+    class Client:
+        def chat_getPermalink(self, **_kwargs):
+            return {}
+
+        def chat_postMessage(self, **kwargs):
+            error_posts.append(kwargs)
+
+    monkeypatch.setattr(
+        inbound.httpx,
+        "post",
+        lambda url, json, timeout: posts.append(json) or _RefusedResponse(),
+    )
+    monkeypatch.setattr(inbound.time, "sleep", lambda _s: (_ for _ in ()).throw(AssertionError("slept")))
+
+    bridge = make_inbound(Client())
+    bridge._deliver(_dm_message())
+
+    assert len(posts) == 1, "a refusal is final: no retry"
+    assert error_posts == [], "no bridge error is posted for a refusal"
+
+
+def test_other_failures_still_retry_and_post_the_error(monkeypatch):
+    posts = []
+    error_posts = []
+
+    class Client:
+        def chat_getPermalink(self, **_kwargs):
+            return {}
+
+        def chat_postMessage(self, **kwargs):
+            error_posts.append(kwargs)
+
+    def down(url, json, timeout):
+        posts.append(json)
+        raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(inbound.httpx, "post", down)
+    monkeypatch.setattr(inbound.time, "sleep", lambda _s: None)
+
+    bridge = make_inbound(Client())
+    bridge._deliver(_dm_message())
+
+    assert len(posts) == inbound.DELIVERY_ATTEMPTS
+    assert len(error_posts) == 1
+    assert error_posts[0]["text"] == inbound.DELIVERY_ERROR_TEXT
+
+
+def test_peer_bridge_error_text_is_not_forwarded(monkeypatch):
+    posts = []
+
+    class Client:
+        def chat_getPermalink(self, **_kwargs):
+            return {}
+
+    monkeypatch.setattr(
+        inbound.httpx,
+        "post",
+        lambda url, json, timeout: posts.append(json) or OkResponse(),
+    )
+    bridge = make_inbound(Client())
+    bridge._deliver(_dm_message(inbound.DELIVERY_ERROR_TEXT, is_peer=True))
+    assert posts == [], "the other bridge's error string never reaches the mind"
+
+    bridge._deliver(_dm_message(inbound.DELIVERY_ERROR_TEXT, is_peer=False))
+    assert len(posts) == 1, "a person quoting the error text is still delivered"

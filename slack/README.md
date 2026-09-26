@@ -59,7 +59,13 @@ Other settings: `HEADLONG_SLACK_STATE_DIR`, legacy `SHELLM_SLACK_STATE_DIR`
 `<identity>/run/slack-bridge/`), `SLACK_THREAD_FOLLOWUPS=1` (answer
 un-mentioned replies in threads the bot is already part of),
 `SLACK_THREAD_JOIN_BACKFILL` (how many closest prior messages above a first @mention
-to prepend; default 20, 0 disables, max 50).
+to prepend; default 20, 0 disables, max 50), and peer hearing:
+`SLACK_PEER_BOT_USERS` (comma-separated bot user ids of other Headlong
+personas whose posts may reach this mind; empty keeps every bot post
+dropped), `SLACK_PEER_MAX_TURNS` (peer messages forwarded in one thread in a
+row with no person speaking; default 4) and `SLACK_PEER_HOURLY_CAP` (peer
+messages forwarded per hour; default 30). See
+[design/peer_hearing.md](../design/peer_hearing.md).
 
 For the end-to-end procedure we used to install our agent, Audel, into a
 workspace on that stack (Slack app, tokens, SSM env, rebuild, verification),
@@ -81,6 +87,12 @@ slack app install --environment deployed  # push manifest + reinstall (new scope
 slack run                        # local dev: CLI-managed dev app + tokens,
                                  # runs the bridge against the repo root
 ```
+
+`manifest.harris.json` is the same app definition for the second persona,
+Harris, which has its own Slack app and bot user (so the two personas post
+as different bots and the bridge on each box only sees its own tokens).
+It was created from that file with "Create New App → From a manifest" in
+the laudesters workspace; keep the two files in step when scopes change.
 
 Scope changes become: edit `manifest.json` → `slack manifest validate` →
 `slack app install`. Production still uses the long-lived `xoxb-`/`xapp-`

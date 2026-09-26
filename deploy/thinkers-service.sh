@@ -22,7 +22,12 @@ IDENT="${2:?identity name required}"
 ACTION="${3:?action required (start|stop)}"
 
 cd "$APP_DIR"
-export PATH="$APP_DIR/bin:$PATH"
+# bin/ is the mind's commands; tools/ is where `identity` lives since the
+# 2026-08-20 reorg, and the wake prompt calls `identity prompt` every run.
+# Audel's box hid this behind stale August copies of the tools in
+# ~/.local/bin; Harris's fresh box (2026-09-14) rendered an empty "About"
+# section on every wake until tools/ was on this PATH.
+export PATH="$APP_DIR/bin:$APP_DIR/tools:$PATH"
 
 # Same env layering as the web control plane's _ENV_WRAPPER: root .env
 # first (API keys, SHELLM_MODEL), then the identity's own .env so
