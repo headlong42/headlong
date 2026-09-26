@@ -399,7 +399,7 @@ _redact_keys() {
         -e 's/(^|[^A-Za-z0-9])(SG\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})/\1[redacted]/g' \
         -e 's/(^|[^A-Za-z0-9])(SK[0-9a-f]{32})/\1[redacted]/g' \
         -e 's/(^|[^A-Za-z0-9])(key-[A-Za-z0-9]{20,})/\1[redacted]/g' \
-        -e 's/((aws|AWS)_secret_access_key)[[:space:]]*[=:][[:space:]]*[^[:space:]]+/\1=[redacted]/g'
+        -e "s/([aA][wW][sS]_[sS][eE][cC][rR][eE][tT]_[aA][cC][cC][eE][sS][sS]_[kK][eE][yY][\"']?[[:space:]]*[:=][[:space:]]*[\"']?)([^\"'[:space:]]+)/\1[redacted]/g"
 }
 _update_person_notes() {
     local key="$1" person="$2" hist prev_body prev_file system user new_body
