@@ -249,5 +249,31 @@ out=$(signals "$DAY 14:06" | grep -F "Cap duty")
 has   "a send wins over the day's limit"   "$out" "the 14:00 window was sent at"
 hasnt "a sent window is not called closed" "$out" "the 14:00 window is closed"
 
+# ── Part 5b: a goal with no daily_max field gets no day limit ─────────────
+# The 2026-09-27 break pass found every cap case injecting daily_max into the
+# goal it tested, while the live papers goal carried no such field, so the fix
+# was inert on the real input until the field was added there. Pin the other
+# side of that seam: with no daily_max field the day limit is off, a morning
+# receipt of two items does not close the later window, and nothing reads as
+# closed by the day's limit. That is the exact input class the live goal was
+# in, so the no-field shape cannot drop out of the suite unnoticed.
+mem add --type goal --schedule "13:00 14:00" "Open duty" >/dev/null 2>&1
+of=$(grep -lF 'Open duty' "$MEM_DIR"/*.md | head -1)
+OPENID=$(awk '/^id:/{print $2; exit}' "$of")
+if grep -q '^daily_max:' "$of"; then bad "the open goal carries no daily_max" "$(grep '^daily_max:' "$of")"; else ok "the open goal carries no daily_max"; fi
+openreceipt() {  # openreceipt <HHMM> <ids...>
+    printf 'key=%s/%s-%s\nsent=%s\nids=%s\n' "$OPENID" "$DAY" "$1" \
+        "$(/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" \
+        > "$PAPERS_RECEIPTS_DIR/${OPENID}_${DAY}-$1.receipt"
+}
+openreceipt 1300 "2609.29647 2609.30199"
+out=$(signals "$DAY 14:05" | grep -F "Open duty")
+has   "no field, the later window stays due"      "$out" "DUE NOW"
+has   "no field, the window key is given"         "$out" "--key $OPENID/$DAY-1400"
+hasnt "no field, no day limit is claimed"         "$out" "closed by the day's limit"
+out=$(signals "$DAY 13:05" | grep -F "Open duty")
+has   "no field, the morning receipt is reported" "$out" "the 13:00 window was sent at"
+hasnt "no field, the next window is not closed"   "$out" "closed by the day's limit"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ $fail -eq 0 ]]
