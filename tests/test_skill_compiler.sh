@@ -30,6 +30,12 @@ mkdir -p "$STUB"
 cat > "$STUB/llm" <<'STUBLEOF'
 #!/usr/bin/env bash
 [ -n "${STUB_LLM_LOG:-}" ] && printf '%s\n' "$*" >> "$STUB_LLM_LOG"
+if [ "${STUB_MODE:-}" = "quote" ]; then
+  cat <<'JSONQ'
+[{"name":"greet-quote-fold","prompt":"Run the greeting skill and report what it prints.","expect":"final","expect_contains":["sed \"s/<[^>]*>//g\""]}]
+JSONQ
+  exit 0
+fi
 cat <<'JSON'
 [
   {"name":"greet-pool-exact","prompt":"Run the greeting skill and report what it prints.","expect":"final","expect_contains":["Hello, phrase-pool world!"]},
@@ -44,6 +50,13 @@ cat > "$STUB/shellm" <<'STUBLEOF'
 [ -n "${STUB_SHELLM_LOG:-}" ] && printf '%s\n' "$*" >> "$STUB_SHELLM_LOG"
 : "${TRAJ_DIR:?stub shellm needs TRAJ_DIR}"
 mkdir -p "$TRAJ_DIR"
+if [ "${STUB_MODE:-}" = "quote" ]; then
+  {
+    printf '%s\n' '{"type":"shell-output","stdout":"stripped with sed '"'"'s/<[^>]*>//g'"'"'"}'
+    printf '%s\n' '{"type":"final","content":"stripped with sed '"'"'s/<[^>]*>//g'"'"'"}'
+  } > "$TRAJ_DIR/stub-run.jsonl"
+  exit 0
+fi
 {
   printf '%s\n' '{"type":"shell-output","stdout":"Hello, phrase-pool world! | phrase-pool world | ZzyzxNotInPool"}'
   printf '%s\n' '{"type":"final","content":"Reported. Hello, phrase-pool world! and phrase-pool world and ZzyzxNotInPool."}'
@@ -77,6 +90,8 @@ Run `python3 fixture_greet.py` to print the greeting.
 ```text
 Hello, phrase-pool world!
 ```
+
+Example test JSON, for the reader only: {"name": "short-identifier", "expect_contains": ["substring1", "substring2"]}. Write the exact prompt to send to shellm in the prompt field.
 MDEOF
 
 run_sc() { SKILLS_DIR="$WORK/skills" SKILLS_KERNEL_DIR="$WORK/kernel" "$SC" "$@"; }
@@ -165,6 +180,55 @@ if [ -f "$MD_CACHE" ] && grep -q '## Summary: 3 / 3 passed, 2 / 3 verified' "$MD
 else
   bad "markdown cache carries the summary and the pass verification section" "file=$MD_CACHE"
 fi
+
+# FIX3 2026-09-27: placeholder scaffolding from the skill docs is not output
+# vocabulary. fixture-greet's SKILL.md lists example slot names; the pool must
+# reject them even though the docs carry them.
+if printf '%s' "$pool" | jq -e 'index("substring1") or index("substring2") or index("short-identifier") or index("exact prompt to send to shellm")' >/dev/null 2>&1; then
+  bad "phrase pool rejects placeholder scaffolding" "pool=${pool:0:200}"
+else
+  ok "phrase pool rejects placeholder scaffolding"
+fi
+
+# FIX3 2026-09-27: the teacher prompt carries the new rules and the install
+# status of every binary the skill declares.
+FIXB="$WORK/skills/fixture-bins"
+mkdir -p "$FIXB"
+cat > "$FIXB/SKILL.md" <<'MDEOF'
+---
+name: fixture-bins
+description: Greet a caller with a binary greeting.
+bins:
+  - bash
+  - definitely-not-installed-xyz
+---
+
+# fixture-bins
+
+Run `bash -c echo` to print the greeting.
+MDEOF
+export STUB_LLM_LOG="$WORK/llm-bins.log"
+rm -f "$STUB_LLM_LOG"
+run_sc compile --skill fixture-bins --num-tests 3 --max-iterations 3 >/dev/null 2>&1 || true
+if [[ -f "$STUB_LLM_LOG" ]] && grep -q 'PROMPT-EXPECT AGREEMENT' "$STUB_LLM_LOG" && grep -q 'NO PLACEHOLDER SCAFFOLDING' "$STUB_LLM_LOG" && grep -q 'EXPECT THE OUTPUT NOT THE COMMAND' "$STUB_LLM_LOG" && grep -q 'definitely-not-installed-xyz: NOT INSTALLED' "$STUB_LLM_LOG" && grep -q 'bash: installed' "$STUB_LLM_LOG"; then
+  ok "teacher prompt carries rules 15-18 and the bins install status"
+else
+  bad "teacher prompt carries rules 15-18 and the bins install status" "log=$WORK/llm-bins.log"
+fi
+rm -rf "$REPO/skills/skill-compiler/.compiled/fixture-bins.json" "$REPO/skills/skill-compiler/.compiled/fixture-bins.md"
+
+# FIX3 2026-09-27: a pinned command line passes when the agent writes the other
+# quote style of the same command (quote-fold matching).
+export STUB_MODE=quote
+rm -f "$REPO/skills/skill-compiler/.compiled/fixture-greet.json"
+run_sc compile --skill fixture-greet --num-tests 1 --max-iterations 3 >/dev/null 2>&1 || true
+unset STUB_MODE
+if [[ -f "$CACHE" ]] && jq -e '.tests[0].pass == true' "$CACHE" >/dev/null 2>&1; then
+  ok "quote-style variant of a pinned command still passes"
+else
+  bad "quote-style variant of a pinned command still passes" "result=$(jq -c '.tests[0] | {pass, verification}' "$CACHE" 2>/dev/null)"
+fi
+rm -f "$REPO/skills/skill-compiler/.compiled/fixture-greet.json"
 
 echo
 echo "$pass passed, $fail failed"

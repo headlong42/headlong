@@ -101,13 +101,29 @@ parse_skill_spec() {
         has_cli_tool=true
     fi
 
-    # Check if skill is a reference/documentation skill (explains concepts)
+    # Check if skill is a reference/documentation skill (explains concepts)    # DEPENDENCY-FIX 2026-09-27: declared binaries, so the teacher can see which
+    # ones the test environment actually has (rule 18).
+    local bins_csv
+    bins_csv=$(printf '%s\n' "$frontmatter" | awk '
+        /^[A-Za-z_]*[Bb]ins:/ { sub(/^[^:]*:[[:space:]]*/, ""); grab = 1 }
+        grab {
+            if ($0 ~ /^[[:space:]]*$/) next
+            if ($0 !~ /^[[:space:]]*(-|\[)/) { grab = 0; next }
+            line = $0
+            gsub(/[\[\]",:]/, " ", line)
+            n = split(line, a, /[[:space:]]+/)
+            for (i = 1; i <= n; i++)
+                if (a[i] ~ /^[A-Za-z0-9._+][A-Za-z0-9._+-]*$/) printf "%s,", a[i]
+        }
+    ' | sed 's/,$//')
+
+
     local is_reference_skill=false
     if printf '%s' "$body" | grep -qiE '(reference|overview|architecture|how.*works|concept|design)'; then
         is_reference_skill=true
     fi
 
-    jq -n         --arg name "$name"         --arg description "$description"         --arg body "$body"         --arg usage_section "$usage_section"         --arg has_cli_tool "$has_cli_tool"         --arg is_reference_skill "$is_reference_skill"         '{name:$name, description:$description, body:$body, usage_section:$usage_section, has_cli_tool:($has_cli_tool=="true"), is_reference_skill:($is_reference_skill=="true")}'
+    jq -n         --arg name "$name"         --arg description "$description"         --arg body "$body"         --arg usage_section "$usage_section"         --arg has_cli_tool "$has_cli_tool"         --arg bins "$bins_csv"         --arg is_reference_skill "$is_reference_skill"         '{name:$name, description:$description, body:$body, usage_section:$usage_section, has_cli_tool:($has_cli_tool=="true"), is_reference_skill:($is_reference_skill=="true"), bins:([$bins|split(",")[]|select(length>0)])}'
 }
 
 # Synthesize test cases using teacher model
@@ -160,8 +176,11 @@ capture_phrase_pool() {
 import os, re, json, glob
 d = os.environ["SKILL_ABS"]
 out = []
+PLACEHOLDER_SCAFFOLD_RE = re.compile(r"(substring[0-9]|short-identifier|exact prompt)", re.I)
 def emit(s):
     s = s.strip()
+    if PLACEHOLDER_SCAFFOLD_RE.search(s):
+        return
     if "\x01" in s:
         for frag in s.split("\x01"):
             emit(frag)
@@ -224,8 +243,11 @@ PY
 import os, re, json
 d = os.environ["SKILL_ABS"]
 out = []
+PLACEHOLDER_SCAFFOLD_RE = re.compile(r"(substring[0-9]|short-identifier|exact prompt)", re.I)
 def emit(s):
     s = s.strip()
+    if PLACEHOLDER_SCAFFOLD_RE.search(s):
+        return
     if "\x01" in s:
         for frag in s.split("\x01"):
             emit(frag)
@@ -245,6 +267,8 @@ if _m:
     text = text[_m.end():]
 def emit_meta(s):
     s = s.strip(" []{}\"'`,;")
+    if PLACEHOLDER_SCAFFOLD_RE.search(s):
+        return
     if len(s) < 2 or not re.search(r"[A-Za-z]", s):
         return
     out.append(s)
@@ -309,7 +333,28 @@ synthesize_tests() {
     fi
 
     local skill_spec
-    skill_spec=$(printf '%s' "$spec_json" | jq -c .)
+    skill_spec=$(printf '%s' "$spec_json" | jq -c .)    # DEPENDENCY-FIX 2026-09-27: tell the teacher which declared binaries the
+    # test environment has (rule 18). A test that needs a missing binary dies at
+    # exit 127 and the stall guard kills the run before any expected line.
+    local bins_status="none declared"
+    local declared_bin
+    declared_bin=$(printf '%s' "$spec_json" | jq -r '[.bins[]?] | join(" ")')
+    if [[ -n "$declared_bin" ]]; then
+        local -a bin_arr=()
+        local b
+        read -r -a bin_arr <<< "$declared_bin"
+        bins_status=""
+        for b in "${bin_arr[@]}"; do
+            if command -v "$b" >/dev/null 2>&1; then
+                bins_status="${bins_status}${b}: installed"$'\n'
+            else
+                bins_status="${bins_status}${b}: NOT INSTALLED"$'\n'
+            fi
+        done
+        bins_status="${bins_status%$'\n'}"
+    fi
+
+
 
     # Build prompt using a heredoc with proper escaping
     local prompt
@@ -338,6 +383,15 @@ CRITICAL RULES for test prompts:
 
 13. REPORT-AS-TEXT FIX 2026-09-27: when a test asks the agent to report tool output, the prompt must tell it to state that output as plain text in its final answer and never paste the output inside a code block. The agent's whole reply is one bash code block, so pasted output text is EXECUTED as a command: 'Hello, World! Current time: ...' exits 127, three times over, and the stall guard kills the run before any final is written (observed on hello-world 'greeting-with-timestamp' and shellm 'explain-identity' on 2026-09-22, both skills running correctly at the time of the kill). Phrase such prompts as 'state the result in your final answer' or 'report the output as plain text, not as shell commands', and never as 'show me the output in a code block'. A test whose prompt says 'report the output' without this wording is forbidden.
 14. COUNT-FREE FRAGMENTS 2026-09-27: when the expected output line carries a count or any per-case value (for example a tool that prints 'N violation(s):'), never pin the whole rendered line. Pin a fragment that is stable across cases (for example 'violation(s):') or leave expect_contains out. A literal containing a value that varies by case fails against every other case.
+
+15. PROMPT-EXPECT AGREEMENT FIX 2026-09-27: every expect_contains literal must be text the test's own prompt asks the agent to produce. A prompt that tells the agent to report the result as plain text and never paste commands (rule 13) can never make the agent emit a command line, so demanding a command line as expected output is impossible by construction (observed 2026-09-27 on the skill-compiler self test, which pinned the exact command line it told the agent never to paste: the agent answered correctly and the literal was absent). Choose every literal from what the answer will say, never from what the agent will run.
+
+16. NO PLACEHOLDER SCAFFOLDING FIX 2026-09-27: the example blocks in skill docs carry placeholder slot names (short-identifier, substring1, substring2, exact prompt to send to shellm). Those are scaffolding for the reader, not output vocabulary, and the phrase pool now rejects them even where the docs list them. Never copy a placeholder or an example slot name into expect_contains. Pin only lines a real run prints.
+
+17. EXPECT THE OUTPUT NOT THE COMMAND FIX 2026-09-27: never pin a whole command line as expected output. The same command written with the other quote style or an extra flag produces identical results (verified 2026-09-27: the single-quote and double-quote spellings of the same sed strip command strip exactly the same text), so pinning one spelling fails against a run that is correct (observed 2026-09-27 on the web research fetch and extract tests). Pin the data the command produces (the extracted names, the stripped text), or pin a fragment that survives a change of quote style.
+
+18. DEPENDENCY FIX 2026-09-27: a test must never depend on a binary the test environment does not have. The binaries this skill declares and whether each one is installed are listed below. For any NOT INSTALLED binary the test must not run a command that needs it and must not pin frontmatter lines or output that depend on it: either take a path that avoids the binary, or expect the graceful missing-binary report if the skill documents one. A command that exits 127 is not a test (observed 2026-09-27 on the skill author cowsay scaffold test: cowsay is not installed, the validation command exited 127 three times and the stall guard killed the run before any expected line was reached).
+
 
 
 SKILL SPECIFICATION (JSON):
@@ -379,6 +433,9 @@ EXAMPLE GOOD TEST for CLI tool skill (counterpoint):
 PHRASE POOL (verbatim source for every expect_contains entry):
 __PHRASE_POOL__
 
+BINARIES THIS SKILL DECLARES, AND WHETHER THE TEST ENVIRONMENT HAS THEM:
+__BINS_STATUS__
+
 Return ONLY a JSON array of test case objects. No markdown, no explanation.
 
 Skill specification: __SKILL_SPEC__
@@ -389,6 +446,7 @@ PROMPT_EOF
     # Replace placeholders
     prompt="${prompt/__SKILL_SPEC__/$skill_spec}"
     prompt="${prompt/__NUM_TESTS__/$num_tests}"
+    prompt="${prompt//__BINS_STATUS__/$bins_status}"
     [ -n "$skill_abs" ] || skill_abs="${SKILLS_DIR:-}"
     prompt="${prompt//__SKILL_ABS__/$skill_abs}"
 
@@ -684,6 +742,20 @@ ${traj_blob}"
             elif printf '%s\n' "$exec_match" | grep -Eiqw -- "${_esc}(s|es)?"; then
                 pass=true
                 break
+            fi
+            # QUOTE-FOLD-FIX 2026-09-27: the same command written with the other
+            # quote style is the same command (single-quote and double-quote
+            # spellings of one sed strip produce identical output, verified
+            # 2026-09-27). Fold both quote characters to one before matching a
+            # quoted literal so one spelling is not brittle against the other.
+            if [[ "$substr" == *"'"* || "$substr" == *'"'* ]]; then
+                local fold_lit fold_ev
+                fold_lit=$(printf '%s' "$substr" | sed "s/[\'\"]/'/g")
+                fold_ev=$(printf '%s\n' "$exec_match" | sed "s/[\'\"]/'/g")
+                if printf '%s\n' "$fold_ev" | _phrase_match "$fold_lit"; then
+                    pass=true
+                    break
+                fi
             fi
             # DENIAL-AWARE-FIX 2026-09-22: a denial line may only satisfy a term
             # that is itself a denial phrase, so "No violations found" still
