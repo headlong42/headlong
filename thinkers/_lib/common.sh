@@ -306,12 +306,41 @@ _receipt_ids_count() {
     [[ -f "$r" ]] || return 0
     awk '/^ids=/{sub(/^ids=/, ""); print NF; exit}' "$r"
 }
+# How many distinct paper ids a sent message presented. The day's limit counts
+# a receiptless keyed send by this instead of by one, because the message is the
+# only record such a send leaves. Takes the window key and the sent ledger json,
+# and prints a count; 0 when the key is not there or the message named no id.
+# An id is NNNN.NNNNN as a standalone token (the same shape
+# bin/papers-sendcheck.awk counts), so one inside a longer number is not picked
+# up.
+_msg_ids_count() {
+    local key="$1" chatjson="$2"
+    printf '%s\n' "$chatjson" | jq -r --arg k "$key" \
+        '.[] | select(.key == $k and .state != "failed" and .state != "skipped") | .content // ""' 2>/dev/null \
+    | awk '
+        { line = $0; n = length(line); pos = 1
+          while (match(substr(line, pos), /[0-9][0-9][0-9][0-9][.][0-9][0-9][0-9][0-9][0-9]?/)) {
+            st = pos + RSTART - 1; en = st + RLENGTH - 1
+            id = substr(line, st, RLENGTH)
+            before = (st > 1) ? substr(line, st - 1, 1) : ""
+            after  = (en < n) ? substr(line, en + 1, 1) : ""
+            if (before !~ /[0-9]/ && after !~ /[0-9]/) seen[id] = 1
+            pos = st + RLENGTH
+            if (pos > n) break
+          }
+        }
+        END { c = 0; for (i in seen) c++; print c + 0 }'
+}
 _schedule_signals() {
     local mem_dir="${1:-$MEM_DIR}" tz="${HEADLONG_TZ:-UTC}" grace="${SCHEDULE_GRACE_MIN:-360}"
-    local f sched gtz until id title day now now_m zone sent t t_m key at due next said skip daily_max used n wins
+    local f sched gtz until id title day now now_m zone sent chatjson t t_m key at due next said skip daily_max used n wins
     printf -- '- Now: %s (%s).\n' "$(TZ="$tz" date +'%A %Y-%m-%d %H:%M %Z')" "$(date -u +'%Y-%m-%d %H:%MZ')"
     [[ -d "$mem_dir" ]] || return 0
-    sent=$(chat sent --since 2d -n 500 --json 2>/dev/null | jq -r '.[] | select(.key != null and .state != "failed" and .state != "skipped") | "\(.key) \(.ts[11:16])Z"' 2>/dev/null) || sent=""
+    # One read of the sent ledger serves the whole run: sent maps each key to
+    # its send time, and chatjson keeps the messages themselves, so a keyed
+    # send that left no receipt can still be counted by what it presented.
+    chatjson=$(chat sent --since 2d -n 500 --json 2>/dev/null) || chatjson=""
+    sent=$(printf '%s\n' "$chatjson" | jq -r '.[] | select(.key != null and .state != "failed" and .state != "skipped") | "\(.key) \(.ts[11:16])Z"' 2>/dev/null) || sent=""
     while IFS= read -r f; do
         [[ -n "$f" ]] || continue
         sched=$(_fm "$f" schedule); until=$(_fm "$f" until)
@@ -374,7 +403,14 @@ _schedule_signals() {
                 [[ -n "$at" ]] || at=$(_receipt_sent "$key")
                 if [[ -z "$at" ]]; then continue; fi
                 n=$(_receipt_ids_count "$key"); n=${n:-0}
-                if (( n < 1 )); then n=1; fi
+                if (( n < 1 )); then
+                    # No receipt for this send, so the message is the only
+                    # record: count the distinct paper ids it presented
+                    # rather than assume one. A send naming no id still
+                    # counts one, so a send is never worth zero.
+                    n=$(_msg_ids_count "$key" "$chatjson")
+                    if (( n < 1 )); then n=1; fi
+                fi
                 used=$(( used + n ))
             done
         fi

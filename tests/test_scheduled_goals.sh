@@ -380,5 +380,63 @@ out=$(signals "$DAY 14:05" | grep -F "Spelling duty")
 has "an hour written once is that hour"        "$out" "the 09:00 window was sent at"
 has "an hour written once leaves 14:00 open"   "$out" "DUE NOW"
 
+# ── Part 5g: a receiptless send counts what its message presented ───────────
+# The receipt is not the only record of what a send carried. When a keyed send
+# leaves no receipt at all, the day's limit used to count it as one item, so a
+# two-paper send that forgot its receipt left the later window open and a
+# second pair went out the same day. Count the distinct ids the message
+# presented instead: the message is the only record such a send leaves. A send
+# naming no id still counts one, and a receipt still wins when both exist.
+mem add --type goal --schedule "13:00 14:00" "Pairless duty" >/dev/null 2>&1
+pf=$(grep -lF 'Pairless duty' "$MEM_DIR"/*.md | head -1)
+PID2=$(awk '/^id:/{print $2; exit}' "$pf")
+awk '!/^daily_max: /{print} /^schedule: /{print "daily_max: 2"}' "$pf" > "$pf.t" && mv "$pf.t" "$pf"
+grep -q '^daily_max: 2$' "$pf" && ok "pairless goal carries daily_max" || bad "pairless goal carries daily_max" "$(head -10 "$pf")"
+
+# two papers in the message, no receipt written: the day is spent
+chat send --to slack-C0TESTCHAN1 --key "$PID2/$DAY-1300" \
+    "Two papers, one message, no receipt: 2609.29647 https://arxiv.org/abs/2609.29647 and 2609.30199 https://arxiv.org/abs/2609.30199" >/dev/null 2>&1
+[[ -f "$PAPERS_RECEIPTS_DIR/${PID2}_${DAY}-1300.receipt" ]] \
+    && bad "the pairless send really has no receipt" "receipt exists" \
+    || ok "the pairless send really has no receipt"
+out=$(signals "$DAY 14:05" | grep -F "Pairless duty")
+hasnt "a receiptless pair does not raise a window" "$out" "DUE NOW"
+has   "a receiptless pair spends the day"          "$out" "the 14:00 window is closed by the day's limit (2 of 2"
+
+# one paper in the message and no receipt: one item spent, the later window open
+mem add --type goal --schedule "13:00 14:00" "Singleless duty" >/dev/null 2>&1
+sf=$(grep -lF 'Singleless duty' "$MEM_DIR"/*.md | head -1)
+SID=$(awk '/^id:/{print $2; exit}' "$sf")
+awk '!/^daily_max: /{print} /^schedule: /{print "daily_max: 2"}' "$sf" > "$sf.t" && mv "$sf.t" "$sf"
+chat send --to slack-C0TESTCHAN1 --key "$SID/$DAY-1300" \
+    "One paper today: 2609.29647 https://arxiv.org/abs/2609.29647" >/dev/null 2>&1
+out=$(signals "$DAY 14:05" | grep -F "Singleless duty")
+has   "a receiptless single leaves the later window open" "$out" "DUE NOW"
+hasnt "a receiptless single is not a pair"                "$out" "2 of 2"
+
+# a send naming no id at all still counts one against the day
+mem add --type goal --schedule "13:00 14:00" "Idless duty" >/dev/null 2>&1
+idf=$(grep -lF 'Idless duty' "$MEM_DIR"/*.md | head -1)
+IID=$(awk '/^id:/{print $2; exit}' "$idf")
+awk '!/^daily_max: /{print} /^schedule: /{print "daily_max: 1"}' "$idf" > "$idf.t" && mv "$idf.t" "$idf"
+chat send --to slack-C0TESTCHAN1 --key "$IID/$DAY-1300" \
+    "A note with no paper id in it at all" >/dev/null 2>&1
+out=$(signals "$DAY 14:05" | grep -F "Idless duty")
+hasnt "an idless send is still worth one" "$out" "DUE NOW"
+has   "an idless send spends a day capped at one" "$out" "the 14:00 window is closed by the day's limit (1 of 1"
+
+# a receipt wins over the message: what the receipt recorded is what counts
+mem add --type goal --schedule "13:00 14:00" "Bothends duty" >/dev/null 2>&1
+bf=$(grep -lF 'Bothends duty' "$MEM_DIR"/*.md | head -1)
+BID=$(awk '/^id:/{print $2; exit}' "$bf")
+awk '!/^daily_max: /{print} /^schedule: /{print "daily_max: 2"}' "$bf" > "$bf.t" && mv "$bf.t" "$bf"
+chat send --to slack-C0TESTCHAN1 --key "$BID/$DAY-1300" \
+    "Three ids in the words: 2609.29647 2609.30199 2609.30210" >/dev/null 2>&1
+printf 'key=%s/%s-1300\nsent=%s\nids=2609.29647\n' "$BID" "$DAY" "$(/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    > "$PAPERS_RECEIPTS_DIR/${BID}_${DAY}-1300.receipt"
+out=$(signals "$DAY 14:05" | grep -F "Bothends duty")
+has   "a receipt wins over the message" "$out" "DUE NOW"
+hasnt "the message is not counted beside the receipt" "$out" "3 of 3"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ $fail -eq 0 ]]
