@@ -228,8 +228,28 @@ if [[ -f "$CACHE" ]] && jq -e '.tests[0].pass == true' "$CACHE" >/dev/null 2>&1;
 else
   bad "quote-style variant of a pinned command still passes" "result=$(jq -c '.tests[0] | {pass, verification}' "$CACHE" 2>/dev/null)"
 fi
-rm -f "$REPO/skills/skill-compiler/.compiled/fixture-greet.json"
 
 echo
+# LITERAL-SOURCE 2026-09-27: the cache records where each expect_contains
+# literal is attested in the skill text, so the strength of every assertion is
+# visible in the cache itself and not only in prose.
+if jq -e '[.tests[] | has("literal_sources")] | all' "$CACHE" >/dev/null 2>&1; then
+  ok "cache records a literal source for every literal"
+else
+  bad "cache records a literal source for every literal"
+fi
+if jq -e '[.tests[].literal_sources[]] | all(.=="SCRIPT-PRINT" or .=="SCRIPT-TEXT" or .=="DOC" or .=="METADATA" or .=="UNATTESTED")' "$CACHE" >/dev/null 2>&1; then
+  ok "literal sources use the documented vocabulary"
+else
+  bad "literal sources use the documented vocabulary"
+fi
+if jq -e '.summary.literal_sources | type=="object"' "$CACHE" >/dev/null 2>&1; then
+  ok "summary carries the literal source distribution"
+else
+  bad "summary carries the literal source distribution"
+fi
+
+rm -f "$REPO/skills/skill-compiler/.compiled/fixture-greet.json"
+
 echo "$pass passed, $fail failed"
 [[ $fail -eq 0 ]]

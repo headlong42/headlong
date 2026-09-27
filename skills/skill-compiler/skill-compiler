@@ -794,6 +794,10 @@ write_cache() {
     local skill_name="$1"
     local results_json="$2"
     local phrase_pool="${3:-[]}"
+    # LITERAL-SOURCE 2026-09-27: the copy of the skill the tests execute, so the
+    # attestation site of every literal is classified against the same text the
+    # tests ran against (SKILLS_DIR copy first, then the kernel copy).
+    local skill_dir="${4:-}"
 
     local total passed
     total=$(printf '%s' "$results_json" | jq 'length')
@@ -821,9 +825,10 @@ write_cache() {
         phrase_pool="$phrase_pool"
         results_json="$results_json"
         json_out="$COMPILED_DIR/${skill_name}.json"
-        export skill_name phrase_pool results_json json_out
+        skill_dir="$skill_dir"
+        export skill_name phrase_pool results_json json_out skill_dir
         python3 - <<'PY'
-import os, json
+import os, json, re, glob
 pool = json.loads(os.environ.get("phrase_pool") or "[]")
 res = json.loads(os.environ["results_json"])
 poolset = set(pool)
@@ -841,6 +846,48 @@ def label_literal(lit, pool, poolset):
         return "POOL-FRAGMENT"
     return "INVENTED"
 
+# LITERAL-SOURCE 2026-09-27: record WHERE each literal is attested in the
+# skill's own text, so the strength of every assertion is visible in the cache
+# itself instead of only in prose. Priority: a line one of the skill's own
+# scripts prints, then other script text, then the metadata frontmatter, then
+# documentation prose, then nowhere (UNATTESTED).
+skill_dir = os.environ.get("skill_dir") or ""
+_SCRIPT_PRINT_RE = re.compile(r"\b(print|echo|printf|append|write|say)\b")
+
+def classify_literal(lit):
+    if not lit or not (skill_dir and os.path.isdir(skill_dir)):
+        return "UNATTESTED"
+    fm = ""
+    sp = os.path.join(skill_dir, "SKILL.md")
+    text = open(sp, errors="replace").read() if os.path.isfile(sp) else ""
+    m = re.match(r"\A---\n(.*?)\n---\n", text, flags=re.S)
+    if m:
+        fm = m.group(1)
+        body = text[m.end():]
+    else:
+        body = text
+    seen_script = False
+    for fn in sorted(glob.glob(os.path.join(skill_dir, "*.py")) + glob.glob(os.path.join(skill_dir, "*.sh"))):
+        if ".bak" in os.path.basename(fn):
+            continue
+        for line in open(fn, errors="replace"):
+            if lit in line:
+                if _SCRIPT_PRINT_RE.search(line):
+                    return "SCRIPT-PRINT"
+                seen_script = True
+    if seen_script:
+        return "SCRIPT-TEXT"
+    # DOC before METADATA: a literal found in the body is documentation prose,
+    # even when the frontmatter happens to carry the same token.
+    if lit in body:
+        return "DOC"
+    if lit in fm:
+        return "METADATA"
+    return "UNATTESTED"
+
+src_counts = {"SCRIPT-PRINT": 0, "SCRIPT-TEXT": 0, "DOC": 0, "METADATA": 0, "UNATTESTED": 0}
+srclines = []
+
 lines = []
 inv = 0
 exact = 0
@@ -848,9 +895,14 @@ frag = 0
 for r in res:
     t = r.get("test") or {}
     labels = {}
+    sources = {}
     for lit in (t.get("expect_contains") or []):
         lab = label_literal(lit, pool, poolset)
+        src = classify_literal(lit)
         labels[lit] = lab
+        sources[lit] = src
+        src_counts[src] = src_counts.get(src, 0) + 1
+        srclines.append("- %s | %s | %s" % (t.get("name", ""), src, lit))
         if lab == "INVENTED":
             inv += 1
         elif lab == "POOL-FRAGMENT":
@@ -859,21 +911,26 @@ for r in res:
             exact += 1
         lines.append("- %s | %s | %s" % (t.get("name", ""), lab, lit))
     r["literal_labels"] = labels
+    r["literal_sources"] = sources
     if not r.get("pass"):
         r["verification"] = "FAIL"
     elif all(lab != "INVENTED" for lab in labels.values()):
         r["verification"] = "VERIFIED"
     else:
         r["verification"] = "GREEN-ON-INVENTED"
-summary = dict(skill=os.environ.get("skill_name", ""), total=len(res), passed=sum(1 for r in res if r.get("pass")), verified=sum(1 for r in res if r.get("verification") == "VERIFIED"), green_on_invented=sum(1 for r in res if r.get("verification") == "GREEN-ON-INVENTED"), fail=sum(1 for r in res if not r.get("pass")), literal_provenance=dict(pool_exact=exact, pool_fragment=frag, invented=inv))
+summary = dict(skill=os.environ.get("skill_name", ""), total=len(res), passed=sum(1 for r in res if r.get("pass")), verified=sum(1 for r in res if r.get("verification") == "VERIFIED"), green_on_invented=sum(1 for r in res if r.get("verification") == "GREEN-ON-INVENTED"), fail=sum(1 for r in res if not r.get("pass")), literal_provenance=dict(pool_exact=exact, pool_fragment=frag, invented=inv), literal_sources=dict(src_counts))
 out = dict(summary=summary, tests=res)
 open(os.environ["json_out"], "w").write(json.dumps(out, indent=2))
 md = "\n## Literal provenance (expect_contains vs the phrase pool)\n\n"
 md += "POOL-EXACT means a whole entry in the pool handed to the teacher. POOL-FRAGMENT means a constant fragment of a pool entry, vocabulary the skill's own output or docs carry. INVENTED means unverified.\n\n"
 md += "\n".join(lines) + "\n"
+md += "\n## Literal sources (where each literal is attested in the skill's own text)\n\n"
+md += "SCRIPT-PRINT = on a line one of the skill's own scripts prints. SCRIPT-TEXT = in a script away from a print line. METADATA = the frontmatter. DOC = documentation prose. UNATTESTED = found nowhere in the skill's own text. Classified against the copy of the skill the tests execute.\n\n"
+md += "\n".join(srclines) + "\n"
 with open(os.environ["json_out"] + ".prov", "w") as fh:
     fh.write(md)
 print("POOL-EXACT %d, POOL-FRAGMENT %d, INVENTED %d" % (exact, frag, inv))
+print("SOURCES SCRIPT-PRINT %d, SCRIPT-TEXT %d, DOC %d, METADATA %d, UNATTESTED %d" % (src_counts["SCRIPT-PRINT"], src_counts["SCRIPT-TEXT"], src_counts["DOC"], src_counts["METADATA"], src_counts["UNATTESTED"]))
 PY
 )
     info "Literal provenance: ${prov_summary}"
@@ -971,7 +1028,7 @@ cmd_compile() {
         i=$((i + 1))
     done
 
-    write_cache "$skill_name" "$all_results" "$phrase_pool"
+    write_cache "$skill_name" "$all_results" "$phrase_pool" "$skill_dir"
 }
 
 # Show the phrase pool a compile hands the teacher (verification surface for
