@@ -333,5 +333,52 @@ out=$(signals "$DAY 14:05" | grep -F "Zero duty")
 has   "an octal-spelled limit holds [08]"     "$out" "the 14:00 window is closed by the day's limit (8 of 8"
 hasnt "an octal-spelled limit is not due [08]" "$out" "DUE NOW"
 
+# ── Part 5f: the schedule line is read loosely, and a window listed twice is
+# one window ────────────────────────────────────────────────────────────────
+# A 2026-09-27 break pass on the day limit found its own sibling field read as
+# canonical only. A trailing comment or a quoted time put a token in front of
+# the arithmetic that errored, a time listed twice counted its receipt twice
+# against the day's limit (two items closed a day capped at four, so the real
+# window never went out), and a time written 9:00 derived a window key its
+# 0900 receipts could never match. Pin that however the line is spelled, each
+# distinct window is counted and reported once.
+mem add --type goal --schedule "13:00 14:00" "Spelling duty" >/dev/null 2>&1
+spf=$(grep -lF 'Spelling duty' "$MEM_DIR"/*.md | head -1)
+SPID=$(awk '/^id:/{print $2; exit}' "$spf")
+spelled() {  # spelled <raw schedule value> <daily_max> [window as written]
+    local v="$1" cap="$2" w="${3:-1300}"
+    awk -v v="$v" -v c="$cap" '!/^schedule: / && !/^daily_max: /{print} /^schedule: /{print "schedule: " v; print "daily_max: " c}' "$spf" > "$spf.t" && mv "$spf.t" "$spf"
+    rm -f "$PAPERS_RECEIPTS_DIR/${SPID}_${DAY}-"*.receipt
+    printf 'key=%s/%s-%s\nsent=%s\nids=%s\n' "$SPID" "$DAY" "$w" \
+        "$(/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" "2609.29647 2609.30199" \
+        > "$PAPERS_RECEIPTS_DIR/${SPID}_${DAY}-${w}.receipt"
+}
+spellcheck() {  # spellcheck <label> <raw schedule value> <daily_max> [window]
+    local label="$1" out n; shift
+    spelled "$@"
+    out=$(signals "$DAY 14:05" | grep -F "Spelling duty")
+    has   "the 14:00 window opens [$label]"   "$out" "DUE NOW"
+    has   "the due key is 14:00 [$label]"     "$out" "key $SPID/${DAY}-1400"
+    hasnt "the count is not doubled [$label]" "$out" "4 of 4"
+    n=$(printf '%s' "$out" | grep -oF "was sent at" | wc -l | tr -d ' ')
+    [[ "$n" == "1" ]] && ok "the morning send is reported once [$label]" || bad "the morning send is reported once [$label]" "$out"
+}
+spellcheck "comment"      '13:00 14:00 # two a day' 4
+spellcheck "quoted"       '"13:00" 14:00' 4
+spellcheck "listed twice" '13:00 13:00 14:00' 4
+spellcheck "garbage word" '13:00 nonsense 14:00' 4
+
+# the same double count against a limit it does reach reads as two items
+spelled '13:00 13:00 14:00' 2
+out=$(signals "$DAY 14:05" | grep -F "Spelling duty")
+has   "a window listed twice counts its items once"     "$out" "the 14:00 window is closed by the day's limit (2 of 2"
+hasnt "a window listed twice does not double the count" "$out" "4 of 4"
+
+# an hour written once is that hour, and its receipt is found under it
+spelled '9:00 14:00' 4 0900
+out=$(signals "$DAY 14:05" | grep -F "Spelling duty")
+has "an hour written once is that hour"        "$out" "the 09:00 window was sent at"
+has "an hour written once leaves 14:00 open"   "$out" "DUE NOW"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ $fail -eq 0 ]]

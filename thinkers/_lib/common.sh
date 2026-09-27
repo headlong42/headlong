@@ -308,13 +308,35 @@ _receipt_ids_count() {
 }
 _schedule_signals() {
     local mem_dir="${1:-$MEM_DIR}" tz="${HEADLONG_TZ:-UTC}" grace="${SCHEDULE_GRACE_MIN:-360}"
-    local f sched gtz until id title day now now_m zone sent t t_m key at due next said skip daily_max used n
+    local f sched gtz until id title day now now_m zone sent t t_m key at due next said skip daily_max used n wins
     printf -- '- Now: %s (%s).\n' "$(TZ="$tz" date +'%A %Y-%m-%d %H:%M %Z')" "$(date -u +'%Y-%m-%d %H:%MZ')"
     [[ -d "$mem_dir" ]] || return 0
     sent=$(chat sent --since 2d -n 500 --json 2>/dev/null | jq -r '.[] | select(.key != null and .state != "failed" and .state != "skipped") | "\(.key) \(.ts[11:16])Z"' 2>/dev/null) || sent=""
     while IFS= read -r f; do
         [[ -n "$f" ]] || continue
         sched=$(_fm "$f" schedule); until=$(_fm "$f" until)
+        # The words of this line are the day's windows, and like the day limit
+        # beside it the read was canonical only. A trailing comment, a quoted
+        # time, or a token that is not a time put garbage in front of the
+        # arithmetic below and errored it; a time listed twice counted its
+        # receipt twice against the day's limit, so two items could close a day
+        # capped at four and the real window never went out; and a time written
+        # 9:00 derived a different window key than the 0900 receipts it was
+        # matched against. Strip the spelling noise, drop anything that is not
+        # HH:MM before it reaches the arithmetic, and keep each distinct time
+        # once: a window is identified by its key, so listing it twice is one
+        # window, counted once and reported once.
+        sched=${sched%%#*}
+        sched=$(printf '%s' "$sched" | tr -d "\"'\r")
+        wins=""
+        for t in $sched; do
+            [[ "$t" =~ ^([0-9]{1,2}):([0-9]{2})$ ]] || continue
+            (( 10#${BASH_REMATCH[1]} <= 23 && 10#${BASH_REMATCH[2]} <= 59 )) || continue
+            t=$(printf '%02d:%s' "$((10#${BASH_REMATCH[1]}))" "${BASH_REMATCH[2]}")
+            case " $wins " in *" $t "*) continue ;; esac
+            wins="$wins $t"
+        done
+        sched="${wins# }"
         if [[ -z "$sched" || ( -n "$until" && "$until" < "$(date -u +%Y-%m-%d)" ) ]]; then continue; fi
         gtz=$(_fm "$f" tz); gtz="${gtz:-$tz}"; id=$(_fm "$f" id); title=$(_fm "$f" summary | cut -c1-60)
         day=$(TZ="$gtz" date +%Y-%m-%d); now=$(TZ="$gtz" date +%H:%M); zone=$(TZ="$gtz" date +%Z)
