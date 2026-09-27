@@ -308,5 +308,30 @@ out=$(signals "$DAY 14:05" | grep -F "Sloppy duty")
 has   "a duplicated field caps at its first value" "$out" "the 14:00 window is closed by the day's limit (2 of 2"
 hasnt "a duplicated field does not leave it due"   "$out" "DUE NOW"
 
+# ── Part 5e: a limit written with a leading zero is still that number ──
+# Bash arithmetic reads a bare 08 or 09 as octal, errors "value too great for
+# base", and the day's limit comparison then never holds, so a goal written
+# daily_max: 08 had its cap silently OFF. Pin that a leading-zero spelling of
+# the count still closes the later window once the day's items are sent.
+mem add --type goal --schedule "13:00 14:00" "Zero duty" >/dev/null 2>&1
+zf=$(grep -lF 'Zero duty' "$MEM_DIR"/*.md | head -1)
+ZID=$(awk '/^id:/{print $2; exit}' "$zf")
+zerocap() {  # zerocap <raw daily_max> <ids...>
+    local cap="$1"; shift
+    awk -v v="$cap" '!/^daily_max: /{print} /^schedule: /{print "daily_max: " v}' "$zf" > "$zf.t" && mv "$zf.t" "$zf"
+    rm -f "$PAPERS_RECEIPTS_DIR/${ZID}_${DAY}-"*.receipt
+    printf 'key=%s/%s-1300\nsent=%s\nids=%s\n' "$ZID" "$DAY" \
+        "$(/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" \
+        > "$PAPERS_RECEIPTS_DIR/${ZID}_${DAY}-1300.receipt"
+}
+zerocap '02' '2609.29647 2609.30199'
+out=$(signals "$DAY 14:05" | grep -F "Zero duty")
+has   "a leading-zero limit holds [02]"      "$out" "the 14:00 window is closed by the day's limit (2 of 2"
+hasnt "a leading-zero limit is not due [02]"  "$out" "DUE NOW"
+zerocap '08' '1 2 3 4 5 6 7 8'
+out=$(signals "$DAY 14:05" | grep -F "Zero duty")
+has   "an octal-spelled limit holds [08]"     "$out" "the 14:00 window is closed by the day's limit (8 of 8"
+hasnt "an octal-spelled limit is not due [08]" "$out" "DUE NOW"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ $fail -eq 0 ]]

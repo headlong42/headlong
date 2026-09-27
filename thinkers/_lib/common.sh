@@ -342,6 +342,9 @@ _schedule_signals() {
         daily_max=${daily_max%%#*}
         daily_max=$(printf '%s' "$daily_max" | tr -d "\"' \t\r")
         [[ "$daily_max" =~ ^[0-9]+$ ]] || daily_max=""
+        # 08 and 09 fail the numeric check below if read as octal, which
+        # would silently turn the day limit off. Read the limit as decimal.
+        [[ -n "$daily_max" ]] && daily_max=$((10#$daily_max))
         if [[ -n "$daily_max" ]]; then
             for t in $sched; do
                 key="$id/$day-${t/:/}"
