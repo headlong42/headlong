@@ -16,7 +16,6 @@ set -euo pipefail
 # working few-shots as a compiled adjunct.
 
 SCRIPT_DIR="$(cd "$(dirname "$(realpath "$0")")" && pwd)"
-SKILL_NAME="skill-compiler"
 COMPILED_DIR="$SCRIPT_DIR/.compiled"
 if [[ -z "${SKILLS_DIR:-}" ]]; then
     for _sc_cand in "$SCRIPT_DIR/.." "${HOME:-/tmp}/.skills"; do
@@ -723,7 +722,6 @@ write_cache() {
     # the teacher was handed. An INVENTED literal can match because the test
     # prompt forced the phrase into the output, so it proves nothing about the
     # tool's own vocabulary and must not ride on a pass.
-    local pool_json="${phrase_pool:-[]}"
     # FRAGMENT-ATTEST 2026-09-27: verified used to be recomputed here with a
     # second, stricter rule (whole-pool membership only), which disagreed with
     # the literal labeler below and undercounted fragment-attested passes. One
@@ -736,7 +734,13 @@ write_cache() {
     # phrase pool the teacher was actually handed. POOL-EXACT = verbatim in the
     # pool; INVENTED = unverified vocabulary the pool never guaranteed.
     local prov_summary
-    prov_summary=$(skill_name="$skill_name" phrase_pool="$phrase_pool" results_json="$results_json" json_out="$COMPILED_DIR/${skill_name}.json" python3 - <<'PY'
+    prov_summary=$(
+        skill_name="$skill_name"
+        phrase_pool="$phrase_pool"
+        results_json="$results_json"
+        json_out="$COMPILED_DIR/${skill_name}.json"
+        export skill_name phrase_pool results_json json_out
+        python3 - <<'PY'
 import os, json
 pool = json.loads(os.environ.get("phrase_pool") or "[]")
 res = json.loads(os.environ["results_json"])
@@ -800,12 +804,11 @@ PY
         printf '## Summary: %d / %d passed, %d / %d verified (a pass counts as verified only on pool-attested literals)\n\n' "$passed" "$total" "$verified" "$total"
         local i=0
         while [[ $i -lt $total ]]; do
-            local r name p lt lc f
+            local r name p lt f
             r=$(printf '%s' "$results_json" | jq -c ".[$i]")
             name=$(printf '%s' "$r" | jq -r '.test.name')
             p=$(printf '%s' "$r" | jq -r '.pass')
             lt=$(printf '%s' "$r" | jq -r '.last_step_type')
-            lc=$(printf '%s' "$r" | jq -r '.last_step_content')
             f=$(printf '%s' "$r" | jq -r '.final')
             if [[ "$p" == "true" ]]; then
                 printf '### %s: ✓ PASS\n\n' "$name"
