@@ -116,6 +116,7 @@ cmd_send() {
 To message someone else: chat reply <their-name> <message>
 To keep a note for yourself, append a thought step instead of a message."
 
+    [[ -z "$key" ]] || _refuse_skipped_key "$key"
     [[ "$force" -eq 1 || -z "$key" ]] || _refuse_key "$key"
     # The repeat check guards the identity's OWN sends. A message a person
     # sends in (a bridge delivering "great" for the second time today) is
@@ -805,6 +806,36 @@ cmd_sent() {
                      + (if .key then " [\(.key)]" else "" end)
                      + "  " + ((.filename // .content // "") | gsub("\n"; " ") | if length > 80 then .[0:80] + "…" else . end)
           end' -R < "$idx"
+}
+
+# _refuse_skipped_key <key>: die if papers-skip marked this window deliberately
+# skipped. The paper tools refuse such a window through papers-receipt, but
+# `chat send --key` is the exact command a scheduled window's DUE NOW line
+# prescribes and it never consulted the receipts dir, so on 2026-09-27 a
+# deliberately skipped window sent from here while every paper tool refused
+# it (scratch/skip-chat-hole-2026-09-27). The record name folds '/' to '_'
+# and its writer refuses non-canonical keys since that date, so a record only
+# exists under the canonical spelling: check the key as given, its
+# slash-collapsed spelling, and the two-component id/window form that every
+# alias of a window-shaped key folds near. Unconditional -- a skip is a
+# deliberate do-not-send, so --force does not get past it.
+_refuse_skipped_key() {
+    local key="$1" here dir name c
+    [[ -n "$key" ]] || return 0
+    here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    dir="${PAPERS_RECEIPTS_DIR:-${PAPERS_RECEIPTS:-$here/../notes/daily-papers/sent-receipts}}"
+    [[ -d "$dir" ]] || return 0
+    local -a cands=("$key")
+    c=$(printf '%s' "$key" | tr -s '/' | sed 's|^/||; s|/$||')
+    [[ "$c" == "$key" ]] || cands+=("$c")
+    if [[ "$key" == */[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-[0-9][0-9][0-9][0-9] ]]; then
+        cands+=("${key%%/*}/${key##*/}")
+    fi
+    for name in "${cands[@]}"; do
+        if [[ -e "$dir/$(printf '%s' "$name" | tr '/' '_').skip" ]]; then
+            die "refusing to send: '$name' was deliberately skipped (record $(printf '%s' "$name" | tr '/' '_').skip in $dir). That window is off on purpose; do not send it. Delete the .skip record if the skip is over."
+        fi
+    done
 }
 
 # _refuse_key <key>: die if a send with this key already went out and did not
