@@ -330,6 +330,17 @@ _schedule_signals() {
         # already spent the two-a-day limit and this loop kept demanding the
         # evening post until its skip record was written by hand.
         daily_max=$(_fm "$f" daily_max); used=0
+        # The day's limit means the same thing however the field is spelled:
+        # 2, "2", 2 with a trailing space, and 2 # two a day all cap the day at
+        # two. _fm returns the raw value on the line, so this read normalizes
+        # it before deciding the limit exists. The normalization lives here and
+        # not in _fm so the change stays on the one field the limit is decided
+        # on; a field written twice is read from its first line, and a value that is
+        # still not a plain count leaves the limit off,
+        # which is the safe reading.
+        daily_max=${daily_max%%$'\n'*}
+        daily_max=${daily_max%%#*}
+        daily_max=$(printf '%s' "$daily_max" | tr -d "\"' \t\r")
         [[ "$daily_max" =~ ^[0-9]+$ ]] || daily_max=""
         if [[ -n "$daily_max" ]]; then
             for t in $sched; do

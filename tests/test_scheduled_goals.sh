@@ -275,5 +275,38 @@ out=$(signals "$DAY 13:05" | grep -F "Open duty")
 has   "no field, the morning receipt is reported" "$out" "the 13:00 window was sent at"
 hasnt "no field, the next window is not closed"   "$out" "closed by the day's limit"
 
+# ── Part 5c: a day limit written in any ordinary spelling is still a limit ──
+# A 2026-09-27 break pass found the day limit read as canonical only: a daily_max
+# with a trailing space, an inline comment, or quotes around the value all failed
+# the numeric check and silently turned the limit OFF, so a hand-edited goal
+# could drop its own cap and nothing would notice. Pin that the ordinary
+# spellings of the same count all keep the spent window closed.
+mem add --type goal --schedule "13:00 14:00" "Sloppy duty" >/dev/null 2>&1
+sf=$(grep -lF 'Sloppy duty' "$MEM_DIR"/*.md | head -1)
+SLOPID=$(awk '/^id:/{print $2; exit}' "$sf")
+sloppycap() {  # sloppycap <raw daily_max value>
+    awk -v v="$1" '!/^daily_max: /{print} /^schedule: /{print "daily_max: " v}' "$sf" > "$sf.t" && mv "$sf.t" "$sf"
+    rm -f "$PAPERS_RECEIPTS_DIR/${SLOPID}_${DAY}-"*.receipt
+    printf 'key=%s/%s-1300\nsent=%s\nids=%s\n' "$SLOPID" "$DAY" \
+        "$(/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" "2609.29647 2609.30199" \
+        > "$PAPERS_RECEIPTS_DIR/${SLOPID}_${DAY}-1300.receipt"
+}
+for spelling in '2' '2 ' '2 # two a day' '"2"' "'2'"; do
+    sloppycap "$spelling"
+    out=$(signals "$DAY 14:05" | grep -F "Sloppy duty")
+    has   "limit holds for [$spelling]"   "$out" "the 14:00 window is closed by the day's limit (2 of 2"
+    hasnt "no due window for [$spelling]" "$out" "DUE NOW"
+done
+
+# a field written twice does not turn the limit off: the first value decides
+awk '!/^daily_max: /{print} /^schedule: /{print "daily_max: 2"; print "daily_max: 5"}' "$sf" > "$sf.t" && mv "$sf.t" "$sf"
+rm -f "$PAPERS_RECEIPTS_DIR/${SLOPID}_${DAY}-"*.receipt
+printf 'key=%s/%s-1300\nsent=%s\nids=%s\n' "$SLOPID" "$DAY" \
+    "$(/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" "2609.29647 2609.30199" \
+    > "$PAPERS_RECEIPTS_DIR/${SLOPID}_${DAY}-1300.receipt"
+out=$(signals "$DAY 14:05" | grep -F "Sloppy duty")
+has   "a duplicated field caps at its first value" "$out" "the 14:00 window is closed by the day's limit (2 of 2"
+hasnt "a duplicated field does not leave it due"   "$out" "DUE NOW"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ $fail -eq 0 ]]
