@@ -270,9 +270,19 @@ for block in re.findall(r"```[A-Za-z0-9_-]*\n(.*?)```", text, flags=re.S):
         for seg in re.split(r"[:;,|]", line):
             emit(seg.strip(" .*'"))
 body = re.sub(r"```.*?```", " ", text, flags=re.S)
-for m in re.finditer(r"`([^`\n]{4,200})`", body):
+for m in re.finditer(r"`([^`\n]{1,})`", body):
     emit(m.group(1))
-for m in re.finditer(r'"([^"\n]{4,200})"', body):
+for m in re.finditer(r'"([^"\n]{1,})"', body):
+    emit(m.group(1))
+# PHRASE-POOL v3.2 2026-09-27: span misalignment. The backtick and quote span
+# regexes required 4+ chars, so a short span (shellm's `mem`) made the matcher
+# start at its CLOSING delimiter and swallow the rest of the line up to the next
+# one, gluing unrelated text and dropping every later span on that line (shellm's
+# 'mem add --type TYPE <text>' never entered the pool -> INVENTED label). Take
+# every span and let emit() apply the length floor to each span separately.
+# Also harvest parenthetical doc phrases: pre-draft-check documents its recipient
+# argument as '(substring match)', vocabulary the harvest missed entirely.
+for m in re.finditer(r"\(([^)\n]{4,200})\)", body):
     emit(m.group(1))
 seen = set()
 uniq = []
