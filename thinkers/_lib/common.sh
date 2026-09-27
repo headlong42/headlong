@@ -295,9 +295,20 @@ _receipt_skip_reason() {
     why=$(awk -F= '/^reason=/{print substr($0,8); exit}' "$s")
     printf '%s' "${why:-no reason given}"
 }
+# How many items a completed receipt presented: the words on its ids= line.
+# A goal's day limit (daily_max in its frontmatter) counts these, and a keyed
+# send with no receipt at all counts one. Prints 0 when there is no receipt.
+_receipt_ids_count() {
+    local key="$1" dir r
+    dir=$(_receipts_dir)
+    [[ -n "$dir" ]] || return 0
+    r="$dir/$(printf %s "$key" | tr / _).receipt"
+    [[ -f "$r" ]] || return 0
+    awk '/^ids=/{sub(/^ids=/, ""); print NF; exit}' "$r"
+}
 _schedule_signals() {
     local mem_dir="${1:-$MEM_DIR}" tz="${HEADLONG_TZ:-UTC}" grace="${SCHEDULE_GRACE_MIN:-360}"
-    local f sched gtz until id title day now now_m zone sent t t_m key at due next said skip
+    local f sched gtz until id title day now now_m zone sent t t_m key at due next said skip daily_max used n
     printf -- '- Now: %s (%s).\n' "$(TZ="$tz" date +'%A %Y-%m-%d %H:%M %Z')" "$(date -u +'%Y-%m-%d %H:%MZ')"
     [[ -d "$mem_dir" ]] || return 0
     sent=$(chat sent --since 2d -n 500 --json 2>/dev/null | jq -r '.[] | select(.key != null and .state != "failed" and .state != "skipped") | "\(.key) \(.ts[11:16])Z"' 2>/dev/null) || sent=""
@@ -308,6 +319,29 @@ _schedule_signals() {
         gtz=$(_fm "$f" tz); gtz="${gtz:-$tz}"; id=$(_fm "$f" id); title=$(_fm "$f" summary | cut -c1-60)
         day=$(TZ="$gtz" date +%Y-%m-%d); now=$(TZ="$gtz" date +%H:%M); zone=$(TZ="$gtz" date +%Z)
         now_m=$(( 10#${now%:*} * 60 + 10#${now#*:} )); due=""; next=""; said=""
+        # A goal may cap what goes out per day (daily_max: N in its
+        # frontmatter). The cap counts items, not sends: a completed receipt
+        # counts one item per id on its ids= line, a keyed send with no
+        # receipt counts one. Counted before the window loop, so the limit is
+        # about the whole day whatever order the windows are listed in. A
+        # window the day's limit has closed is neither due nor missed: nothing
+        # failed and nothing is owed once the cap is spent. That is the
+        # 2026-09-26 evening papers phantom, where the morning pair had
+        # already spent the two-a-day limit and this loop kept demanding the
+        # evening post until its skip record was written by hand.
+        daily_max=$(_fm "$f" daily_max); used=0
+        [[ "$daily_max" =~ ^[0-9]+$ ]] || daily_max=""
+        if [[ -n "$daily_max" ]]; then
+            for t in $sched; do
+                key="$id/$day-${t/:/}"
+                at=$(printf '%s\n' "$sent" | awk -v k="$key" '$1==k{v=$2} END{print v}')
+                [[ -n "$at" ]] || at=$(_receipt_sent "$key")
+                if [[ -z "$at" ]]; then continue; fi
+                n=$(_receipt_ids_count "$key"); n=${n:-0}
+                if (( n < 1 )); then n=1; fi
+                used=$(( used + n ))
+            done
+        fi
         for t in $sched; do
             t_m=$(( 10#${t%:*} * 60 + 10#${t#*:} )); key="$id/$day-${t/:/}"
             at=$(printf '%s\n' "$sent" | awk -v k="$key" '$1==k{v=$2} END{print v}')
@@ -319,6 +353,13 @@ _schedule_signals() {
             if [[ -z "$at" ]]; then skip=$(_receipt_skip_reason "$key"); fi
             if [[ -n "$skip" ]]; then
                 said="${said}the $t window was skipped on purpose: ${skip:0:80}; "
+                continue
+            fi
+            # The day's limit closes a window before the due and the missed
+            # arithmetic, and only when nothing claims the window: a real send
+            # is always reported first.
+            if [[ -z "$at" && -n "$daily_max" ]] && (( used >= daily_max )); then
+                said="${said}the $t window is closed by the day's limit ($used of $daily_max items already sent); "
                 continue
             fi
             if (( t_m > now_m )); then

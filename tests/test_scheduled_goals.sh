@@ -190,5 +190,64 @@ out=$(signals "$DAY 12:06" | grep -F "Skip duty")
 has   "a receipt wins over a skip"      "$out" "the 12:00 window was sent at"
 hasnt "a receipt is not called skipped" "$out" "the 12:00 window was skipped"
 
+
+# ── Part 5: a goal's day limit (daily_max), the spent-cap phantom ───────────
+# When the day's items already reach a goal's daily_max, later windows of that
+# day are closed by the limit instead of raising DUE NOW and then reading as
+# missed: the 2026-09-26 evening papers phantom, where the morning pair had
+# already spent the two-a-day limit and the scheduler kept demanding the
+# evening post until its skip record was written by hand. A receipt counts one
+# item per id on its ids= line, a keyed send with no receipt counts one, and a
+# real send still wins over the limit.
+unset SCHEDULE_GRACE_MIN 2>/dev/null
+export PAPERS_RECEIPTS_DIR="$WORK/receipts"
+mkdir -p "$PAPERS_RECEIPTS_DIR"
+mem add --type goal --schedule "13:00 14:00" "Cap duty" >/dev/null 2>&1
+cf=$(grep -lF 'Cap duty' "$MEM_DIR"/*.md | head -1)
+CAPID=$(awk '/^id:/{print $2; exit}' "$cf")
+awk '{print} /^schedule: /{print "daily_max: 2"}' "$cf" > "$cf.t" && mv "$cf.t" "$cf"
+grep -q '^daily_max: 2$' "$cf" && ok "cap test goal carries daily_max" || bad "cap test goal carries daily_max" "$(head -10 "$cf")"
+
+capreceipt() {  # capreceipt <HHMM> <ids...>
+    printf 'key=%s/%s-%s\nsent=%s\nids=%s\n' "$CAPID" "$DAY" "$1" \
+        "$(/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" \
+        > "$PAPERS_RECEIPTS_DIR/${CAPID}_${DAY}-$1.receipt"
+}
+
+# the morning window presented two items and the limit is two: inside grace
+# the evening window is not due, and past grace it is not read as missed
+capreceipt 1300 "2609.29647 2609.30199"
+out=$(signals "$DAY 14:05" | grep -F "Cap duty")
+hasnt "a spent day limit does not raise a window" "$out" "DUE NOW"
+has   "a spent day limit says why"                "$out" "the 14:00 window is closed by the day's limit (2 of 2"
+out=$(SCHEDULE_GRACE_MIN=20 signals "$DAY 14:55" | grep -F "Cap duty")
+hasnt "a spent day limit is not a miss"           "$out" "was missed"
+hasnt "a spent day limit stays closed past grace" "$out" "DUE NOW"
+
+# before the closed window opens, the limit keeps it off the next line too
+out=$(signals "$DAY 13:05" | grep -F "Cap duty")
+has   "the limit names the closed window"   "$out" "the 14:00 window is closed by the day's limit"
+hasnt "a closed window is not the next one" "$out" "next window 14:00"
+has   "with the day spent the next is tomorrow" "$out" "next window tomorrow at 13:00"
+
+# one item leaves the day's second window open
+capreceipt 1300 "2609.29647"
+out=$(signals "$DAY 14:05" | grep -F "Cap duty")
+has "under the limit the later window is due" "$out" "DUE NOW"
+has "under the limit the window key is given" "$out" "--key $CAPID/$DAY-1400"
+
+# a keyed send with no receipt counts one item against the limit
+rm -f "$PAPERS_RECEIPTS_DIR/${CAPID}_${DAY}-1300.receipt"
+chat send --to slack-C0TESTCHAN1 --key "$CAPID/$DAY-1300" "one item, no receipt" >/dev/null 2>&1
+out=$(signals "$DAY 14:05" | grep -F "Cap duty")
+has "a receiptless send is still a send"    "$out" "the 13:00 window was sent at"
+has "one item of two keeps the window open" "$out" "DUE NOW"
+
+# a real send is reported even when the day's limit is spent
+capreceipt 1400 "2609.30210"
+out=$(signals "$DAY 14:06" | grep -F "Cap duty")
+has   "a send wins over the day's limit"   "$out" "the 14:00 window was sent at"
+hasnt "a sent window is not called closed" "$out" "the 14:00 window is closed"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ $fail -eq 0 ]]
