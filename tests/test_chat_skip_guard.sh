@@ -76,6 +76,21 @@ expect_refusal "skip holds even with --force" "breaktest/2026-09-26-1800" "probe
 expect_send   "a window with no skip record sends" "breaktest/2026-09-26-1900" "normal one"
 expect_send   "a non-window duty key sends" "1ab0deb4/polostan-history-2026-09-26" "normal two"
 
+# Aliases the first fix missed (break pass 2026-09-27): a prefix, a dot
+# prefix, a suffix, an id in the other case and a trailing space all carried
+# the skipped window past the guard, and so did an unpadded window.
+expect_refusal "prefix alias of the skipped window" "x/breaktest/2026-09-26-1800" "probe A"
+expect_refusal "dot-prefix alias of the skipped window" "./breaktest/2026-09-26-1800" "probe B"
+expect_refusal "suffix alias of the skipped window" "breaktest/2026-09-26-1800/x" "probe C"
+expect_refusal "case alias of the skipped window" "BREAKTEST/2026-09-26-1800" "probe D"
+expect_refusal "trailing-space alias of the skipped window" "breaktest/2026-09-26-1800 " "probe E"
+expect_refusal "unpadded window alias of the skipped window" "breaktest/2026-9-6-1800" "probe F"
+expect_send   "a duty key that only looks windowish still sends" "1ab0deb4/notes-2026-9-6-1800" "normal three"
+
+# A skip record written in the other case still refuses the lowercase key.
+printf 'key=BREAKTEST2/2026-09-26-2200\n' > "$PAPERS_RECEIPTS_DIR/BREAKTEST2_2026-09-26-2200.skip"
+expect_refusal "a skip record in the other case refuses the lowercase key" "breaktest2/2026-09-26-2200" "probe G"
+
 # The older PAPERS_RECEIPTS spelling is honored too (same rule as papers-receipt).
 unset PAPERS_RECEIPTS_DIR
 export PAPERS_RECEIPTS="$WORK/receipts2"
