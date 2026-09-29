@@ -126,3 +126,14 @@ def test_non_string_content_is_decode_error():
     assert payload["content"] is None
     assert payload["decode_error"] is True
 
+
+def test_nul_bytes_roundtrip():
+    import base64
+    # Test file with NUL bytes and newlines
+    data = b"a\x00b\nc\rd"
+    payload = file_payload({
+        "filename": "nul.bin",
+        "content_b64": base64.b64encode(data).decode("ascii"),
+    })
+    assert payload is not None
+    assert payload["content"] == data
