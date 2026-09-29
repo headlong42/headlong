@@ -43,6 +43,12 @@ How it connects. The bridge holds two long-lived Slack tokens and opens
 an outbound Socket Mode websocket. The tokens live in the box's root
 `.env`, which comes from an SSM parameter and survives rebuilds.
 
+File delivery. The bridge uploads files sent via `chat send-file` using
+Slack's `files_upload_v2` API. The upload goes through the bridge's bot
+token; the agent's trajectory carries only the base64-encoded bytes and
+filename. A file size limit (`CHAT_SEND_FILE_MAX_BYTES`, default 10MB)
+protects the trajectory from bloat and the bridge from OOM.
+
 Known gaps. The root `.env` is readable by the `shellm` user, which is
 the user the agent runs as, so an injected agent can read the Slack
 tokens and post as the bot anywhere the bot is installed. The Telegram
@@ -90,6 +96,13 @@ to, because the allowlist cannot control who is in a group. Inbound
 media is dropped, so nothing gets downloaded onto the box. Outbound
 file steps (`chat send-file`) are uploaded as Telegram documents or
 photos; that is agent-to-user, not a download path.
+
+File delivery. The bridge uploads files sent via `chat send-file` as
+Telegram documents (or photos for PNG/JPEG). The upload goes through
+the bridge's bot token; the agent's trajectory carries only the
+base64-encoded bytes and filename. A file size limit
+(`CHAT_SEND_FILE_MAX_BYTES`, default 10MB) protects the trajectory
+from bloat and the bridge from OOM.
 
 How it connects. The bridge long polls the Telegram API outbound. The
 bot token lives in `/etc/shellm/telegram.env`, which is root owned with
