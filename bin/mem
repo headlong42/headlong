@@ -137,7 +137,10 @@ mem_redact() {
         -e 's/gh[pousr]_[A-Za-z0-9]{20,}/<redacted:github-token>/g' \
         -e 's/github_pat_[A-Za-z0-9_]{20,}/<redacted:github-token>/g' \
         -e 's/xox[a-z]-[A-Za-z0-9_.-]{10,}/<redacted:slack-token>/g' \
-        -e 's/sk-[A-Za-z0-9_.=-]{20,}/<redacted:api-key>/g' \
+        -e 's/(^|[^A-Za-z0-9])sk-[A-Za-z0-9_.=-]{20,}/\1<redacted:api-key>/g' \
+        -e 's/(^|[^0-9])[0-9]{4}([ -][0-9]{4}){2,3}([^0-9]|$)/\1<redacted:card>\3/g' \
+        -e 's/(^|[^0-9A-Za-z])[0-9]{15,16}([^0-9]|$)/\1<redacted:card>\2/g' \
+        -e 's/(^|[^0-9A-Za-z])(card|pan|credit|debit|amex|visa|mastercard)[^A-Za-z0-9]{0,8}(the |is |was )?[0-9][0-9 -]{11,27}[0-9]/\1\2 <redacted:card>/Ig' \
         -e 's/hf_[A-Za-z0-9]{20,}/<redacted:hf-token>/g' \
         -e 's/AIza[A-Za-z0-9_-]{30,}/<redacted:google-key>/g' \
         -e 's/(AKIA|ASIA)[A-Z0-9]{16}/<redacted:aws-key>/g' \
