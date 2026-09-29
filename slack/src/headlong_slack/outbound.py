@@ -9,6 +9,7 @@ match — no echo loop.
 from __future__ import annotations
 
 import logging
+import io
 import threading
 import time
 from typing import Any
@@ -17,6 +18,7 @@ from . import mindlog, naming
 from .config import Config
 from .slackfmt import chunk, strip_leaked_command, to_mrkdwn
 from .state import ActiveThreads
+from .filepayload import file_payload
 
 log = logging.getLogger(__name__)
 
@@ -67,10 +69,50 @@ def run(
                 step.get("source"),
             )
             continue
+
         to = step.get("to")
         if not naming.is_slack_name(to):
             continue
         conv = naming.decode(to)
+
+        payload = file_payload(step)
+        if payload is not None:
+            # File steps travel in content_b64 and often have empty `content`.
+            # Do not require text, and do not fall back to posting bytes as a message.
+            name = payload["filename"]
+            data = payload["content"]
+            caption = payload.get("caption")
+            sent_file = False
+            if payload.get("decode_error") or data is None:
+                log.error("undecodable file payload for %s (%s)", to, name)
+            else:
+                try:
+                    # Slack files_upload_v2 accepts bytes or file-like object
+                    client.files_upload_v2(
+                        channel=conv.channel,
+                        thread_ts=conv.thread_ts,
+                        file=io.BytesIO(data),
+                        filename=name,
+                        initial_comment=caption,
+                    )
+                    sent_file = True
+                except Exception:
+                    log.exception("files_upload_v2 failed for %s", to)
+            if not sent_file:
+                # Cursor already advanced past this step; tell the user
+                # the upload was lost rather than failing silently.
+                notice = f"(failed to deliver file {name})"
+                try:
+                    client.chat_postMessage(
+                        channel=conv.channel,
+                        thread_ts=conv.thread_ts,
+                        text=notice,
+                        unfurl_links=False,
+                    )
+                except Exception:
+                    log.exception("delivery-failed notice also failed for %s", to)
+            continue
+
         text = to_mrkdwn(strip_leaked_command(str(step.get("content") or ""))).strip()
         if not text:
             continue
