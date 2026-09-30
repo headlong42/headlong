@@ -141,6 +141,21 @@ has   "no window left today: tomorrow" "$out" "next window tomorrow at 09:00 PDT
 mem add --type goal --schedule "06:00 07:00" "Second duty" >/dev/null 2>&1
 out=$(signals "$DAY 07:30" | grep -F "Second duty")
 has   "two open windows: the later is due"   "$out" "-0700"
+# a window closed without a post (SCHEDULE_CLOSED_KEYS manifest) is done
+mem add --type goal --schedule "12:00" "Closed duty" >/dev/null 2>&1
+cf=$(grep -l '^summary: Closed duty$' "$MEM_DIR"/*.md | head -1)
+CID=$(awk '/^id:/{print $2; exit}' "$cf")
+[[ -n "$CID" && "$CID" != "$GID" ]] || { echo "FAIL could not pin Closed duty's own id"; exit 1; }
+out=$(signals "$DAY 12:30" | grep -F "Closed duty")
+has "closed-keys: an unlisted key is still due" "$out" "DUE NOW"
+printf '%s/%s-1200\n' "$CID" "$DAY" > "$WORK/closed.keys"
+out=$(SCHEDULE_CLOSED_KEYS="$WORK/closed.keys" signals "$DAY 12:30" | grep -F "Closed duty")
+hasnt "closed-keys: a listed key is not due" "$out" "DUE NOW"
+has   "closed-keys: says closed, not sent"   "$out" "the 12:00 window was closed without a post"
+hasnt "closed-keys: never claims a send"     "$out" "was sent at"
+out=$(SCHEDULE_CLOSED_KEYS="$WORK/no-such-file.keys" signals "$DAY 12:30" | grep -F "Closed duty")
+has  "closed-keys: a missing manifest is harmless" "$out" "DUE NOW"
+
 hasnt "two open windows: the earlier is not" "$out" "-0600"
 
 # an expired goal is skipped
