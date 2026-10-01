@@ -360,11 +360,11 @@ synthesize_tests() {
 
 
 
-    # Build prompt using a heredoc with proper escaping
+    # Build the teacher prompt from a quoted heredoc. Portable form: bash 3.2 mis-lexes
+    # `read -r -d '' var <<'EOF'` (the empty -d word defeats here-doc recognition) and
+    # then parses the heredoc body as code, so use command substitution + cat instead.
     local prompt
-    # Build prompt using a heredoc with proper escaping
-    local prompt
-    IFS= read -r -d '' prompt <<'PROMPT_EOF'
+    prompt=$(cat <<'PROMPT_EOF'
 You are a skill compiler for the Headlong agent framework. A skill is a markdown file with YAML frontmatter that defines a capability for an LLM-in-bash agent.
 
 IMPORTANT: In Headlong, skills are NOT CLI commands. They are procedural documentation (SKILL.md files) that the agent reads on demand via `skills show <name>`. When a skill is relevant, the agent loads it and follows its guidance.
@@ -445,6 +445,7 @@ Return ONLY a JSON array of test case objects. No markdown, no explanation.
 Skill specification: __SKILL_SPEC__
 Number of tests to generate: __NUM_TESTS__
 PROMPT_EOF
+)
     prompt=${prompt//__PHRASE_POOL__/$phrase_pool}
 
     # Replace placeholders
