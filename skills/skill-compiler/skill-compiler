@@ -198,7 +198,7 @@ for fn in sorted(files):
     for line in open(fn, errors="replace"):
         if not re.search(r"\b(print|echo|printf|append|write|say)\b", line):
             continue
-        for m in re.finditer(r'"([^"]*)"|\'([^\']*)\'', line):
+        for m in re.finditer(r'"([^"]*)"|\x27([^\x27]*)\x27', line):
             lit = m.group(1) if m.group(1) is not None else m.group(2)
             if not lit:
                 continue
@@ -208,7 +208,7 @@ for fn in sorted(files):
             lit = lit.replace("\\n", " ")
             emit(lit)
             for seg in re.split(r"[:;,|]|—", lit):
-                emit(seg.strip(" .·✓✗⚠ℹ→*\"'`"))
+                emit(seg.strip(" .·✓✗⚠ℹ→*\"'\x60"))
 seen = set()
 uniq = []
 for s in out:
@@ -270,7 +270,7 @@ _fm = _m.group(1) if _m else ""
 if _m:
     text = text[_m.end():]
 def emit_meta(s):
-    s = s.strip(" []{}\"'`,;")
+    s = s.strip(" []{}\"'\x60,;")
     if PLACEHOLDER_SCAFFOLD_RE.search(s):
         return
     if len(s) < 2 or not re.search(r"[A-Za-z]", s):
@@ -288,7 +288,7 @@ for _line in _fm.splitlines():
         emit_meta(_tok.strip(" :"))
 
 text = re.sub(r"\A---\n.*?\n---\n", " ", text, count=1, flags=re.S)
-for block in re.findall(r"```[A-Za-z0-9_-]*\n(.*?)```", text, flags=re.S):
+for block in re.findall(r"\x60\x60\x60[A-Za-z0-9_-]*\n(.*?)\x60\x60\x60", text, flags=re.S):
     for line in block.splitlines():
         line = line.strip()
         if not line or line.startswith("$") or line.startswith("#"):
@@ -296,13 +296,13 @@ for block in re.findall(r"```[A-Za-z0-9_-]*\n(.*?)```", text, flags=re.S):
         emit(line)
         for seg in re.split(r"[:;,|]", line):
             emit(seg.strip(" .*'"))
-body = re.sub(r"```.*?```", " ", text, flags=re.S)
-for m in re.finditer(r"`([^`\n]{1,})`", body):
+body = re.sub(r"\x60\x60\x60.*?\x60\x60\x60", " ", text, flags=re.S)
+for m in re.finditer("\x60([^\x60\n]{1,})\x60", body):
     emit(m.group(1))
 for m in re.finditer(r'"([^"\n]{1,})"', body):
     emit(m.group(1))
 # PHRASE-POOL v3.2 2026-09-27: span misalignment. The backtick and quote span
-# regexes required 4+ chars, so a short span (shellm's `mem`) made the matcher
+# regexes required 4+ chars, so a short span (shellm's \x60mem\x60) made the matcher
 # start at its CLOSING delimiter and swallow the rest of the line up to the next
 # one, gluing unrelated text and dropping every later span on that line (shellm's
 # 'mem add --type TYPE <text>' never entered the pool -> INVENTED label). Take
@@ -361,13 +361,13 @@ synthesize_tests() {
 
 
     # Build the teacher prompt from a quoted heredoc. Portable form: bash 3.2 mis-lexes
-    # `read -r -d '' var <<'EOF'` (the empty -d word defeats here-doc recognition) and
+    # read -r -d '' var <<'EOF' (the empty -d word defeats here-doc recognition) and
     # then parses the heredoc body as code, so use command substitution + cat instead.
     local prompt
     prompt=$(cat <<'PROMPT_EOF'
 You are a skill compiler for the Headlong agent framework. A skill is a markdown file with YAML frontmatter that defines a capability for an LLM-in-bash agent.
 
-IMPORTANT: In Headlong, skills are NOT CLI commands. They are procedural documentation (SKILL.md files) that the agent reads on demand via `skills show <name>`. When a skill is relevant, the agent loads it and follows its guidance.
+IMPORTANT: In Headlong, skills are NOT CLI commands. They are procedural documentation (SKILL.md files) that the agent reads on demand via \x60skills show <name>\x60. When a skill is relevant, the agent loads it and follows its guidance.
 
 CRITICAL RULES for test prompts:
 1. If the skill involves git operations, the prompt MUST include "initialize a git repository first in a NEW SUBDIRECTORY you create (mkdir repo, then cd repo)" - the temp dir has no git history, and the repo must NOT sit at the top of the run directory: the run harness appends to its own log file there while the test is executing, so a repo created at the top level is dirtied mid-test and a clean-tree check (nothing to commit, working tree clean) can never pass no matter how the agent stages and commits.
@@ -484,7 +484,7 @@ print(json.dumps(obj))
 
 # Execute a single test case
 # GNU timeout is not on stock macOS. Bound a command when timeout exists, and
-# run it directly otherwise (still inside a `|| true` caller, so a hung script
+# run it directly otherwise (still inside a || true caller, so a hung script
 # can only cost the phase's own budget).
 _sc_bounded() {
     local _sc_secs="$1"; shift
