@@ -15,7 +15,11 @@ set -euo pipefail
 # by synthesizing test cases with a teacher model, executing them, and storing
 # working few-shots as a compiled adjunct.
 
-SCRIPT_DIR="$(cd "$(dirname "$(realpath "$0")")" && pwd)"
+# Resolve our own directory without depending on realpath, which is not on
+# stock macOS PATH (Homebrew coreutils installs it prefixed). Same idiom as
+# bin/shellm: try realpath, fall back to the invocation path.
+_sc_self=$(realpath "${BASH_SOURCE[0]:-$0}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]:-$0}")
+SCRIPT_DIR="$(cd "$(dirname "$_sc_self")" && pwd)"
 COMPILED_DIR="$SCRIPT_DIR/.compiled"
 if [[ -z "${SKILLS_DIR:-}" ]]; then
     for _sc_cand in "$SCRIPT_DIR/.." "${HOME:-/tmp}/.skills"; do
@@ -92,7 +96,7 @@ parse_skill_spec() {
     # Extract Usage section from body (between ## Usage and next ## or end)
     local usage_section=""
     if printf '%s' "$body" | grep -q '^## Usage'; then
-        usage_section=$(printf '%s' "$body" | sed -n '/^## Usage$/,/^## /p' | head -n -1)
+        usage_section=$(printf '%s' "$body" | sed -n '/^## Usage$/,/^## /p' | sed '$d')
     fi
 
     # Check if skill has a CLI tool/command (Usage section with code blocks)
@@ -226,8 +230,8 @@ PY
         tmp=$(mktemp -d 2>/dev/null || echo /tmp/phrase-pool.$$)
         mkdir -p "$tmp"
         case "$script" in
-            *.py) ( cd "$tmp" && timeout 15 python3 "$script" --help; cd "$tmp" && timeout 15 python3 "$script" ) 2>/dev/null || true ;;
-            *.sh) ( cd "$tmp" && timeout 15 bash "$script" --help; cd "$tmp" && timeout 15 bash "$script" ) 2>/dev/null || true ;;
+            *.py) ( cd "$tmp" && _sc_bounded 15 python3 "$script" --help; cd "$tmp" && _sc_bounded 15 python3 "$script" ) 2>/dev/null || true ;;
+            *.sh) ( cd "$tmp" && _sc_bounded 15 bash "$script" --help; cd "$tmp" && _sc_bounded 15 bash "$script" ) 2>/dev/null || true ;;
         esac | sed '/^[[:space:]]*$/d' | awk '!seen[$0]++' | head -80 | jq -Rsc 'split("\n") | map(select(length>0))' > "$tmp/live.json" 2>/dev/null || printf '[]' > "$tmp/live.json"
         live_pool=$(cat "$tmp/live.json")
         rm -rf "$tmp"
@@ -478,6 +482,18 @@ print(json.dumps(obj))
 }
 
 # Execute a single test case
+# GNU timeout is not on stock macOS. Bound a command when timeout exists, and
+# run it directly otherwise (still inside a `|| true` caller, so a hung script
+# can only cost the phase's own budget).
+_sc_bounded() {
+    local _sc_secs="$1"; shift
+    if command -v timeout >/dev/null 2>&1 && timeout 1 true 2>/dev/null; then
+        timeout "$_sc_secs" "$@"
+    else
+        "$@"
+    fi
+}
+
 execute_test() {
     local test_json="$1"
     local skill_name="$2"
