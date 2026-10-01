@@ -316,7 +316,18 @@ for s in out:
 print(json.dumps(uniq[:200]))
 PY
 )
-    jq -n --argjson src "$src_pool" --argjson live "$live_pool" --argjson doc "$doc_pool" '($src + $live + $doc) | unique | .[:200]' 2>/dev/null || printf '[]'
+    # PHRASE-POOL v4 2026-10-01 (real-harvest experiment): union in a history
+    # live-run pool when one is supplied. Teacher-synthesized pools cannot express
+    # what the tool really prints on real runs (scratch/skill-compiler-realharvest-
+    # 2026-10-01/FINDING.md), so expect_contains literals were optimized against
+    # static harvested strings instead of live output. SKILL_HISTORY_POOL names a
+    # JSON file of {"entries":[{"line":...}]} or a plain array of strings, harvested
+    # from real tool stdout. Default off: without the env var the pool is unchanged.
+    local hist_pool="[]"
+    if [[ -n "${SKILL_HISTORY_POOL:-}" && -f "${SKILL_HISTORY_POOL}" ]]; then
+        hist_pool=$(jq -c 'if type=="array" then . else [(.entries // [])[] | .line // empty] end | map(select(type=="string")) | unique | .[:300]' "$SKILL_HISTORY_POOL" 2>/dev/null || printf '[]')
+    fi
+    jq -n --argjson src "$src_pool" --argjson live "$live_pool" --argjson doc "$doc_pool" --argjson hist "$hist_pool" '($src + $live + $doc + $hist) | unique | .[:400]' 2>/dev/null || printf '[]'
 }
 
 synthesize_tests() {
