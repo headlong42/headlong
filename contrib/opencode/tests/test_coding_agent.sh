@@ -8,6 +8,12 @@ REPO="$(dirname "$HERE")"
 export PATH="$REPO/../../bin:$PATH"
 export SHELLM_THINKER_ENV=local
 
+# The caller's trajectory identity is not ours to borrow. The tools below fork child
+# trajectories, and an unforkable ambient identity makes them abort with an empty
+# result, or worse lets fixture output land in the caller's live trajectory. Every
+# trajectory use in this file passes an explicit --traj-dir/--parent-traj instead.
+unset TRAJ_ID TRAJ_DIR
+
 pass=0
 fail=0
 ok()  { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
@@ -350,7 +356,7 @@ export REAL_PERL
 cat > "$WORK/sanitizer/perl" <<'FAKE_PERL'
 #!/usr/bin/env python3
 import os, subprocess, sys
-data = sys.stdin.buffer.read()
+data = b'' if sys.stdin.isatty() else sys.stdin.buffer.read()
 if os.environ['FAIL_SANITIZER_MATCH'].encode() in data:
     sys.stdout.buffer.write(data)
     sys.exit(3)
