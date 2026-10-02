@@ -172,6 +172,121 @@ _phrase_match() {
 # Sources now: (a) string literals on output-producing lines of every script in
 # the skill (print/echo/printf/append/write), report text included; (b) a live
 # run of the script the SKILL.md Usage names, not whichever file sorts first.
+# HARVEST-AUTO 2026-10-02 (wiring the real-harvest experiment into the default
+# path): capture_phrase_pool reached real tool vocabulary only when someone
+# hand-built a pool file and pointed SKILL_HISTORY_POOL at it, so the default
+# teacher pool was static vocabulary alone and expected literals were optimized
+# against strings the tool never prints (scratch/skill-compiler-realharvest-
+# 2026-10-01/FINDING.md). The history live-run pool is now harvested by default
+# from the mind trajectory: the stdout half of (cmd, stdout) pairs whose command
+# actually executes the skill's own script. Line acceptance is by OUTPUT SHAPE,
+# not command text, per the contamination rule in RECLASSIFY.md: a line is kept
+# when it looks like report text and is not a verbatim line of the skill's own
+# source, which is the class that put 29 Python source lines in the counterpoint
+# pool. Cache at $SKILL_HARVEST_CACHE/pool-history-<skill>.json with a TTL
+# (SKILL_HARVEST_TTL, default 3600s; SKILL_HARVEST_REFRESH=1 forces a rebuild).
+# SKILL_HISTORY_POOL still wins when set, SKILL_AUTO_HARVEST=0 turns this off.
+harvest_history_pool() {
+    local skill_abs="${1:-}"
+    [[ -n "$skill_abs" && -d "$skill_abs" ]] || return 1
+    local skill_name script
+    skill_name=$(basename "${skill_abs%/}")
+    script=""
+    if [[ -f "$skill_abs/SKILL.md" ]]; then
+        script=$(grep -oE '[A-Za-z0-9_.-]+\.(py|sh)' "$skill_abs/SKILL.md" | head -1 || true)
+    fi
+    if [[ -z "$script" || ! -f "$skill_abs/$script" ]]; then
+        script=$(find "$skill_abs" -maxdepth 1 -type f \( -name '*.py' -o -name '*.sh' \) ! -name '*.bak*' 2>/dev/null | head -1 || true)
+        script=$(basename "${script:-}")
+    fi
+    [[ -n "$script" ]] || return 1
+    local cache_dir="${SKILL_HARVEST_CACHE:-${TMPDIR:-/tmp}/skill-harvest-cache}"
+    mkdir -p "$cache_dir" 2>/dev/null || return 1
+    local cache="$cache_dir/pool-history-$skill_name.json"
+    local ttl="${SKILL_HARVEST_TTL:-3600}"
+    [[ "$ttl" =~ ^[0-9]+$ ]] || ttl=3600
+    if [[ -f "$cache" && -z "${SKILL_HARVEST_REFRESH:-}" ]]; then
+        local now mtime
+        now=$(date +%s 2>/dev/null || echo 0)
+        mtime=$(stat -c %Y "$cache" 2>/dev/null || stat -f %m "$cache" 2>/dev/null || echo 0)
+        if [[ "$now" -gt 0 && "$mtime" -gt 0 && $((now - mtime)) -lt "$ttl" ]]; then
+            printf '%s\n' "$cache"
+            return 0
+        fi
+    fi
+    local traj_dir="${SKILL_HARVEST_TRAJ_DIR:-${TRAJ_DIR:-$HOME/.headlong/trajectories}}"
+    [[ -d "$traj_dir" ]] || return 1
+    local files_list="$cache_dir/files-$skill_name.txt"
+    grep -rlF --include='*.jsonl' -m1 "$script" "$traj_dir" 2>/dev/null | head -300 > "$files_list" || true
+    [[ -s "$files_list" ]] || return 1
+    SKILL_HARVEST_SKILL_ABS="$skill_abs" SKILL_HARVEST_SCRIPT="$script" \
+    SKILL_HARVEST_FILES="$files_list" SKILL_HARVEST_OUT="$cache" \
+    SKILL_HARVEST_MIN_COUNT="${SKILL_HARVEST_MIN_COUNT:-2}" \
+    SKILL_HARVEST_MAX_ENTRIES="${SKILL_HARVEST_MAX_ENTRIES:-600}" python3 - <<'PY' 2>/dev/null || return 1
+import json, os, re, collections
+skill_abs = os.environ["SKILL_HARVEST_SKILL_ABS"]
+script = os.environ["SKILL_HARVEST_SCRIPT"]
+out_path = os.environ["SKILL_HARVEST_OUT"]
+min_count = int(os.environ.get("SKILL_HARVEST_MIN_COUNT", "2"))
+max_entries = int(os.environ.get("SKILL_HARVEST_MAX_ENTRIES", "600"))
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+BAD = re.compile(r"(/[\w.\-]+){2,}|[0-9a-f]{10,}|\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}|\b\d{6,}\b|<@|https?://", re.I)
+CODEY = re.compile(r"^\s*(def |class |import |from |return |if |elif |for |while |try:|except|pass\b|#!|\$\s|echo |printf |grep |sed |awk )|\$\(|\bprint\(|=>|;\s*$")
+src = set()
+for fn in sorted(os.listdir(skill_abs)):
+    if not (fn.endswith(".py") or fn.endswith(".sh")):
+        continue
+    if ".bak" in fn:
+        continue
+    try:
+        for line in open(os.path.join(skill_abs, fn), errors="replace"):
+            t = ANSI.sub("", line).strip()
+            if t:
+                src.add(t)
+    except Exception:
+        pass
+cnt = collections.Counter()
+invocations = 0
+for path in open(os.environ["SKILL_HARVEST_FILES"], errors="replace"):
+    path = path.strip()
+    if not path:
+        continue
+    cmd = None
+    try:
+        fh = open(path, errors="replace")
+    except Exception:
+        continue
+    for line in fh:
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        t = r.get("type")
+        if t == "reasoning" and isinstance(r.get("cmd"), str):
+            cmd = r["cmd"]
+        elif t == "shell-output" and cmd is not None:
+            if script in cmd and re.search(r"python|bash|\./", cmd):
+                invocations += 1
+                for ln in (r.get("stdout") or "").splitlines():
+                    st = ANSI.sub("", ln).strip().strip("\u2502").strip()
+                    if not (4 <= len(st) <= 160):
+                        continue
+                    if BAD.search(st) or CODEY.search(st) or st in src:
+                        continue
+                    if len(re.findall(r"[A-Za-z]", st)) < 5:
+                        continue
+                    cnt[st] += 1
+            cmd = None
+    fh.close()
+entries = [{"line": l, "count": c} for l, c in sorted(cnt.items(), key=lambda kv: (-kv[1], kv[0])) if c >= min_count][:max_entries]
+blob = {"pool": "history live-run literals from real tool stdout (auto-harvest)", "skill": os.path.basename(skill_abs.rstrip("/")), "script": script, "min_count": min_count, "invocations": invocations, "distinct_lines": len(cnt), "entries": entries}
+tmp = out_path + ".tmp"
+open(tmp, "w").write(json.dumps(blob, indent=1))
+os.replace(tmp, out_path)
+PY
+    [[ -s "$cache" ]] || return 1
+    printf '%s\n' "$cache"
+}
 capture_phrase_pool() {
     local skill_abs="$1"
     [[ -d "$skill_abs" ]] || { printf '[]'; return 0; }
@@ -332,11 +447,22 @@ PY
     # literal POOL-DROPPED rather than INVENTED. SKILL_POOL_CAP overrides the cap
     # (the offline suite uses it to reach the truncation); SKILL_POOL_SRC_CAP and
     # SKILL_POOL_LIVE_CAP override the per-source caps above.
+    # HARVEST-AUTO 2026-10-02: when no SKILL_HISTORY_POOL is supplied, harvest
+    # one from real tool stdout in the trajectory (harvest_history_pool above).
+    # Default on: the static pools alone cannot express what the tool prints on
+    # real runs. SKILL_HISTORY_POOL still wins, SKILL_AUTO_HARVEST=0 opts out.
+    local hist_pool="[]" hist_src="${SKILL_HISTORY_POOL:-}"
+    if [[ -z "$hist_src" && "${SKILL_AUTO_HARVEST:-1}" != "0" ]]; then
+        hist_src=$(harvest_history_pool "$skill_abs" || true)
+    fi
+    if [[ -n "$hist_src" && -f "$hist_src" ]]; then
+        hist_pool=$(jq -c 'if type=="array" then . else [(.entries // [])[] | .line // empty] end | map(select(type=="string")) | unique | .[:300]' "$hist_src" 2>/dev/null || printf '[]')
+    fi
     local cap="${SKILL_POOL_CAP:-400}"
     [[ "$cap" =~ ^[0-9]+$ ]] || cap=400
     local pool_json
-    pool_json=$(jq -cn --argjson src "$src_pool" --argjson live "$live_pool" --argjson doc "$doc_pool" --argjson cap "$cap" '
-        ($src + $live + $doc) | unique | . as $all
+    pool_json=$(jq -cn --argjson src "$src_pool" --argjson live "$live_pool" --argjson doc "$doc_pool" --argjson hist "$hist_pool" --argjson cap "$cap" '
+        ($src + $live + $doc + $hist) | unique | . as $all
         | {offered: ($all[:$cap]),
            dropped: ($all[$cap:]),
            pool_total: ($all | length),
