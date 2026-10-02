@@ -181,7 +181,7 @@ _resolve_traj_id() {
 
     # 4. Directory glob: find directories named <hex_prefix>-*
     local match
-    match=$(find "$traj_dir" -type d -name "${hex_prefix}-*" 2>/dev/null | head -1)
+    match=$(find "$traj_dir" -type d -name "${hex_prefix}-*" 2>/dev/null | head -1 || true)
     if [[ -n "$match" && -f "$match/trajectory.jsonl" ]]; then
         printf '%s\n' "$match/trajectory.jsonl"
         return
@@ -237,7 +237,7 @@ _get_summary() {
 
     # Try run-summary step
     local summary_line
-    summary_line=$(jq -R -c 'fromjson? // empty | select(.type == "run-summary")' "$traj_file" 2>/dev/null | head -1)
+    summary_line=$(jq -R -c 'fromjson? // empty | select(.type == "run-summary")' "$traj_file" 2>/dev/null | head -1 || true)
     if [[ -n "$summary_line" ]]; then
         raw=$(printf '%s' "$summary_line" | jq -r '.tldr // empty')
     fi
@@ -245,9 +245,9 @@ _get_summary() {
     # Fallback: prompt step
     if [[ -z "$raw" ]]; then
         local prompt_line
-        prompt_line=$(jq -R -c 'fromjson? // empty | select(.type == "prompt")' "$traj_file" 2>/dev/null | head -1)
+        prompt_line=$(jq -R -c 'fromjson? // empty | select(.type == "prompt")' "$traj_file" 2>/dev/null | head -1 || true)
         if [[ -n "$prompt_line" ]]; then
-            raw=$(printf '%s' "$prompt_line" | jq -r '.content // empty' | head -c 200)
+            raw=$(printf '%s' "$prompt_line" | jq -r '.content // empty' | head -c 200 || true)
         fi
     fi
 
@@ -255,7 +255,7 @@ _get_summary() {
     if [[ -z "$raw" ]]; then
         local run_line
         run_line=$(head -1 "$traj_file")
-        raw=$(printf '%s' "$run_line" | jq -r '.command // empty' 2>/dev/null | head -c 200)
+        raw=$(printf '%s' "$run_line" | jq -r '.command // empty' 2>/dev/null | head -c 200 || true)
     fi
 
     [[ -z "$raw" ]] && raw="(no summary)"
@@ -343,7 +343,7 @@ cmd_new() {
 
     # Sanitize slug for directory name: collapse to single line, lowercase, safe chars only
     local safe_slug
-    safe_slug=$(printf '%s' "$slug" | tr '\n\r\t' '---' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//' | head -c 60)
+    safe_slug=$(printf '%s' "$slug" | tr '\n\r\t' '---' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//' | head -c 60 || true)
     [[ -z "$safe_slug" ]] && safe_slug="unnamed"
 
     # Directory name: <hex8>-<slug>
@@ -602,7 +602,7 @@ _find_step_in_dir() {
     while IFS= read -r f; do
         [[ -f "$f" ]] || continue
         local row
-        row=$(jq -R -c --arg id "$step_id" 'fromjson? // empty | select(.step_id == $id or (.step_id // "" | startswith($id)))' "$f" 2>/dev/null | head -1)
+        row=$(jq -R -c --arg id "$step_id" 'fromjson? // empty | select(.step_id == $id or (.step_id // "" | startswith($id)))' "$f" 2>/dev/null | head -1 || true)
         if [[ -n "$row" ]]; then
             printf '%s\n%s\n' "$f" "$row"
             return 0
@@ -2362,7 +2362,7 @@ cmd_list() {
             # In --steps mode, children are rendered inline; check if any forks exist
             # by looking for fork steps in the self trajectory
             local has_forks
-            has_forks=$(jq -R -r 'fromjson? // empty | select(.type=="fork") | .child' "$traj_file" 2>/dev/null | head -1)
+            has_forks=$(jq -R -r 'fromjson? // empty | select(.type=="fork") | .child' "$traj_file" 2>/dev/null | head -1 || true)
             if [[ -n "$has_forks" ]]; then
                 printf '%s(showing direct children only; use --children all to expand full tree)%s\n' \
                     "$_c_dim" "$_c_reset"

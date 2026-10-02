@@ -365,7 +365,7 @@ action_list() {
                 *"|${name}|"*)
                     # Find the earlier path for the warning
                     local prev_path
-                    prev_path=$(printf '%s\n' "$_seen_paths" | grep "^${name}	" | head -1 | cut -f2)
+                    prev_path=$(printf '%s\n' "$_seen_paths" | grep "^${name}	" | head -1 | cut -f2 || true)
                     warn "skill ${_bold}${name}${_reset} found in multiple locations:\n    ${prev_path}\n    ${skill_path}\n  Using the first one. Remove one copy to resolve."
                     continue
                     ;;
