@@ -895,7 +895,7 @@ EOF
         if [[ "$HAS_TTY" -eq 1 ]]; then
             chosen=$(_pick_from_list "Model to run your agent on" "$models" "${model_env:-}")
         else
-            chosen="${model_env:-$(printf '%s\n' "$models" | head -1)}"
+            chosen="${model_env:-$(printf '%s\n' "$models" | head -1 || true)}"
         fi
     else
         # A server may hide /v1/models (some proxies do) while chat still

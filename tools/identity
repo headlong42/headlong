@@ -703,7 +703,7 @@ _install_imported_identity() {
         done
     fi
     if [[ "$have_traj" -eq 0 ]]; then
-        new_rt=$(traj new --traj_dir "$dest/trajectories" --slug "root" | head -1)
+        new_rt=$(traj new --traj_dir "$dest/trajectories" --slug "root" | head -1 || true)
         tmp_info=$(mktemp)
         { grep -v '^root_trajectory=' "$dest/info.txt" || true; printf 'root_trajectory=%s\n' "$new_rt"; } > "$tmp_info"
         mv "$tmp_info" "$dest/info.txt"
