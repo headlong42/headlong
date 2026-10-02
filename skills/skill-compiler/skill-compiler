@@ -747,7 +747,7 @@ ${skill_content}"
     local actual_traj_file
     actual_traj_file=$(find "$traj_dir" -name "*.jsonl" -o -name "*.json" 2>/dev/null | head -1)
 
-    local last_step_type="" last_step_content="" last_step_json="" final_content=""
+    local last_step_type="" last_step_content="" last_step_json="" final_content="" observed_evidence=""
     if [[ -n "$actual_traj_file" && -f "$actual_traj_file" ]]; then
         # Get the last step type and content
         local last_line
@@ -871,6 +871,7 @@ ${traj_blob}"
             rm -f "$prompt_only_filter"
             exec_content=$(printf '%s\n%s\n' "$exec_content" "$final_only")
         fi
+        observed_evidence="$exec_content"
         # DENIAL-FIX 2026-09-22: a line that denies the term ("No violations
         # found", "Not a violation", "0 violations") is evidence of absence, not
         # of the term.
@@ -956,7 +957,8 @@ ${traj_blob}"
         --arg last_step_content "$last_step_content" \
         --arg final "$final_content" \
         --arg exit_code "$rc" \
-        '{test:$test, pass:($pass=="true"), last_step_type:$last_step_type, last_step_content:$last_step_content, final:$final, exit_code:($exit_code|tonumber)}'
+        --arg observed "$observed_evidence" \
+        '{test:$test, pass:($pass=="true"), last_step_type:$last_step_type, last_step_content:$last_step_content, final:$final, exit_code:($exit_code|tonumber), observed:$observed}'
 }
 
 # Write cache files
@@ -1074,6 +1076,33 @@ def classify_literal(lit):
 src_counts = {"SCRIPT-PRINT": 0, "SCRIPT-TEXT": 0, "DOC": 0, "METADATA": 0, "UNATTESTED": 0}
 srclines = []
 
+
+# DELETION-GATE 2026-10-02 (notes/skill-compiler-accept-reject-deletion-gate-2026-10-02.md):
+# a compiled adjunct may not claim VERIFIED on pool-attested literals alone. Run
+# one deletion mutation over the observed verdict surface: delete every line the
+# phrase pool does not cover (POOL-ABSENT), keep the pool-covered surface
+# byte-identical, and ask whether the frozen assertions still have support. An
+# assertion survives the mutation when a kept (pool-covered) line still carries
+# its literal; it is killed when every line carrying its literal was deleted. A
+# pass the mutation cannot kill covers only the pool slice and is labeled
+# POOL-SLICE-ONLY, never VERIFIED. Covered-line rule matches the scratch gate
+# bin/skill-deletion-gate: exact when the line equals a pool entry, fragment
+# when a 12-char containment holds either way, absent otherwise.
+def line_covered(ln, pool):
+    v = ln.strip()
+    if not v:
+        return True
+    for e in pool:
+        if not e:
+            continue
+        if v == e:
+            return True
+        if (v in e or e in v) and min(len(v), len(e)) >= 12:
+            return True
+    return False
+
+g_kill = g_surv = g_self = 0
+g_lines = g_kept = 0
 lines = []
 inv = 0
 exact = 0
@@ -1101,15 +1130,53 @@ for r in res:
         lines.append("- %s | %s | %s" % (t.get("name", ""), lab, lit))
     r["literal_labels"] = labels
     r["literal_sources"] = sources
+    obs = [l for l in (r.get("observed") or "").splitlines() if l.strip()]
+    kept = [l for l in obs if line_covered(l, pool)]
+    lits = list(t.get("expect_contains") or [])
+    killed = False
+    reason = "no-expect-contains"
+    self_cov = False
+    if lits and not obs:
+        reason = "no-observed-lines"
+    elif lits:
+        killed = True
+        reason = "mutation-kills"
+        for lit in lits:
+            support = [l for l in obs if lit in l]
+            if not support:
+                killed = False
+                reason = "literal-absent-from-observed"
+                break
+            if any(lit in l for l in kept):
+                killed = False
+                reason = "support-line-pool-covered"
+                if all(not line_covered(l.replace(lit, ""), pool) for l in support):
+                    self_cov = True
+                    reason = "support-line-covered-by-assertion-itself"
+                break
+    r["deletion_gate"] = dict(killed=killed, reason=reason, self_covered=self_cov,
+                              lines_total=len(obs), lines_kept=len(kept))
+    g_lines += len(obs)
+    g_kept += len(kept)
+    if killed:
+        g_kill += 1
+    else:
+        g_surv += 1
+    if self_cov:
+        g_self += 1
     if not r.get("pass"):
         r["verification"] = "FAIL"
     elif any(lab == "INVENTED" for lab in labels.values()):
         r["verification"] = "GREEN-ON-INVENTED"
     elif any(lab == "POOL-DROPPED" for lab in labels.values()):
         r["verification"] = "GREEN-ON-DROPPED"
+    elif not r["deletion_gate"].get("killed"):
+        # POOL-SLICE-ONLY: the deletion mutation leaves this pass standing, so it
+        # only shows the pool-covered slice behaved (DELETION-GATE 2026-10-02).
+        r["verification"] = "POOL-SLICE-ONLY"
     else:
         r["verification"] = "VERIFIED"
-summary = dict(skill=os.environ.get("skill_name", ""), total=len(res), passed=sum(1 for r in res if r.get("pass")), verified=sum(1 for r in res if r.get("verification") == "VERIFIED"), green_on_invented=sum(1 for r in res if r.get("verification") == "GREEN-ON-INVENTED"), fail=sum(1 for r in res if not r.get("pass")), literal_provenance=dict(pool_exact=exact, pool_fragment=frag, invented=inv, pool_dropped=dropped), literal_sources=dict(src_counts), green_on_dropped=sum(1 for r in res if r.get("verification") == "GREEN-ON-DROPPED"), pool_truncated=bool(poolcap.get("pool_dropped") or 0))
+summary = dict(skill=os.environ.get("skill_name", ""), total=len(res), passed=sum(1 for r in res if r.get("pass")), verified=sum(1 for r in res if r.get("verification") == "VERIFIED"), green_on_invented=sum(1 for r in res if r.get("verification") == "GREEN-ON-INVENTED"), fail=sum(1 for r in res if not r.get("pass")), literal_provenance=dict(pool_exact=exact, pool_fragment=frag, invented=inv, pool_dropped=dropped), literal_sources=dict(src_counts), green_on_dropped=sum(1 for r in res if r.get("verification") == "GREEN-ON-DROPPED"), pool_truncated=bool(poolcap.get("pool_dropped") or 0), pool_slice_only=sum(1 for r in res if r.get("verification") == "POOL-SLICE-ONLY"), deletion_gate=dict(killed=g_kill, survived=g_surv, self_covered=g_self, lines_total=g_lines, lines_kept=g_kept, covered_fraction=(round(float(g_kept)/g_lines, 4) if g_lines else None), verdict=("MUTATION-KILLS" if g_kill and not g_surv else ("PARTIAL-KILL" if g_kill else "BLIND-TO-POOL-ABSENT"))))
 out = dict(summary=summary, tests=res)
 open(os.environ["json_out"], "w").write(json.dumps(out, indent=2))
 md = "\n## Literal provenance (expect_contains vs the phrase pool)\n\n"
@@ -1157,7 +1224,7 @@ PY
 
     {
         printf '\n## Pass verification\n\n'
-        printf 'VERIFIED = green with only pool-attested literals (POOL-EXACT or POOL-FRAGMENT). GREEN-ON-INVENTED = green but resting on unverified vocabulary, so not counted as verified. POOL-DROPPED and GREEN-ON-DROPPED mark real vocabulary the pool cap dropped from the truncated pool: real, but not pool-attested, so not counted as verified either.\n\n'
+        printf 'VERIFIED = green with only pool-attested literals (POOL-EXACT or POOL-FRAGMENT). GREEN-ON-INVENTED = green but resting on unverified vocabulary, so not counted as verified. POOL-DROPPED and GREEN-ON-DROPPED mark real vocabulary the pool cap dropped from the truncated pool: real, but not pool-attested, so not counted as verified either. POOL-SLICE-ONLY = green and pool-attested, but the deletion mutation (delete every verdict line the phrase pool does not cover) leaves the pass standing, so it verifies only the pool-covered slice (DELETION-GATE 2026-10-02). VERIFIED additionally requires that the mutation kills the pass.\n\n'
         python3 - "$COMPILED_DIR/${skill_name}.json" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))

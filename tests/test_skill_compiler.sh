@@ -3,7 +3,8 @@
 # compile skip-list refuses side-effect skills before any model call, a missing
 # skill dies cleanly, the phrase pool carries the tool's own output vocabulary,
 # the cache is self-describing with POOL-EXACT / POOL-FRAGMENT / INVENTED literal
-# labels and VERIFIED only on pool-attested literals, and the shipped script
+# labels, VERIFIED only on pool-attested literals the deletion mutation kills,
+# POOL-SLICE-ONLY otherwise, and the shipped script
 # carries no identity-specific absolute paths. No LLM calls, no network: the
 # teacher and the test runner are stubs on PATH.
 #
@@ -169,10 +170,10 @@ else
   bad "cache json is self-describing (summary plus tests)" "missing or shape-wrong: $CACHE"
 fi
 
-if [ -f "$CACHE" ] && jq -e '.summary | .total == 3 and .passed == 3 and .verified == 2 and .green_on_invented == 1' "$CACHE" >/dev/null 2>&1; then
-  ok "summary counts: 3 passed, 2 verified, 1 green on invented"
+if [ -f "$CACHE" ] && jq -e '.summary | .total == 3 and .passed == 3 and .verified == 0 and .pool_slice_only == 2 and .green_on_invented == 1' "$CACHE" >/dev/null 2>&1; then
+  ok "summary counts: 3 passed, 0 verified, 2 pool-slice-only, 1 green on invented (deletion gate)"
 else
-  bad "summary counts: 3 passed, 2 verified, 1 green on invented" "summary=$(jq -c '.summary' "$CACHE" 2>/dev/null)"
+  bad "summary counts: 3 passed, 0 verified, 2 pool-slice-only, 1 green on invented (deletion gate)" "summary=$(jq -c '.summary' "$CACHE" 2>/dev/null)"
 fi
 
 if [ -f "$CACHE" ] && jq -e '[.tests[] | .literal_labels[]] | sort == (["INVENTED","POOL-EXACT","POOL-FRAGMENT"] | sort)' "$CACHE" >/dev/null 2>&1; then
@@ -191,17 +192,26 @@ else
   bad "no POOL-DROPPED label while the pool is untruncated" "summary=$(jq -c '.summary' "$CACHE" 2>/dev/null)"
 fi
 
-if [ -f "$CACHE" ] && jq -e '[.tests[] | .verification] | sort == (["GREEN-ON-INVENTED","VERIFIED","VERIFIED"] | sort)' "$CACHE" >/dev/null 2>&1; then
-  ok "verification: only pool-attested passes count as VERIFIED"
+if [ -f "$CACHE" ] && jq -e '[.tests[] | .verification] | sort == (["GREEN-ON-INVENTED","POOL-SLICE-ONLY","POOL-SLICE-ONLY"] | sort)' "$CACHE" >/dev/null 2>&1; then
+  ok "verification: pool-attested passes are POOL-SLICE-ONLY unless the deletion mutation kills them"
 else
-  bad "verification: only pool-attested passes count as VERIFIED" "status=$(jq -c '[.tests[] | .verification]' "$CACHE" 2>/dev/null)"
+  bad "verification: pool-attested passes are POOL-SLICE-ONLY unless the deletion mutation kills them" "status=$(jq -c '[.tests[] | .verification]' "$CACHE" 2>/dev/null)"
 fi
 
 MD_CACHE="$REPO/skills/skill-compiler/.compiled/fixture-greet.md"
-if [ -f "$MD_CACHE" ] && grep -q '## Summary: 3 / 3 passed, 2 / 3 verified' "$MD_CACHE" && grep -q '## Pass verification' "$MD_CACHE"; then
+# DELETION-GATE 2026-10-02: the gate is recorded in the cache (per test and in
+# the summary) and it changes what VERIFIED means: a pass the deletion mutation
+# cannot kill covers only the pool slice.
+if [ -f "$CACHE" ] && jq -e '([.tests[] | has("deletion_gate")] | all) and (.summary.deletion_gate.verdict == "BLIND-TO-POOL-ABSENT") and (.summary.deletion_gate.killed == 0) and (.summary.deletion_gate.survived == 3)' "$CACHE" >/dev/null 2>&1; then
+  ok "deletion gate recorded per test and summarized, mutation kills no pool-covered pass"
+else
+  bad "deletion gate recorded per test and summarized" "gate=$(jq -c '.summary.deletion_gate' "$CACHE" 2>/dev/null)"
+fi
+
+if [ -f "$MD_CACHE" ] && grep -q '^## Pass verification' "$MD_CACHE" && grep -q '^## Literal provenance' "$MD_CACHE" && grep -q 'POOL-SLICE-ONLY' "$MD_CACHE"; then
   ok "markdown cache carries the summary and the pass verification section"
 else
-  bad "markdown cache carries the summary and the pass verification section" "file=$MD_CACHE"
+  bad "markdown cache carries the summary and the pass verification section" "file=$MD_CACHE head=$(head -c 200 "$MD_CACHE" 2>/dev/null)"
 fi
 
 # FIX3 2026-09-27: placeholder scaffolding from the skill docs is not output
