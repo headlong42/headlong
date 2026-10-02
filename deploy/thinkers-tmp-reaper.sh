@@ -63,7 +63,7 @@ files=0 dirs=0 kb=0
 # into a second line, so keep only the first field of the first line.
 size_kb() {
     local v
-    v=$(du -sk "$1" 2>/dev/null | head -n 1 | awk '{print $1}')
+    v=$(du -sk "$1" 2>/dev/null | head -n 1 | awk '{print $1}' || true)
     [[ "$v" =~ ^[0-9]+$ ]] && printf '%s' "$v" || printf '0'
 }
 # remove_tree DIR: depth-first, never across a mount point, never through a
