@@ -30,6 +30,12 @@ mkdir -p "$STUB"
 cat > "$STUB/llm" <<'STUBLEOF'
 #!/usr/bin/env bash
 [ -n "${STUB_LLM_LOG:-}" ] && printf '%s\n' "$*" >> "$STUB_LLM_LOG"
+if [ "${STUB_MODE:-}" = "many" ]; then
+  cat <<'JSONM'
+[{"name":"many-dropped","prompt":"Run the skill and report what it prints.","expect":"final","expect_contains":["zeta phrase 09 stable output"]}]
+JSONM
+  exit 0
+fi
 if [ "${STUB_MODE:-}" = "quote" ]; then
   cat <<'JSONQ'
 [{"name":"greet-quote-fold","prompt":"Run the greeting skill and report what it prints.","expect":"final","expect_contains":["sed \"s/<[^>]*>//g\""]}]
@@ -50,6 +56,13 @@ cat > "$STUB/shellm" <<'STUBLEOF'
 [ -n "${STUB_SHELLM_LOG:-}" ] && printf '%s\n' "$*" >> "$STUB_SHELLM_LOG"
 : "${TRAJ_DIR:?stub shellm needs TRAJ_DIR}"
 mkdir -p "$TRAJ_DIR"
+if [ "${STUB_MODE:-}" = "many" ]; then
+  {
+    printf '%s\n' '{"type":"shell-output","stdout":"zeta phrase 09 stable output"}'
+    printf '%s\n' '{"type":"final","content":"Reported. zeta phrase 09 stable output."}'
+  } > "$TRAJ_DIR/stub-run.jsonl"
+  exit 0
+fi
 if [ "${STUB_MODE:-}" = "quote" ]; then
   {
     printf '%s\n' '{"type":"shell-output","stdout":"stripped with sed '"'"'s/<[^>]*>//g'"'"'"}'
@@ -167,6 +180,16 @@ if [ -f "$CACHE" ] && jq -e '[.tests[] | .literal_labels[]] | sort == (["INVENTE
 else
   bad "literal labels: POOL-EXACT, POOL-FRAGMENT, INVENTED" "labels=$(jq -c '[.tests[] | .literal_labels]' "$CACHE" 2>/dev/null)"
 fi
+if [ -f "$CACHE" ] && jq -e '[.tests[].literal_labels | to_entries[] | .value] | all(.=="POOL-EXACT" or .=="POOL-FRAGMENT" or .=="INVENTED" or .=="POOL-DROPPED")' "$CACHE" >/dev/null 2>&1; then
+  ok "literal labels use the documented vocabulary including POOL-DROPPED"
+else
+  bad "literal labels use the documented vocabulary including POOL-DROPPED" "labels=$(jq -c '[.tests[].literal_labels]' "$CACHE" 2>/dev/null)"
+fi
+if [ -f "$CACHE" ] && jq -e '(.summary.pool_truncated == false) and ([.tests[].literal_labels | to_entries[] | select(.value=="POOL-DROPPED")] | length) == 0' "$CACHE" >/dev/null 2>&1; then
+  ok "no POOL-DROPPED label while the pool is untruncated"
+else
+  bad "no POOL-DROPPED label while the pool is untruncated" "summary=$(jq -c '.summary' "$CACHE" 2>/dev/null)"
+fi
 
 if [ -f "$CACHE" ] && jq -e '[.tests[] | .verification] | sort == (["GREEN-ON-INVENTED","VERIFIED","VERIFIED"] | sort)' "$CACHE" >/dev/null 2>&1; then
   ok "verification: only pool-attested passes count as VERIFIED"
@@ -248,6 +271,75 @@ if jq -e '.summary.literal_sources | type=="object"' "$CACHE" >/dev/null 2>&1; t
 else
   bad "summary carries the literal source distribution"
 fi
+
+# POOL-CAP 2026-10-02 (review follow-up on the pool truncation): the pool caps
+# used to drop real phrases silently and lexicographically, so a real phrase
+# past the cap was labeled INVENTED. The pool file now records the truncation,
+# and a dropped-but-real literal is POOL-DROPPED, not INVENTED.
+FIXM="$WORK/skills/fixture-many"
+mkdir -p "$FIXM"
+cat > "$FIXM/fixture_many.py" <<'PYEOF'
+#!/usr/bin/env python3
+print("zeta phrase 00 stable output")
+print("zeta phrase 01 stable output")
+print("zeta phrase 02 stable output")
+print("zeta phrase 03 stable output")
+print("zeta phrase 04 stable output")
+print("zeta phrase 05 stable output")
+print("zeta phrase 06 stable output")
+print("zeta phrase 07 stable output")
+print("zeta phrase 08 stable output")
+print("zeta phrase 09 stable output")
+print("zeta phrase 10 stable output")
+print("zeta phrase 11 stable output")
+PYEOF
+cat > "$FIXM/SKILL.md" <<'MDEOF'
+---
+name: fixture-many
+description: Print twelve distinct output phrases for the pool-cap checks.
+---
+
+# fixture-many
+
+Run `python3 fixture_many.py` to print the phrases.
+MDEOF
+export SKILL_POOL_CAP=1000
+full_pool=$(run_sc pool --skill fixture-many)
+unset SKILL_POOL_CAP
+nfull=$(printf '%s' "$full_pool" | jq 'length' 2>/dev/null || echo 0)
+if [[ "$nfull" =~ ^[0-9]+$ && "$nfull" -gt 6 ]]; then
+  ok "fixture-many yields a pool larger than the test cap"
+else
+  bad "fixture-many yields a pool larger than the test cap" "pool entries=$nfull"
+fi
+POOLFILE="$REPO/skills/skill-compiler/.compiled/pool-fixture-many.json"
+export SKILL_POOL_CAP=3
+run_sc pool --skill fixture-many >/dev/null 2>&1 || true
+unset SKILL_POOL_CAP
+if [ -f "$POOLFILE" ] && jq -e '.pool_offered == 3 and .pool_total > 3 and .pool_dropped == (.pool_total - 3) and ((.dropped | length) > 0)' "$POOLFILE" >/dev/null 2>&1; then
+  ok "pool file records the truncation with the dropped tail"
+else
+  bad "pool file records the truncation with the dropped tail" "$(jq -c '{pool_offered,pool_total,pool_dropped,dropped:(.dropped|length)}' "$POOLFILE" 2>/dev/null)"
+fi
+export STUB_MODE=many
+export SKILL_POOL_CAP=3
+rm -f "$REPO/skills/skill-compiler/.compiled/fixture-many.json" "$POOLFILE"
+run_sc compile --skill fixture-many --num-tests 1 --max-iterations 3 >/dev/null 2>&1 || true
+unset STUB_MODE SKILL_POOL_CAP
+CM="$REPO/skills/skill-compiler/.compiled/fixture-many.json"
+if [ -f "$CM" ] && jq -e '.tests[0].literal_labels["zeta phrase 09 stable output"] == "POOL-DROPPED"' "$CM" >/dev/null 2>&1; then
+  ok "a dropped-but-real literal is labeled POOL-DROPPED, not INVENTED"
+else
+  bad "a dropped-but-real literal is labeled POOL-DROPPED, not INVENTED" "labels=$(jq -c '.tests[0].literal_labels' "$CM" 2>/dev/null)"
+fi
+if [ -f "$CM" ] && jq -e '.summary.pool_truncated == true and .summary.literal_provenance.pool_dropped >= 1' "$CM" >/dev/null 2>&1; then
+  ok "summary surfaces the pool truncation"
+else
+  bad "summary surfaces the pool truncation" "summary=$(jq -c '.summary' "$CM" 2>/dev/null)"
+fi
+
+rm -f "$REPO/skills/skill-compiler/.compiled/fixture-many.json" "$REPO/skills/skill-compiler/.compiled/fixture-many.md" "$POOLFILE"
+rm -f "$REPO/skills/skill-compiler/.compiled/pool-fixture-greet.json"
 
 rm -f "$REPO/skills/skill-compiler/.compiled/fixture-greet.json"
 
