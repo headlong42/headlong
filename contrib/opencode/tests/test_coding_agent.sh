@@ -350,7 +350,7 @@ export REAL_PERL
 cat > "$WORK/sanitizer/perl" <<'FAKE_PERL'
 #!/usr/bin/env python3
 import os, subprocess, sys
-data = sys.stdin.buffer.read()
+data = b'' if sys.stdin.isatty() else sys.stdin.buffer.read()
 if os.environ['FAIL_SANITIZER_MATCH'].encode() in data:
     sys.stdout.buffer.write(data)
     sys.exit(3)
