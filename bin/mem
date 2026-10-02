@@ -173,7 +173,7 @@ mem_prefilter() {
     local query="$1" top="$2" terms
     terms=$(printf '%s' "$query" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_#@.-' '\n' \
         | awk 'length($0) >= 3' | grep -vxE 'the|and|for|not|from|with|that|this|are|was|what|when|how|about|into|has|have|had|its|but|all|any|can|out|one|two|then|than|they|them|will|were|been|being|also|just|only|some|such|there|their|which|while|would|could|should' \
-        | sort -u | tr '\n' ' ')
+        | sort -u | tr '\n' ' ' || true)
     [[ -n "${terms// /}" ]] || return 0
     LC_ALL=C awk -v terms="$terms" '
         BEGIN { n = split(terms, T, " ") }
@@ -191,7 +191,7 @@ mem_prefilter() {
                   tf = cnt[f, i]
                   s += idf[i] * (tf * 2.2) / (tf + 1.2 * (0.25 + 0.75 * len[f] / avg)) }
               if (s > 0) printf "%f\t%s\n", s, files[f] }
-        }' "$MEM_DIR"/*.md | sort -t "$(printf '\t')" -k1,1 -gr | head -n "$top" | cut -f2-
+        }' "$MEM_DIR"/*.md | sort -t "$(printf '\t')" -k1,1 -gr | awk -v top="$top" 'NR <= top {print}' | cut -f2-
 }
 
 # `mem prefilter <query> [--top N]`: the candidate paths stage 1 would hand
