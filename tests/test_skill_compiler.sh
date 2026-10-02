@@ -261,7 +261,7 @@ if jq -e '[.tests[] | has("literal_sources")] | all' "$CACHE" >/dev/null 2>&1; t
 else
   bad "cache records a literal source for every literal"
 fi
-if jq -e '[.tests[].literal_sources[]] | all(.=="SCRIPT-PRINT" or .=="SCRIPT-TEXT" or .=="DOC" or .=="METADATA" or .=="UNATTESTED")' "$CACHE" >/dev/null 2>&1; then
+if jq -e '[.tests[].literal_sources[]] | all(.=="TOOL-OUTPUT" or .=="SCRIPT-PRINT" or .=="SCRIPT-PRINT-UNATTESTED" or .=="SCRIPT-TEXT" or .=="DOC" or .=="METADATA" or .=="UNATTESTED")' "$CACHE" >/dev/null 2>&1; then
   ok "literal sources use the documented vocabulary"
 else
   bad "literal sources use the documented vocabulary"
@@ -270,6 +270,27 @@ if jq -e '.summary.literal_sources | type=="object"' "$CACHE" >/dev/null 2>&1; t
   ok "summary carries the literal source distribution"
 else
   bad "summary carries the literal source distribution"
+fi
+
+# PROVENANCE-FIX 2026-10-02: TOOL-OUTPUT is the only literal source that is
+# occurrence evidence, so it fires only when captured real tool output carries
+# the literal, and with a corpus loaded a literal the output never shows is not
+# labeled SCRIPT-PRINT just because a script prints it.
+printf '%s\n' 'Hello, phrase-pool world!' > "$WORK/real-output.txt"
+rm -f "$CACHE"
+SKILL_REAL_OUTPUT="$WORK/real-output.txt" run_sc compile --skill fixture-greet --num-tests 3 --max-iterations 3 >/dev/null 2>&1 || true
+if [[ -f "$CACHE" ]] && jq -e '[.tests[].literal_sources["Hello, phrase-pool world!"]] | any(.=="TOOL-OUTPUT")' "$CACHE" >/dev/null 2>&1 && jq -e '[.tests[].literal_sources["ZzyzxNotInPool"]] | all(.!="TOOL-OUTPUT")' "$CACHE" >/dev/null 2>&1; then
+  ok "TOOL-OUTPUT only when captured real output carries the literal"
+else
+  bad "TOOL-OUTPUT only when captured real output carries the literal" "sources=$(jq -c '[.tests[].literal_sources]' "$CACHE" 2>/dev/null)"
+fi
+printf '%s\n' 'captured output the fixture never prints' > "$WORK/real-output.txt"
+rm -f "$CACHE"
+SKILL_REAL_OUTPUT="$WORK/real-output.txt" run_sc compile --skill fixture-greet --num-tests 3 --max-iterations 3 >/dev/null 2>&1 || true
+if [[ -f "$CACHE" ]] && jq -e '[.tests[].literal_sources["Hello, phrase-pool world!"]] | all(.!="SCRIPT-PRINT" and .!="TOOL-OUTPUT")' "$CACHE" >/dev/null 2>&1; then
+  ok "with captured output loaded an unseen literal is not SCRIPT-PRINT"
+else
+  bad "with captured output loaded an unseen literal is not SCRIPT-PRINT" "sources=$(jq -c '[.tests[].literal_sources]' "$CACHE" 2>/dev/null)"
 fi
 
 # POOL-CAP 2026-10-02 (review follow-up on the pool truncation): the pool caps
