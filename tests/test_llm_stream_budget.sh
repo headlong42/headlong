@@ -48,6 +48,10 @@ export PATH="$WORK/bin:$PATH"
 export OPENROUTER_API_KEY="test-key"
 export HEADLONG_HOME="$WORK/home"
 mkdir -p "$HEADLONG_HOME"
+# Do not inherit a caller's overrides: these cases assert on the script
+# defaults (LLM_MAX_TIME=600, no stream ceiling), so an exported value would
+# silently win and make a clean-env run fail in a polluted shell.
+unset LLM_MAX_TIME LLM_STREAM_MAX_TIME LLM_SPEED_LIMIT LLM_SPEED_TIME LLM_CONNECT_TIMEOUT
 export CURL_ARGV="$WORK/argv" CURL_MODE="$WORK/mode"
 
 LLM="$REPO/bin/llm"
