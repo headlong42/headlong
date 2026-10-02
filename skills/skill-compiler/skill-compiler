@@ -638,10 +638,12 @@ ${traj_blob}"
     all_content=$(printf '%s\n' "$all_content" | grep -vxF -f "$filter_file" 2>/dev/null || true)
     rm -f "$filter_file"
 
+    local final_len=0
+    final_len=$(printf '%s' "$final_content" | tr -d '[:space:]' | wc -c | tr -d ' ')
     if [[ "$expect" == "final" ]]; then
         # For "final" expectation, we accept either a final step OR an observation step that contains the answer
         if [[ "$last_step_type" == "final" ]] || [[ "$last_step_type" == "observation" ]] || [[ "$last_step_type" == "reasoning" ]] || [[ "$last_step_type" == "shell-output" ]]; then
-            pass=true
+            [[ "$final_len" -gt 0 ]] && pass=true
         fi
     elif [[ "$expect" == "observation" ]]; then
         # For "observation" expectation, we accept observation, final, or reasoning (agent often answers in reasoning)
@@ -667,6 +669,7 @@ ${traj_blob}"
         # whose term appears in the final answer could never pass (hello-world
         # false-fail). Final steps are in the evidence pool now, still subject to
         # the echo filter and the denial-aware matching below.
+    local ec_matched=0 ec_missed=""
     if [[ $pass == true ]] && [[ $(printf '%s' "$expect_contains" | jq 'length') -gt 0 ]]; then
         pass=false
         local exec_content=""
@@ -731,6 +734,7 @@ ${traj_blob}"
         local len
         len=$(printf '%s' "$expect_contains" | jq 'length')
         while [[ $i -lt $len ]]; do
+            local lit_hit=false
             local substr
             substr=$(printf '%s' "$expect_contains" | jq -r ".[$i]")
             # WORD-FIX 2026-09-22: whole-word fixed-string matching. "violation"
@@ -747,12 +751,10 @@ ${traj_blob}"
             # matching so "violation" cannot ride on "violations".
             if [[ "$substr" == *" "* ]]; then
                 if printf '%s\n' "$exec_match" | _phrase_match "$substr"; then
-                    pass=true
-                    break
+                    lit_hit=true
                 fi
             elif printf '%s\n' "$exec_match" | grep -Eiqw -- "${_esc}(s|es)?"; then
-                pass=true
-                break
+                lit_hit=true
             fi
             # QUOTE-FOLD-FIX 2026-09-27: the same command written with the other
             # quote style is the same command (single-quote and double-quote
@@ -764,8 +766,7 @@ ${traj_blob}"
                 fold_lit=$(printf '%s' "$substr" | sed "s/[\'\"]/'/g")
                 fold_ev=$(printf '%s\n' "$exec_match" | sed "s/[\'\"]/'/g")
                 if printf '%s\n' "$fold_ev" | _phrase_match "$fold_lit"; then
-                    pass=true
-                    break
+                    lit_hit=true
                 fi
             fi
             # DENIAL-AWARE-FIX 2026-09-22: a denial line may only satisfy a term
@@ -774,16 +775,22 @@ ${traj_blob}"
             if printf '%s' "$substr" | grep -Eiq -- "$denial_re"; then
                 if [[ "$substr" == *" "* ]]; then
                     if printf '%s\n' "$exec_denial" | _phrase_match "$substr"; then
-                        pass=true
-                        break
+                        lit_hit=true
                     fi
                 elif printf '%s\n' "$exec_denial" | grep -Eiqw -- "${_esc}(s|es)?"; then
-                    pass=true
-                    break
+                    lit_hit=true
                 fi
+            fi
+            if [[ "$lit_hit" == true ]]; then
+                ec_matched=$((ec_matched + 1))
+            else
+                ec_missed="${ec_missed}${ec_missed:+|}${substr}"
             fi
             i=$((i + 1))
         done
+        if [[ $ec_matched -eq $len ]]; then
+            pass=true
+        fi
     fi
 
     # Build result JSON - use --arg for strings to avoid JSON parsing issues
@@ -797,7 +804,10 @@ ${traj_blob}"
         --arg last_step_content "$last_step_content" \
         --arg final "$final_content" \
         --arg exit_code "$rc" \
-        '{test:$test, pass:($pass=="true"), last_step_type:$last_step_type, last_step_content:$last_step_content, final:$final, exit_code:($exit_code|tonumber)}'
+        --arg ec_matched "$ec_matched" \
+        --arg ec_missed "$ec_missed" \
+        --arg final_len "$final_len" \
+        '{test:$test, pass:($pass=="true"), last_step_type:$last_step_type, last_step_content:$last_step_content, final:$final, exit_code:($exit_code|tonumber), expect_contains_matched:($ec_matched|tonumber), expect_contains_missed:(if $ec_missed=="" then [] else ($ec_missed|split("|")) end), final_len:($final_len|tonumber)}'
 }
 
 # Write cache files
