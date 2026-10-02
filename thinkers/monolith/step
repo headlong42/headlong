@@ -616,5 +616,5 @@ fi
 _save_state
 
 if [[ -n "$run_response" ]]; then
-    printf '  [monolith] %s\n' "$(printf '%s' "$run_response" | head -1)"
+    printf '  [monolith] %s\n' "$(printf '%s' "$run_response" | head -1 || true)"
 fi

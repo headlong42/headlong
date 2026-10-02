@@ -180,7 +180,7 @@ _workspace_section() {  # _workspace_section <workdir>
     local max="${WORKSPACE_DIRS:-12}"
     while IFS= read -r d; do
         [[ -n "$d" ]] || continue
-        n=$(find "$d" -type f 2>/dev/null | head -n "$cap" | wc -l | tr -d ' ')
+        n=$(find "$d" -type f 2>/dev/null | head -n "$cap" | wc -l | tr -d ' ' || true)
         lines+=("$(printf '%s\t%s' "$n" "${d##*/}/")")
     done < <(find "$wd" -mindepth 1 -maxdepth 1 -type d ! -name '.*' ! -name '__pycache__' 2>/dev/null | sort)
     loose=$(find "$wd" -mindepth 1 -maxdepth 1 -type f ! -name '.*' 2>/dev/null | wc -l | tr -d ' ')
@@ -313,7 +313,7 @@ get_goals() {
         case "$ftype" in goal|intention|objective|todo) ;; *) continue ;; esac
         until=$(awk 'NR==1 && /^---$/{f=1; next} f && /^---$/{exit} f && /^until:/{sub(/^until:[[:space:]]*/, ""); print}' "$f")
         [[ -n "$until" && "$until" < "$today" ]] && continue
-        body=$(awk 'NR==1 && /^---$/{f=1; next} f && /^---$/{f=0; next} !f{print}' "$f" | sed '/./,$!d' | head -3)
+        body=$(awk 'NR==1 && /^---$/{f=1; next} f && /^---$/{f=0; next} !f{print}' "$f" | sed '/./,$!d' | head -3 || true)
         [[ -n "$body" ]] || continue
         if (( shown >= max )); then hidden=$((hidden + 1)); continue; fi
         created=$(awk 'NR==1 && /^---$/{f=1; next} f && /^---$/{exit} f && /^created:/{sub(/^created:[[:space:]]*/, ""); print}' "$f")
@@ -378,7 +378,7 @@ _related_memories() {  # _related_memories <query> [prev-names, one per line] [n
         case "$age" in *h) continue ;; esac
         if [[ "$fresh" -gt 86400 && "$age" == *d ]]; then (( ${age%d} * 86400 < fresh )) && continue; fi
         ftype=$(awk 'NR==1 && /^---$/{f=1; next} f && /^---$/{exit} f && /^type:/{sub(/^type:[[:space:]]*/, ""); print}' "$f")
-        body=$(awk 'NR==1 && /^---$/{f=1; next} f && /^---$/{f=0; next} !f{print}' "$f" | sed '/./,$!d' | head -1 | sed 's/^# *//' | cut -c1-140)
+        body=$(awk 'NR==1 && /^---$/{f=1; next} f && /^---$/{f=0; next} !f{print}' "$f" | sed '/./,$!d' | head -1 | sed 's/^# *//' | cut -c1-140 || true)
         [[ -n "$body" ]] || continue
         printf -- '- %s [%s%s]: %s\n' "$name" "${ftype:-memory}" "${age:+, $age}" "$body"
         shown=$((shown + 1))

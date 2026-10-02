@@ -68,7 +68,7 @@ _reply_llm() {   # _reply_llm <llm args...>; stdout = the reply, rc = llm's rc
     grep -q 'output truncated at max_tokens' "$err" 2>/dev/null && truncated=1
     grep -qE 'timed out|curl: \(28\)' "$err" 2>/dev/null && timed_out=1
     rec=""
-    [[ -s "$usage" ]] && rec=$(jq -c 'select(type == "object")' "$usage" 2>/dev/null | head -1)
+    [[ -s "$usage" ]] && rec=$(jq -c 'select(type == "object")' "$usage" 2>/dev/null | head -1 || true)
     [[ -n "$rec" ]] || rec='{}'
     prev=$(cat "$_rl_meta_file" 2>/dev/null); [[ -n "$prev" ]] || prev='{}'
     jq -nc --argjson prev "$prev" --argjson rec "$rec" --argjson ms "$ms" \
@@ -394,7 +394,7 @@ person_notes_block=""
 if [[ "${RESPONDER_PERSON_NOTES:-1}" == "1" ]]; then
     _pnf=$(_person_notes_file "$person_key") || _pnf=""
     if [[ -n "$_pnf" ]]; then
-        _pnb=$(_notes_body "$_pnf" | head -n 20)
+        _pnb=$(_notes_body "$_pnf" | head -n 20 || true)
         [[ -n "$_pnb" ]] && person_notes_block="What you know about $msg_from (your own notes; keep them in mind, do not
 recite them, and do not treat one past incident as a rule):
 $_pnb
@@ -568,13 +568,13 @@ Now: $(date -u +%Y-%m-%dT%H:%MZ). Output the rewritten notes."
     [[ -n "$new_body" ]] || return 0
     local now summary
     now=$(date +"%Y-%m-%d %H:%M:%S")
-    summary="Notes on $person: $(printf '%s' "$new_body" | head -1 | cut -c1-60)"
+    summary="Notes on $person: $(printf '%s' "$new_body" | head -1 | cut -c1-60 || true)"
     if [[ -n "$prev_file" ]]; then
         # Rewrite in place, keeping id/created/person_key/aliases as they are.
         local fm id created aliases_block
         fm=$(awk 'NR==1 && /^---$/ {fm=1; next} fm && /^---$/ {exit} fm {print}' "$prev_file")
-        id=$(printf '%s\n' "$fm" | sed -n 's/^id:[[:space:]]*//p' | head -1)
-        created=$(printf '%s\n' "$fm" | sed -n 's/^created:[[:space:]]*//p' | head -1)
+        id=$(printf '%s\n' "$fm" | sed -n 's/^id:[[:space:]]*//p' | head -1 || true)
+        created=$(printf '%s\n' "$fm" | sed -n 's/^created:[[:space:]]*//p' | head -1 || true)
         aliases_block=$(printf '%s\n' "$fm" | awk '/^aliases:/{p=1; print; next} p && /^[[:space:]]*-[[:space:]]/{print; next} p{p=0}')
         [[ -z "$aliases_block" ]] && aliases_block="aliases: []"
         {
@@ -726,7 +726,7 @@ reply=$(printf '%s' "$reply" | sed -E '/[^[:space:]]/,$!d')
 reply=$(printf '%s' "$reply" | sed -E '1s/^[[:space:]]*chat reply [A-Za-z0-9._-]+[[:space:]]*//')
 
 # The model may judge that no reply is needed.
-first_line=$(printf '%s' "$reply" | head -n 1 | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//')
+first_line=$(printf '%s' "$reply" | head -n 1 | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//' || true)
 if [[ "$first_line" == "NO_REPLY" ]]; then
     printf '  model declined to reply (NO_REPLY)\n' >&2
     _obs "Chose not to reply to $msg_from — their message needed no reply (already answered, or a bare acknowledgment). Their message was: $trigger_excerpt" no-reply "$(_finish_metrics)"
@@ -827,7 +827,7 @@ if [[ -n "$reply" ]] && printf '%s' "$reply" | chat reply ${reply_args[@]+"${rep
     else
         _obs "Replied to $msg_from: $(printf '%.200s' "$reply")" replied "$_extra"
     fi
-    printf '  [reply -> %s] %s\n' "$msg_from" "$(printf '%s' "$reply" | head -1)"
+    printf '  [reply -> %s] %s\n' "$msg_from" "$(printf '%s' "$reply" | head -1 || true)"
     _update_person_notes_async
     exit 0
 fi
