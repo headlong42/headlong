@@ -26,7 +26,7 @@ run_script_on_box "N=$N; IDENT=$IDENT
 $(cat <<'ONBOX'
 set -uo pipefail
 cd /opt/shellm/app || exit 1
-T=$(ls .identities/$IDENT/trajectories/*-root/trajectory.jsonl | head -1)
+T=$(ls .identities/$IDENT/trajectories/*-root/trajectory.jsonl | head -1 || true)
 sudo tail -n 20000 "$T" | jq -r 'select(.type=="prompt") | .content' > /tmp/recall-judge-prompts.txt
 sudo -u shellm bash -lc "cd /opt/shellm/app && source .identities/$IDENT/activate >/dev/null 2>&1 && export PATH=/opt/shellm/app/bin:\$PATH && N=$N python3 - <<'PY'
 import os, re, subprocess, json

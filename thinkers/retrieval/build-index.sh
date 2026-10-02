@@ -16,9 +16,9 @@ mkdir -p "$(dirname "$out")"
 tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT
 for f in "$mem_dir"/*.md; do
     [[ -f "$f" ]] || continue
-    mid=$(sed -n 's/^id:[[:space:]]*//p' "$f" | head -1)
+    mid=$(sed -n 's/^id:[[:space:]]*//p' "$f" | head -1 || true)
     [[ -n "$mid" ]] || continue
-    summary=$(sed -n 's/^summary:[[:space:]]*//p' "$f" | head -1 | tr '\t' ' ')
+    summary=$(sed -n 's/^summary:[[:space:]]*//p' "$f" | head -1 | tr '\t' ' ' || true)
     # body lines plus the summary line; the rest of the frontmatter is skipped
     awk 'NR==1 && /^---$/ {f=1; next} f && /^---$/ {f=0; next} !f || /^summary:/' "$f" \
         | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]' '\n' \

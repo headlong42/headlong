@@ -511,7 +511,7 @@ _bugreport_text() {
     echo "install prefix on PATH: $(command -v persona 2>/dev/null || echo '(persona not on PATH)')"
     local t; for t in jq curl uv docker cargo python3 git; do
         if command -v "$t" >/dev/null 2>&1; then
-            printf '%s: %s\n' "$t" "$("$t" --version 2>&1 | head -1)"
+            printf '%s: %s\n' "$t" "$("$t" --version 2>&1 | head -1 || true)"
         else
             printf '%s: missing\n' "$t"
         fi

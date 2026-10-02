@@ -118,7 +118,7 @@ cmd_restore() {
                 exit 1
             fi
         fi
-        ref=\$(g stash list | grep -m1 '$MARKER' | cut -d: -f1)
+        ref=\$(g stash list | grep -m1 '$MARKER' | cut -d: -f1 || true)
         [ -z \"\$ref\" ] && { echo '=== NONE ==='; exit 0; }
         if ! g diff --quiet HEAD; then
             echo '=== DIRTY ==='

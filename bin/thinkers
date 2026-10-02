@@ -236,7 +236,7 @@ _resolve_traj_file() {
     fi
 
     local match
-    match=$(find "$traj_dir" -type d -name "${hex_prefix}-*" 2>/dev/null | head -1)
+    match=$(find "$traj_dir" -type d -name "${hex_prefix}-*" 2>/dev/null | head -1 || true)
     if [[ -n "$match" && -f "$match/trajectory.jsonl" ]]; then
         printf '%s' "$match/trajectory.jsonl"; return
     fi

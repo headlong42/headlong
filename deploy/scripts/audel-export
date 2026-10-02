@@ -92,7 +92,7 @@ PUT_URL='$put_url'
 $(cat <<'ONBOX'
 set -euo pipefail
 [ -d "$IDENT_DIR" ] || { echo "no identity dir on box: $IDENT_DIR" >&2; exit 1; }
-ROOT=$(ls -d "$IDENT_DIR"/trajectories/*-root | head -1)
+ROOT=$(ls -d "$IDENT_DIR"/trajectories/*-root | head -1 || true)
 TRAJ="$ROOT/trajectory.jsonl"
 [ -f "$TRAJ" ] || { echo "no root trajectory under $IDENT_DIR" >&2; exit 1; }
 
