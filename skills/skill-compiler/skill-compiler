@@ -232,6 +232,14 @@ max_entries = int(os.environ.get("SKILL_HARVEST_MAX_ENTRIES", "600"))
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 BAD = re.compile(r"(/[\w.\-]+){2,}|[0-9a-f]{10,}|\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}|\b\d{6,}\b|<@|https?://", re.I)
 CODEY = re.compile(r"^\s*(def |class |import |from |return |if |elif |for |while |try:|except|pass\b|#!|\$\s|echo |printf |grep |sed |awk )|\$\(|\bprint\(|=>|;\s*$")
+
+NOTE_TOK = re.compile(r'^[A-G](?:#|b)?\d$')
+LABELED_TOK = re.compile(r"^[A-Za-z][A-Za-z' ]*:\s*(.*)$")
+def is_input_echo(s):
+    m = LABELED_TOK.match(s)
+    rest = m.group(1) if m else s
+    toks = rest.split()
+    return bool(toks) and all(NOTE_TOK.match(t) for t in toks)
 src = set()
 for fn in sorted(os.listdir(skill_abs)):
     if not (fn.endswith(".py") or fn.endswith(".sh")):
@@ -246,6 +254,7 @@ for fn in sorted(os.listdir(skill_abs)):
     except Exception:
         pass
 cnt = collections.Counter()
+echo_dropped = 0
 invocations = 0
 for path in open(os.environ["SKILL_HARVEST_FILES"], errors="replace"):
     path = path.strip()
@@ -271,6 +280,9 @@ for path in open(os.environ["SKILL_HARVEST_FILES"], errors="replace"):
                     st = ANSI.sub("", ln).strip().strip("\u2502").strip()
                     if not (4 <= len(st) <= 160):
                         continue
+                    if is_input_echo(st):
+                        echo_dropped += 1
+                        continue
                     if BAD.search(st) or CODEY.search(st) or st in src:
                         continue
                     if len(re.findall(r"[A-Za-z]", st)) < 5:
@@ -279,7 +291,7 @@ for path in open(os.environ["SKILL_HARVEST_FILES"], errors="replace"):
             cmd = None
     fh.close()
 entries = [{"line": l, "count": c} for l, c in sorted(cnt.items(), key=lambda kv: (-kv[1], kv[0])) if c >= min_count][:max_entries]
-blob = {"pool": "history live-run literals from real tool stdout (auto-harvest)", "skill": os.path.basename(skill_abs.rstrip("/")), "script": script, "min_count": min_count, "invocations": invocations, "distinct_lines": len(cnt), "entries": entries}
+blob = {"echo_dropped": echo_dropped, "pool": "history live-run literals from real tool stdout (auto-harvest)", "skill": os.path.basename(skill_abs.rstrip("/")), "script": script, "min_count": min_count, "invocations": invocations, "distinct_lines": len(cnt), "entries": entries}
 tmp = out_path + ".tmp"
 open(tmp, "w").write(json.dumps(blob, indent=1))
 os.replace(tmp, out_path)
