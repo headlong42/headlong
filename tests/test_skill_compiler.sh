@@ -359,6 +359,52 @@ else
   bad "summary surfaces the pool truncation" "summary=$(jq -c '.summary' "$CM" 2>/dev/null)"
 fi
 
+# ECHO-FILTER 2026-10-03 (review follow-up on the input-echo harvest filter):
+# the history harvester must drop input-echo lines (rule A+C: a labelled line
+# whose remainder is a run of pure note tokens OR pure interval tokens) before
+# they reach the pool, count what it dropped in the pool blob, and keep a
+# labelled near-miss that only looks like an echo. The fixture trajectory
+# carries one note-sequence echo, one interval-sequence echo and one near-miss
+# ("Verdict: A1 X9 tune kept in pool", mixed tokens plus words) that a
+# too-broad filter would drop along with them.
+FIXE="$WORK/skills/fixture-echo"
+mkdir -p "$FIXE"
+cat > "$FIXE/fixture_echo.py" <<'PYEOF'
+#!/usr/bin/env python3
+print("verdict line kept in pool")
+PYEOF
+cat > "$FIXE/SKILL.md" <<'MDEOF'
+---
+name: fixture-echo
+description: Fixture whose harvested output carries input echoes.
+---
+
+# fixture-echo
+
+Run `python3 fixture_echo.py` to print the verdict.
+MDEOF
+TRAJX="$WORK/traj-echo"
+mkdir -p "$TRAJX"
+cat > "$TRAJX/run.jsonl" <<'JSONEOF'
+{"type":"reasoning","cmd":"python3 fixture_echo.py"}
+{"type":"shell-output","stdout":"Notes: A1 B2 C3 D4 E4 F4 G4\nIntervals: major- minor- perfec octave\nVerdict: A1 X9 tune kept in pool"}
+JSONEOF
+export SKILL_HARVEST_CACHE="$WORK/harvest-echo" SKILL_HARVEST_TRAJ_DIR="$TRAJX" SKILL_HARVEST_REFRESH=1 SKILL_HARVEST_MIN_COUNT=1
+run_sc pool --skill fixture-echo >/dev/null 2>&1 || true
+unset SKILL_HARVEST_CACHE SKILL_HARVEST_TRAJ_DIR SKILL_HARVEST_REFRESH SKILL_HARVEST_MIN_COUNT
+HBLOB="$WORK/harvest-echo/pool-history-fixture-echo.json"
+if [ -f "$HBLOB" ] && jq -e '.echo_dropped == 2 and .invocations >= 1' "$HBLOB" >/dev/null 2>&1; then
+  ok "harvest drops note and interval echoes and counts them (echo_dropped 2)"
+else
+  bad "harvest drops note and interval echoes and counts them (echo_dropped 2)" "blob=$(jq -c '{echo_dropped,distinct_lines,invocations}' "$HBLOB" 2>/dev/null)"
+fi
+if [ -f "$HBLOB" ] && jq -e '[.entries[].line] | any(. == "Verdict: A1 X9 tune kept in pool")' "$HBLOB" >/dev/null 2>&1 && jq -e '[.entries[].line] | any(. == "Notes: A1 B2 C3 D4 E4 F4 G4" or . == "Intervals: major- minor- perfec octave") | not' "$HBLOB" >/dev/null 2>&1; then
+  ok "a labelled near-miss line survives the echo filter"
+else
+  bad "a labelled near-miss line survives the echo filter" "entries=$(jq -c '[.entries[].line]' "$HBLOB" 2>/dev/null)"
+fi
+rm -f "$REPO/skills/skill-compiler/.compiled/pool-fixture-echo.json"
+
 rm -f "$REPO/skills/skill-compiler/.compiled/fixture-many.json" "$REPO/skills/skill-compiler/.compiled/fixture-many.md" "$POOLFILE"
 rm -f "$REPO/skills/skill-compiler/.compiled/pool-fixture-greet.json"
 
