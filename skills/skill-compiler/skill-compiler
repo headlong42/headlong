@@ -239,7 +239,7 @@ LABELED_TOK = re.compile(r"^[A-Za-z][A-Za-z' ]*:\s*(.*)$")
 def is_input_echo(s):
     # rule A+C: a labeled line whose remainder is a run of pure note tokens
     # OR a run of pure interval tokens (Intervals: echoes), same as
-    # bin/skill-deletion-gate is_echo / _echo_class.
+    # skills/skill-compiler/skill-deletion-gate (in this branch) is_echo / _echo_class.
     m = LABELED_TOK.match(s)
     rest = m.group(1) if m else s
     toks = rest.split()
