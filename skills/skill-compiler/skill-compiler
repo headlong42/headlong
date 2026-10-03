@@ -234,12 +234,18 @@ BAD = re.compile(r"(/[\w.\-]+){2,}|[0-9a-f]{10,}|\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2
 CODEY = re.compile(r"^\s*(def |class |import |from |return |if |elif |for |while |try:|except|pass\b|#!|\$\s|echo |printf |grep |sed |awk )|\$\(|\bprint\(|=>|;\s*$")
 
 NOTE_TOK = re.compile(r'^[A-G](?:#|b)?\d$')
+INTERVAL_TOK = re.compile(r'^(?:major-|minor-|perfec|octave|unison|triton)$')
 LABELED_TOK = re.compile(r"^[A-Za-z][A-Za-z' ]*:\s*(.*)$")
 def is_input_echo(s):
+    # rule A+C: a labeled line whose remainder is a run of pure note tokens
+    # OR a run of pure interval tokens (Intervals: echoes), same as
+    # bin/skill-deletion-gate is_echo / _echo_class.
     m = LABELED_TOK.match(s)
     rest = m.group(1) if m else s
     toks = rest.split()
-    return bool(toks) and all(NOTE_TOK.match(t) for t in toks)
+    if not toks:
+        return False
+    return all(NOTE_TOK.match(t) for t in toks) or all(INTERVAL_TOK.match(t) for t in toks)
 src = set()
 for fn in sorted(os.listdir(skill_abs)):
     if not (fn.endswith(".py") or fn.endswith(".sh")):
