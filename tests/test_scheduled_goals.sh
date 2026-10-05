@@ -155,6 +155,21 @@ has   "closed-keys: says closed, not sent"   "$out" "the 12:00 window was closed
 hasnt "closed-keys: never claims a send"     "$out" "was sent at"
 out=$(SCHEDULE_CLOSED_KEYS="$WORK/no-such-file.keys" signals "$DAY 12:30" | grep -F "Closed duty")
 has  "closed-keys: a missing manifest is harmless" "$out" "DUE NOW"
+# the manifest may be ledger prose (closed-keys.md bullets) or a .skip receipt
+cat > "$WORK/closed.prose" <<XPROSE
+# Closed window keys
+
+A window key whose ledger entry is a .skip record is closed for good.
+- $CID/$DAY-1200
+XPROSE
+out=$(SCHEDULE_CLOSED_KEYS="$WORK/closed.prose" signals "$DAY 12:30" | grep -F "Closed duty")
+hasnt "closed-keys: a prose bullet is not due" "$out" "DUE NOW"
+has   "closed-keys: a prose bullet says closed" "$out" "closed without a post"
+printf 'key=%s/%s-1200\nskipped=2026-10-04T19:40:42Z\nreason=deliberate no-send\n' "$CID" "$DAY" > "$WORK/closed.skip"
+out=$(SCHEDULE_CLOSED_KEYS="$WORK/closed.skip" signals "$DAY 12:30" | grep -F "Closed duty")
+hasnt "closed-keys: a skip receipt is not due" "$out" "DUE NOW"
+has   "closed-keys: a skip receipt says closed" "$out" "closed without a post"
+
 
 # an expired goal is skipped
 mem add --type goal --until 2020-01-01 --schedule "10:00" "Expired duty" >/dev/null 2>&1

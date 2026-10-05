@@ -255,7 +255,12 @@ _schedule_signals() {
     sent=$(chat sent --since 2d -n 500 --json 2>/dev/null | jq -r '.[] | select(.key != null and .state != "failed" and .state != "skipped") | "\(.key) \(.ts[11:16])Z"' 2>/dev/null) || sent=""
     closed=""
     if [[ -n "${SCHEDULE_CLOSED_KEYS:-}" && -f "${SCHEDULE_CLOSED_KEYS}" ]]; then
-        closed=$(awk '{print $1}' "$SCHEDULE_CLOSED_KEYS")
+        # Match key-shaped tokens anywhere in the manifest: it may be a bare
+        # one-key-per-line list or the ledger prose it is generated from
+        # (notes/daily-papers/closed-keys.md bullets, a .skip receipt's key=
+        # line). A column-1 read parsed none of the real ledger's keys, so the
+        # window kept flashing DUE NOW even with the manifest set.
+        closed=$(grep -oE '[A-Za-z0-9.-]+/[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4}' "$SCHEDULE_CLOSED_KEYS" 2>/dev/null | sort -u)
     fi
     while IFS= read -r f; do
         [[ -n "$f" ]] || continue
@@ -270,7 +275,7 @@ _schedule_signals() {
             if (( t_m > now_m )); then
                 if [[ -z "$next" ]]; then next="$t $zone, in $(( (t_m - now_m) / 60 ))h$(( (t_m - now_m) % 60 ))m"; fi
             elif [[ -n "$at" ]]; then said="${said}the $t window was sent at $at; "; due=""
-            elif printf '%s\n' "$closed" | grep -qx -- "$key"; then said="${said}the $t window was closed without a post; "
+            elif printf '%s\n' "$closed" | grep -qx -- "$key"; then said="${said}the $t window was closed without a post; "; due=""
             elif (( now_m - t_m <= grace )); then due="$t $key"
             else said="${said}the $t window was missed, let it go; "; fi
         done

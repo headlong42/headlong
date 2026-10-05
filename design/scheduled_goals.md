@@ -211,3 +211,13 @@ _schedule_signals therefore also reads SCHEDULE_CLOSED_KEYS, a path to a
 plain one-key-per-line manifest, and treats any key listed there as done,
 reported as "the window was closed without a post" so nobody waits for a
 delivery that is not coming. A missing or unset manifest changes nothing.
+
+The manifest is read for key-shaped tokens anywhere in the file, not for bare
+lines: the real ledger (notes/daily-papers/closed-keys.md) keeps its keys in
+prose bullets, and a .skip receipt carries its key on a key= line. A column-1
+parse matched none of them, so the fix as first drafted would have left the
+stale DUE NOW flash alive even after it merged.
+
+Deploy still has to point SCHEDULE_CLOSED_KEYS at the manifest. Until it does,
+a closed window is offered as DUE NOW as before, and the mind answers a key it
+has already adjudicated with its drop command rather than re-deciding it.
