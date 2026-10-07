@@ -285,9 +285,6 @@ else
     bad "large wrapped heredoc is preserved without sending the script through argv"
 fi
 
-echo
-[[ $fail -eq 0 ]]
-
 # CRLF: a Windows line ending must not survive into the extracted code, and
 # must not stop the closing fence from being recognized.
 resp=$'```bash\r\necho crlf\r\n```\r\n'
@@ -295,7 +292,7 @@ out=$(extract_code "$resp")
 if [[ "$out" == "echo crlf" ]]; then
     ok "CRLF line endings are stripped from the extracted code"
 else
-    bad "CRLF line endings are stripped from the extracted code" "$(printf '%s' "$out" | cat -A)"
+    bad "CRLF line endings are stripped from the extracted code" "$(printf '%s' "$out" | cat -vet)"
 fi
 
 # Harness provenance lines ([served_by], [exit], [stdout], ...) pasted after a
@@ -317,4 +314,34 @@ if [[ "$out" == $'echo before\n[exit] 1\necho after' ]]; then
 else
     bad "provenance text inside a fence is literal code" "$out"
 fi
+
+# A provenance word inside an unfenced heredoc or multiline quote is data.
+# Compare all output, including the trailing command, and write the heredoc
+# to a file so truncating its contents cannot look like a successful run.
+for marker in served_by exec_s exit stdout stderr; do
+    for quoting in heredoc single double; do
+        case "$quoting" in
+            heredoc) script=$(printf "cat <<'DATA' > '%s/literal'\nbefore\n[%s]\nafter\nDATA\ncat '%s/literal'\necho AFTER\n" "$WORK" "$marker" "$WORK") ;;
+            single) script=$(printf "printf '%%s\\\\n' 'before\n[%s]\nafter'\necho AFTER\n" "$marker") ;;
+            double) script=$(printf "printf '%%s\\\\n' \"before\n[%s]\nafter\"\necho AFTER\n" "$marker") ;;
+        esac
+        expected=$(printf '%s\n' "$script" | bash)
+        out=$(extract_code "$script")
+        ran=$(printf '%s\n' "$out" | bash 2>"$WORK/notice"); rc=$?
+        if [[ "$rc" -eq 0 && "$ran" == "$expected" ]]; then
+            ok "unfenced $quoting preserves [$marker] and the trailing command"
+        else
+            bad "unfenced $quoting preserves [$marker] and the trailing command" "rc=$rc ran=$ran"
+        fi
+    done
+done
+
+# A large discarded trailer must not make the upstream printf die on SIGPIPE.
+resp=$'echo one\n[stdout]\n'"$padding"
+out=$(extract_code "$resp")
+ran=$(printf '%s\n' "$out" | bash 2>"$WORK/notice")
+[[ "$ran" == one ]] && ok "a large provenance trailer is discarded" || bad "a large provenance trailer is discarded" "$ran"
+
+echo
 echo "$pass passed, $fail failed"
+[[ $fail -eq 0 ]]

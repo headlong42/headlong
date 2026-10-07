@@ -2029,15 +2029,22 @@ extract_code() {
     # Strip [cmd]/[thought] markers that the model may emit instead of fences.
     local no_fence=0
     if [[ -z "$code" ]]; then
-        # Cut at the first provenance line: harness metadata ([served_by],
-        # [exec_s], [exit], [stdout], [stderr]) is structure from the run
-        # harness, never code to execute. Everything after it is metadata.
         code=$(printf '%s\n' "$response" | awk '
-            /^\[(served_by|exec_s|exit|stdout|stderr)\]/ { exit }
             /^[[:space:]]*\[cmd\][[:space:]]*$/ { next }
             /^[[:space:]]*\[thought\]/ { next }
             { print }
         ')
+        # A provenance marker may be literal data in a heredoc or quote.
+        # Cut only when the prefix is a complete script; leave ambiguous
+        # replies intact. Consume all input to avoid SIGPIPE under pipefail.
+        local before_provenance
+        before_provenance=$(printf '%s\n' "$code" | awk '
+            /^\[(served_by|exec_s|exit|stdout|stderr)\]/ { cut = 1 }
+            !cut { print }
+        ')
+        if [[ "$before_provenance" != "$code" ]] && script_parses "$before_provenance"; then
+            code="$before_provenance"
+        fi
         # A response with no bash block and real content is about to be run as
         # a shell command. That is almost always the model ending its turn with
         # a plain sentence (which fails "command not found") or forgetting the
