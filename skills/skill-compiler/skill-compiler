@@ -309,7 +309,9 @@ capture_phrase_pool() {
     local skill_abs="$1"
     [[ -d "$skill_abs" ]] || { printf '[]'; return 0; }
     local src_pool
-    src_pool=$(SKILL_ABS="$skill_abs" python3 - <<'PY' 2>/dev/null || printf '[]'
+    local _sc_src_pool_py
+    _sc_src_pool_py=$(mktemp "${TMPDIR:-/tmp}/sc_src_pool.XXXXXX") || { printf '[]'; return 0; }
+    cat > "$_sc_src_pool_py" <<'PY'
 import os, re, json, glob
 d = os.environ["SKILL_ABS"]
 out = []
@@ -350,7 +352,8 @@ for s in out:
         uniq.append(s)
 print(json.dumps(uniq[:int(os.environ.get("SKILL_POOL_SRC_CAP", "200"))]))
 PY
-)
+    src_pool=$(SKILL_ABS="$skill_abs" python3 "$_sc_src_pool_py" 2>/dev/null || printf '[]')
+    rm -f "$_sc_src_pool_py"
     local script="" live_pool="[]"
     if [[ -f "$skill_abs/SKILL.md" ]]; then
         script=$(grep -oE '[A-Za-z0-9_.-]+\.(py|sh)' "$skill_abs/SKILL.md" | head -1 || true)
@@ -376,7 +379,9 @@ PY
     # pool-vacuity-map-2026-09-27.md). Harvest the output vocabulary the skill's own
     # SKILL.md documents: non-command lines of fenced examples plus quoted prose
     # literals. Script and live-run pools keep priority.
-    doc_pool=$(SKILL_ABS="$skill_abs" python3 - <<'PY' 2>/dev/null || printf '[]'
+    local _sc_doc_pool_py
+    _sc_doc_pool_py=$(mktemp "${TMPDIR:-/tmp}/sc_doc_pool.XXXXXX") || { printf '[]'; return 0; }
+    cat > "$_sc_doc_pool_py" <<'PY'
 import os, re, json
 d = os.environ["SKILL_ABS"]
 out = []
@@ -452,7 +457,8 @@ for s in out:
         uniq.append(s)
 print(json.dumps(uniq[:int(os.environ.get("SKILL_POOL_SRC_CAP", "200"))]))
 PY
-)
+    doc_pool=$(SKILL_ABS="$skill_abs" python3 "$_sc_doc_pool_py" 2>/dev/null || printf '[]')
+    rm -f "$_sc_doc_pool_py"
     # POOL-CAP FIX 2026-10-02 (review follow-up on the pool attestation): the
     # caps above used to drop real phrases invisibly. unique sorts, so .[:200]
     # kept the entries that sort first, and a real phrase sorting later was
