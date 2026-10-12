@@ -436,7 +436,15 @@ domain_self() {
     # noun must be adjective-shaped (participle or a listed adjective), so a
     # verb or preposition ("all failed in the runs I checked") still does not
     # read as a noun modifier, and the noun is any plural noun.
-    if printf '%s\n' "$res" | grep -qiE "^[[:space:]]*(${modshape}[[:space:]]+)*(${plnoun})\b"; then return 0; fi
+    if printf '%s\n' "$res" | grep -qiE "^[[:space:]]*(${modshape}[[:space:]]+)*(${plnoun})\b"; then
+      # Deepen 2026-10-12 (predre bare/3sg follow-up): plnoun's first
+      # alternative [a-z]+(s|es) also matches bare present-tense verbs
+      # (fails, passes, succeeds, clears, breaks), so "none fails" read
+      # as noun+domain and skipped the universal. The noun word must not
+      # be a predicate-list word.
+      nw=$(printf '%s\n' "$res" | sed -E "s/^[[:space:]]*((${modshape})[[:space:]]+)*//I; s/[[:space:]].*$//")
+      printf '%s\n' "$nw" | grep -qiE "^${predre}$" || return 0
+    fi
     if printf '%s\n' "$res" | grep -qiE "$coref_self"; then return 0; fi
     # Adjudication 2026-10-11 (adjrel m-adjkept/known/made/set, lexedge
     # m-{built,read,sent,shown}-* and m-known-rules): a predicate-list word used

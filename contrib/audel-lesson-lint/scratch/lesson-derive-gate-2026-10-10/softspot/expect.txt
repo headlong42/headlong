@@ -18,3 +18,9 @@ m-noone.md refuse
 m-pr.md refuse
 m-stepnum.md refuse
 m-year.md refuse
+a-predre-fails.md accept
+a-predre-pass.md accept
+a-predre-passes.md accept
+a-predre-succeeds.md accept
+a-predre-clears.md accept
+a-predre-breaks.md accept
