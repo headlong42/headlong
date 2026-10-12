@@ -374,7 +374,7 @@ bound_in() {
 # on its own. Residual named for the next pass: the irregular list and the
 # noun-lead rule below are still lexical, so a bare universal whose domain
 # word is not in nounplre ("all cohorts") reads as coreferential.
-predre='(failed|passed|pass|broke|worked|held|moved|changed|stopped|stuck|landed|merged|sent|arrived|ran|went|came|did|was|were|got|made|took|kept|left|fell|rose|cleared|clean|green|red|fine|broken|fixed|open|closed|stale|new|old|slow|fast|wrong|right|late|early|quiet|loud|clear|fuzzy|stable|gone|done|come|become|taken|given|shown|known|grown|written|fallen|risen|seen|won|lost|felt|built|put|cut|set|hit|read|led|fed|of (them|these|those)|[a-z]+(ed|en))'
+predre='(failed|passed|pass|passes|succeeds|succeeded|clears|fails|fail|broke|breaks|worked|held|moved|changed|stopped|stuck|landed|merged|sent|arrived|ran|went|came|did|was|were|got|made|took|kept|left|fell|rose|cleared|clean|green|red|fine|broken|fixed|open|closed|stale|new|old|slow|fast|wrong|right|late|early|quiet|loud|clear|fuzzy|stable|gone|done|come|become|taken|given|shown|known|grown|written|fallen|risen|seen|won|lost|felt|built|put|cut|set|hit|read|led|fed|of (them|these|those)|[a-z]+(ed|en))'
 # Lexlead pass (2026-10-10): adjective-shaped noun modifiers, so the
 # noun-lead chain can tell a modifier from a verb or a preposition. Any
 # regular participle plus a short adjective list; residual named for the next
