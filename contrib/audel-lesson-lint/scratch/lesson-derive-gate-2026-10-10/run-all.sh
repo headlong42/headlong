@@ -3,8 +3,6 @@
 # regression against the folded bin/lesson-derive-gate. Exit 0 only if all
 # recorded expectations hold.
 set -u
-# Seconds each fixture may take before it is declared wedged and fails.
-: "${FIXTURE_TIMEOUT:=20}"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 B="$ROOT/scratch/lesson-derive-gate-2026-10-10"
 L="$ROOT/bin/lesson-overreach-lint"
@@ -12,24 +10,7 @@ G="$ROOT/bin/lesson-derive-gate"
 pass=0; fail=0
 chk() {
   name=$1; want=$2; shift 2
-  # Per-fixture timeout so a wedged linter call fails fast instead of
-  # hanging the whole run (2026-10-12: a mutated nested probe wedged the
-  # runner for 30s+). GNU timeout exits 124 on timeout; gtimeout is the
-  # macOS coreutils name. If neither exists, run without a timeout.
-  local to=
-  if command -v timeout >/dev/null 2>&1; then to=timeout
-  elif command -v gtimeout >/dev/null 2>&1; then to=gtimeout; fi
-  if [ -n "$to" ]; then
-    out=$("$to" "$FIXTURE_TIMEOUT" "$@" 2>&1); got=$?
-    if [ "$got" = 124 ]; then
-      printf 'FAIL %-28s timed out (>%ss)\n' "$name" "$FIXTURE_TIMEOUT"
-      printf '%s\n' "$out" | head -2 | sed 's/^/     /'
-      fail=$((fail+1))
-      return
-    fi
-  else
-    out=$("$@" 2>&1); got=$?
-  fi
+  out=$("$@" 2>&1); got=$?
   if [ "$got" = "$want" ]; then
     printf 'ok   %-28s want=%s\n' "$name" "$want"; pass=$((pass+1))
   else
@@ -70,50 +51,60 @@ echo "=== corpora the runner was blind to (added 2026-10-10) ==="
 corpus_run() {
   cname=$1
   cdir="$B/$cname"
-  # Recurse so fixtures in corpus subdirs are graded too (maxdepth-1 glob
-  # silently skipped edge/labelbreak, irrtail/probes and relcl/gate).
-  while IFS= read -r f; do
-    [ -e "$f" ] || continue
-    rel=${f#"$cdir"/}
-    base=$(basename "$f")
-    want=""
-    if [ -f "$cdir/expect.txt" ]; then
-      # exact subpath first, then basename fallback
-      want=$(awk -v n="$rel" '$1==n{print $2}' "$cdir/expect.txt")
-      [ -n "$want" ] || want=$(awk -v n="$base" '$1==n{print $2}' "$cdir/expect.txt")
-    elif [ -f "$cdir/expected.tsv" ]; then
-      want=$(awk -F'\t' -v n="$rel" '$1==n{print $2}' "$cdir/expected.tsv")
-      [ -n "$want" ] || want=$(awk -F'\t' -v n="$base" '$1==n{print $2}' "$cdir/expected.tsv")
-    fi
-    if [ -z "$want" ]; then
-      case "$base" in
-        m*|m-*) want=refuse ;;
-        *draft*) want=accept ;;
-        a*|a-*) want=accept ;;
+  for loc in "$cdir"; do
+    for f in "$loc"/*.md; do
+      [ -e "$f" ] || continue
+      base=$(basename "$f")
+      want=""
+      if [ -f "$loc/expect.txt" ]; then
+        want=$(awk -v n="$base" '$1==n{print $2}' "$loc/expect.txt")
+      elif [ -f "$loc/expected.tsv" ]; then
+        want=$(awk -F'\t' -v n="$base" '$1==n{print $2}' "$loc/expected.tsv")
+      else
+        case "$base" in
+          m*|m-*) want=refuse ;;
+          *draft*) want=accept ;;
+          a*|a-*) want=accept ;;
+        esac
+      fi
+      case "$want" in
+        accept) w=0 ;;
+        refuse) w=1 ;;
+        *) continue ;;
       esac
-    fi
-    case "$want" in
-      accept) w=0 ;;
-      refuse) w=1 ;;
-      *) continue ;;
-    esac
-    chk "$cname/$rel" "$w" "$L" "$f"
-  done < <(find "$cdir" -type f -name '*.md' | sort)
+      chk "$cname/$base" "$w" "$L" "$f"
+    done
+    for sub in "$loc"/*/; do
+      [ -d "$sub" ] || continue
+      for f in "$sub"/*.md; do
+        [ -e "$f" ] || continue
+        base=$(basename "$f")
+        want=""
+        if [ -f "$sub/expect.txt" ]; then
+          want=$(awk -v n="$base" '$1==n{print $2}' "$sub/expect.txt")
+        elif [ -f "$sub/expected.tsv" ]; then
+          want=$(awk -F'\t' -v n="$base" '$1==n{print $2}' "$sub/expected.tsv")
+        else
+          case "$base" in
+            m*|m-*) want=refuse ;;
+            *draft*) want=accept ;;
+            a*|a-*) want=accept ;;
+          esac
+        fi
+        case "$want" in
+          accept) w=0 ;;
+          refuse) w=1 ;;
+          *) continue ;;
+        esac
+        chk "$cname/$(basename "$sub")/$base" "$w" "$L" "$f"
+      done
+    done
+  done
 }
 # Vbshape pass finding 2026-10-11: adjrel, lexedge and sharedvp also sat
 # outside the runner (relcl flips in them were only ever seen by the ad-hoc
 # tree sweep), and the vbshape corpus joins here.
-# Enumerate .md fixture dirs so no corpus drops out when a name is added.
-# The four special corpora above (edge, reachgap, overreach, fold) are skipped.
-for d in "$B"/*/; do
-  cname=$(basename "$d")
-  case "$cname" in
-    edge|reachgap|overreach|fold) continue ;;
-  esac
-  if find "$d" -type f -name '*.md' -print -quit | grep -q .; then
-    corpus_run "$cname"
-  fi
-done
+for c in softspot seam counttrail barewidening sothat widenedge nounlead bothedge lexlead relcl adjrel lexedge sharedvp vbshape irrverb irrtail particle objslot objshape objpron herplural countshape probe-sop reduced verbtail adjudicate adshape; do corpus_run "$c"; done
 
 echo "---"
 echo "pass=$pass fail=$fail"

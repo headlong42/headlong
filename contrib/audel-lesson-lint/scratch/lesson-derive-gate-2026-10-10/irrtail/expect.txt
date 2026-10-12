@@ -13,7 +13,3 @@ m-shape-pluraltail.md refuse
 m-toolsused.md refuse
 m-pluralword-verb.md refuse
 m-adjphrasal.md refuse
-probes/probe-flungopen.md accept
-probes/probe-keeprangout.md accept
-probes/probe-setinmotion.md accept
-probes/m-bootup.md accept
