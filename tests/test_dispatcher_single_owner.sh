@@ -263,6 +263,51 @@ test_lock_is_held() {
     env_run thinkers stop >/dev/null 2>&1
 }
 
+test_lock_timeout_exits() {
+    if ! command -v flock >/dev/null 2>&1; then
+        ok "a blocked start waits for the lock then exits (skipped, no flock here)"
+        return
+    fi
+    setup_identity
+
+    # Hold the dispatcher lock from the test process with nobody else to
+    # release it. A fresh start blocks its full 15s window on the lock,
+    # then exits 0 rather than hanging or firing. The start leaves its own
+    # token behind (it takes over first) but never becomes a dispatcher,
+    # so nothing must dispatch.
+    local i
+    mkdir -p "$RUN"
+    exec 9>"$RUN/dispatcher.lock"
+    flock -x 9 2>/dev/null
+
+    # `thinkers start` returns as soon as it forks the dispatcher loop, so
+    # the flock block lives in that background child. Poll the dispatcher's
+    # own log for the timeout line: it must appear within the 15s lock
+    # window plus a couple of ticks, and nothing may dispatch.
+    env_run thinkers start >/dev/null 2>&1
+    local timed_out=0
+    for ((i = 0; i < 25; i++)); do
+        grep -q "lock timeout waiting for the incumbent - exiting" "$RUN/logs/dispatcher.log" 2>/dev/null && { timed_out=1; break; }
+        sleep 1
+    done
+
+    if [[ "$timed_out" -eq 1 ]]; then
+        ok "a blocked start waits out its lock window and reports the timeout"
+    else
+        bad "a blocked start waits out its lock window and reports the timeout" "no timeout line after 25s; log: $(tr '\n' ' ' < "$RUN/logs/dispatcher.log" 2>/dev/null)"
+    fi
+
+    if [[ "$(record_count)" -eq 0 ]]; then
+        ok "a timed-out start never becomes a dispatcher, nothing fires"
+    else
+        bad "a timed-out start never becomes a dispatcher, nothing fires" "record count $(record_count)"
+    fi
+
+    flock -u 9 2>/dev/null
+    exec 9>&-
+    env_run thinkers stop >/dev/null 2>&1
+}
+
 test_tokens_unique() {
     setup_identity
     start_thinkers
@@ -379,7 +424,64 @@ SHIM
     env_run thinkers stop >/dev/null 2>&1
 }
 
+test_stale_claim_non_numeric_wake_at() {
+    # The two sweep branches that keep a non-numeric wake_at: a claim with
+    # a readable due time is re-armed into the wake_at (the empty file is
+    # garbage the scheduler would otherwise drop), and a claim with an
+    # unreadable due time is dropped outright, leaving the garbage wake_at
+    # for the scheduler's own non-numeric cleanup. Both must never fire the
+    # occurrence early.
+    setup_identity
+    env_run env THINKERS_CLAIM_STALE_SECS=1 thinkers start >/dev/null 2>&1
+    sleep 2
+    mkdir -p "$RUN/claimed"
+
+    # Branch 1: readable claim due time, non-numeric wake_at. The sweep
+    # replaces the garbage wake_at with the claim's real due time, so the
+    # wake survives as a valid future schedule instead of being dropped by
+    # the scheduler's own non-numeric cleanup.
+    printf '%s' "$(( $(now) + 600 ))" > "$RUN/claimed/napper"
+    touch -d '2 minutes ago' "$RUN/claimed/napper" 2>/dev/null || touch -t 202001010000 "$RUN/claimed/napper"
+    printf 'garbage-not-a-time' > "$RUN/napper.wake_at"
+    sleep 5
+
+    if [[ "$(cat "$RUN/napper.wake_at" 2>/dev/null)" =~ ^[0-9]+$ ]]; then
+        ok "a readable stale claim is re-armed into a garbage wake_at instead of dropped"
+    else
+        bad "a readable stale claim is re-armed into a garbage wake_at instead of dropped" "wake_at=$(cat "$RUN/napper.wake_at" 2>/dev/null)"
+    fi
+    if [[ ! -f "$RUN/claimed/napper" ]]; then
+        ok "the re-armed claim is consumed exactly once"
+    else
+        bad "the re-armed claim is consumed exactly once"
+    fi
+    rm -f "$RUN/napper.wake_at"
+
+    # Branch 2: both claim and wake_at unreadable. The claim is dropped and
+    # the garbage wake_at is left for the scheduler, which removes it on its
+    # own pass: nothing fires because no due time is readable anywhere.
+    printf 'also-garbage' > "$RUN/claimed/napper"
+    touch -d '2 minutes ago' "$RUN/claimed/napper" 2>/dev/null || touch -t 202001010000 "$RUN/claimed/napper"
+    printf 'still-garbage' > "$RUN/napper.wake_at"
+    sleep 5
+
+    if [[ ! -f "$RUN/napper.wake_at" && "$(record_count)" -eq 0 ]]; then
+        ok "an unreadable claim leaves a garbage wake_at alone, the scheduler drops it and nothing fires"
+    else
+        bad "an unreadable claim leaves a garbage wake_at alone, the scheduler drops it and nothing fires" "wake=$( [[ -f "$RUN/napper.wake_at" ]] && cat "$RUN/napper.wake_at" || echo gone) records=$(record_count)"
+    fi
+    if [[ ! -f "$RUN/claimed/napper" ]]; then
+        ok "an unreadable claim is dropped exactly once"
+    else
+        bad "an unreadable claim is dropped exactly once"
+    fi
+
+    env_run thinkers stop >/dev/null 2>&1
+}
+
+want test_stale_claim_non_numeric_wake_at
 want test_many_starts_one_dispatch
+want test_lock_timeout_exits
 want test_lock_is_held
 want test_tokens_unique
 want test_die_after_claim_recovers
