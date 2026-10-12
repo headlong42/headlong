@@ -293,14 +293,6 @@ _start_dispatcher() {
     # scan sat 3.5 h in read() on run/dispatch.fifo). /tmp, not $TMPDIR: a
     # start from inside a shellm run gets a TMPDIR that dies with the run.
     # run/fifo_path records where it is so stop and cleanup can find it.
-    _remove_fifo "$run_dir"
-    local fifo_dir
-    fifo_dir=$(mktemp -d "/tmp/headlong-dispatch.XXXXXX") \
-        || die "Could not create a fifo directory in /tmp"
-    fifo="$fifo_dir/dispatch.fifo"
-    mkfifo "$fifo" || die "Could not create $fifo"
-    printf '%s\n' "$fifo" > "$run_dir/fifo_path"
-
     # Fresh pending-trigger flags (steps that arrived while a thinker was busy)
     rm -rf "$run_dir/pending"
     mkdir -p "$run_dir/pending"
@@ -389,7 +381,6 @@ _start_dispatcher() {
     done < <(_list_thinker_dirs)
 
     if [[ -z "$sub_map" ]]; then
-        _remove_fifo "$run_dir"
         die "No valid subscriptions found"
     fi
 
@@ -439,6 +430,18 @@ _start_dispatcher() {
                 exit 0
             }
         fi
+
+        # Create OUR OWN fifo, outside the identity dir (the mind walks its
+        # own dir and anything that opens a fifo there blocks forever). This
+        # is done HERE, after we hold the lock, so no concurrent start can
+        # delete our fifo before we open fd 3: the 2026-10-12 race where a
+        # racing start removed the incumbent's fifo mid-open left zero
+        # dispatchers and a due wake never fired.
+        fifo_dir=$(mktemp -d "/tmp/headlong-dispatch.XXXXXX") \
+            || { printf '%s [dispatcher] could not create fifo dir — exiting\n' "$(date -u +%FT%TZ)" >&2; exit 1; }
+        fifo="$fifo_dir/dispatch.fifo"
+        mkfifo "$fifo" || { printf '%s [dispatcher] could not create fifo — exiting\n' "$(date -u +%FT%TZ)" >&2; rmdir "$fifo_dir" 2>/dev/null || true; exit 1; }
+        printf '%s\n' "$fifo" > "$run_dir/fifo_path"
 
         # Start tail -F for each unique traj file, tagged with traj path.
         # Track our own tail PIDs separately from the shared tail_pids file:
@@ -1294,30 +1297,31 @@ _cleanup_run_state() {
         rm -f "$tail_pids_file"
     fi
     _kill_traj_tails "$run_dir" ${2:+"$2"}
-    _remove_fifo "$run_dir"
-    rm -f "$run_dir/sub_map" "$run_dir/traj_files" "$run_dir/dispatcher.token"
+    _remove_own_fifo "${3:-}"
+    rm -f "$run_dir/fifo_path" "$run_dir/sub_map" "$run_dir/traj_files" "$run_dir/dispatcher.token"
     rm -rf "$run_dir/pending"
 }
 
-# Remove the dispatcher fifo named by run/fifo_path, and the run/dispatch.fifo
-# that dispatchers before 2026-09-26 kept inside the identity dir. Only a path
-# of the shape _start_dispatcher makes is removed, since fifo_path sits in a
-# directory the mind can write.
-_remove_fifo() {
-    local run_dir="$1" path=""
-    path=$(head -n 1 "$run_dir/fifo_path" 2>/dev/null) || true
+# Remove the dispatcher's OWN fifo, identified by the path it created and
+# holds in $fifo. Each dispatcher owns exactly one fifo; on exit it removes
+# only that one, never a successor's (the shared run/fifo_path is a debug
+# pointer and a racing newer start rewrites it before the old dispatcher's
+# exit trap runs). Only a path of the shape _start_dispatcher makes is
+# removed, since it sits in a directory the mind can write.
+_remove_own_fifo() {
+    local path="$1"
+    [[ -n "$path" ]] || return 0
     case "$path" in
         /tmp/headlong-dispatch.*/dispatch.fifo)
-            if [[ "$path" != *..* && -p "$path" ]]; then
+            if [[ "$path" != *..* ]]; then
                 rm -f "$path"
                 rmdir "${path%/dispatch.fifo}" 2>/dev/null || true
             fi ;;
     esac
-    rm -f "$run_dir/fifo_path" "$run_dir/dispatch.fifo"
 }
 
 _cleanup_dispatcher() {
-    _cleanup_run_state "$IDENTITY_DIR/run"
+    _cleanup_run_state "$IDENTITY_DIR/run" "" "$fifo"
 }
 
 # Dispatcher INT/TERM handler. Sanctioned stops announce themselves:
