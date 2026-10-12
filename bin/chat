@@ -960,6 +960,9 @@ Environment:
   CHATRC          Path to config file (default: ./.chatrc)
   CHAT_REPEAT_WINDOW  How far back `send`/`reply` look for an identical
                   message to the same destination (default 24h; 0 disables)
+  CHAT_REPLY_REPEAT_WINDOW
+                  How far back a stamped `reply` looks for the same answer
+                  to the same person (default 10m; 0 disables)
   TRAJ_DIR        Trajectory directory (set by `identity shell`)
   TRAJ_ID         Trajectory ID (set by `identity shell`)
   IDENTITY_NAME   Identity name (for reply attribution and --to default)
