@@ -3,6 +3,8 @@
 # regression against the folded bin/lesson-derive-gate. Exit 0 only if all
 # recorded expectations hold.
 set -u
+# Seconds each fixture may take before it is declared wedged and fails.
+: "${FIXTURE_TIMEOUT:=20}"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 B="$ROOT/scratch/lesson-derive-gate-2026-10-10"
 L="$ROOT/bin/lesson-overreach-lint"
@@ -10,7 +12,24 @@ G="$ROOT/bin/lesson-derive-gate"
 pass=0; fail=0
 chk() {
   name=$1; want=$2; shift 2
-  out=$("$@" 2>&1); got=$?
+  # Per-fixture timeout so a wedged linter call fails fast instead of
+  # hanging the whole run (2026-10-12: a mutated nested probe wedged the
+  # runner for 30s+). GNU timeout exits 124 on timeout; gtimeout is the
+  # macOS coreutils name. If neither exists, run without a timeout.
+  local to=
+  if command -v timeout >/dev/null 2>&1; then to=timeout
+  elif command -v gtimeout >/dev/null 2>&1; then to=gtimeout; fi
+  if [ -n "$to" ]; then
+    out=$("$to" "$FIXTURE_TIMEOUT" "$@" 2>&1); got=$?
+    if [ "$got" = 124 ]; then
+      printf 'FAIL %-28s timed out (>%ss)\n' "$name" "$FIXTURE_TIMEOUT"
+      printf '%s\n' "$out" | head -2 | sed 's/^/     /'
+      fail=$((fail+1))
+      return
+    fi
+  else
+    out=$("$@" 2>&1); got=$?
+  fi
   if [ "$got" = "$want" ]; then
     printf 'ok   %-28s want=%s\n' "$name" "$want"; pass=$((pass+1))
   else
