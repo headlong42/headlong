@@ -431,6 +431,13 @@ _start_dispatcher() {
             }
         fi
 
+        # Remove a leftover fifo at the legacy in-identity path (before the
+        # 2026-09-26 move). A crash before the move could leave one behind,
+        # and leaving it means the mind's identity-tree walk opens it and
+        # blocks forever. Creating our own after the lock made it never get
+        # cleaned, so clean it explicitly here.
+        rm -f "$run_dir/dispatch.fifo"
+
         # Create OUR OWN fifo, outside the identity dir (the mind walks its
         # own dir and anything that opens a fifo there blocks forever). This
         # is done HERE, after we hold the lock, so no concurrent start can
