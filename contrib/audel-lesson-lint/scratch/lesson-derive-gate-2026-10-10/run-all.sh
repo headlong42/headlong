@@ -51,15 +51,22 @@ echo "=== corpora the runner was blind to (added 2026-10-10) ==="
 corpus_run() {
   cname=$1
   cdir="$B/$cname"
-  for f in "$cdir"/*.md; do
+  # Recurse so fixtures in corpus subdirs are graded too (maxdepth-1 glob
+  # silently skipped edge/labelbreak, irrtail/probes and relcl/gate).
+  while IFS= read -r f; do
     [ -e "$f" ] || continue
+    rel=${f#"$cdir"/}
     base=$(basename "$f")
     want=""
     if [ -f "$cdir/expect.txt" ]; then
-      want=$(awk -v n="$base" '$1==n{print $2}' "$cdir/expect.txt")
+      # exact subpath first, then basename fallback
+      want=$(awk -v n="$rel" '$1==n{print $2}' "$cdir/expect.txt")
+      [ -n "$want" ] || want=$(awk -v n="$base" '$1==n{print $2}' "$cdir/expect.txt")
     elif [ -f "$cdir/expected.tsv" ]; then
-      want=$(awk -F'\t' -v n="$base" '$1==n{print $2}' "$cdir/expected.tsv")
-    else
+      want=$(awk -F'\t' -v n="$rel" '$1==n{print $2}' "$cdir/expected.tsv")
+      [ -n "$want" ] || want=$(awk -F'\t' -v n="$base" '$1==n{print $2}' "$cdir/expected.tsv")
+    fi
+    if [ -z "$want" ]; then
       case "$base" in
         m*|m-*) want=refuse ;;
         *draft*) want=accept ;;
@@ -71,8 +78,8 @@ corpus_run() {
       refuse) w=1 ;;
       *) continue ;;
     esac
-    chk "$cname/$base" "$w" "$L" "$f"
-  done
+    chk "$cname/$rel" "$w" "$L" "$f"
+  done < <(find "$cdir" -type f -name '*.md' | sort)
 }
 # Vbshape pass finding 2026-10-11: adjrel, lexedge and sharedvp also sat
 # outside the runner (relcl flips in them were only ever seen by the ad-hoc
@@ -84,7 +91,7 @@ for d in "$B"/*/; do
   case "$cname" in
     edge|reachgap|overreach|fold) continue ;;
   esac
-  if find "$d" -maxdepth 1 -name '*.md' -print -quit | grep -q .; then
+  if find "$d" -type f -name '*.md' -print -quit | grep -q .; then
     corpus_run "$cname"
   fi
 done

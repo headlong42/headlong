@@ -9,3 +9,4 @@ m-rebreak-clipped.md accept
 m-rebreak-future.md refuse
 m-rebreak-reduced.md refuse
 m-verbmid.md refuse
+gate/lesson-draft.md accept
