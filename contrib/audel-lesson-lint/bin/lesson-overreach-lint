@@ -110,12 +110,6 @@ advre='\b(always|never|cannot|impossible|invariably|inevitably|without fail|at a
 normre='^[[:space:]]*(rule|habit|norm)[[:space:]]*:'
 # Restrictive relative clause bound (lexlead pass 2026-10-10): "both fixtures
 # the lint named" restricts its noun to the ones already named, so the
-# relative clause reads as a bound on the universal. Widened detection would
-# otherwise refuse the bothedge accept "both soft spots the reach lint named
-# broke through". Residual named for the next pass: the verb list is lexical,
-# and the pattern needs a determiner before the relative subject.
-rcbre='\b(the|that|these|those)[[:space:]]+([a-z]+[[:space:]]+){0,4}(named|listed|recorded|reported|tracked|checked|verified|observed|tested|built|ran|saw|read)([[:space:]]|$)'
-
 # Relcl pass (2026-10-11): the pattern above needs a determiner before the
 # relative subject and reads only its own verb list, so both residuals the
 # lexlead comment named were real gaps: "fixtures lint named" carries no
@@ -396,10 +390,6 @@ coref_self='\b(every|each|any|none|nothing|all|no)[[:space:]]+[a-z]+'
 # when the modifier is also a predicate-list word (clean, green): a predicate
 # word read as an adjective is still a modifier. Whitelisting the modifiers
 # missed exactly that overlap and m-adjnoun-both stayed accepted.
-# universal names its domain even with a modifier in front, and the modifier
-# may be an adjective the predicate list also carries (clean, full) or a
-# participle (broken, re-run). At most two, then the noun.
-dm2='(new|old|fresh|later|other|more|most|few|fewer|many|separate|additional|extra|distinct|individual|clean|dirty|full|partial|remaining|overall|total|[a-z]+(-[a-z]+)?(ed|en))'
 coref_ok() {
   printf '%s\n' "$1" | grep -qiE "$corefre" || return 1
   printf '%s\n' "$1" | grep -qiE "$coref_widen" && return 1
@@ -446,7 +436,7 @@ domain_self() {
     # noun must be adjective-shaped (participle or a listed adjective), so a
     # verb or preposition ("all failed in the runs I checked") still does not
     # read as a noun modifier, and the noun is any plural noun.
-    if printf '%s\n' "$res" | grep -qiE "^[[:space:]]*($modshape[[:space:]]+)*($plnoun)\b"; then return 0; fi
+    if printf '%s\n' "$res" | grep -qiE "^[[:space:]]*(${modshape}[[:space:]]+)*(${plnoun})\b"; then return 0; fi
     if printf '%s\n' "$res" | grep -qiE "$coref_self"; then return 0; fi
     # Adjudication 2026-10-11 (adjrel m-adjkept/known/made/set, lexedge
     # m-{built,read,sent,shown}-* and m-known-rules): a predicate-list word used
