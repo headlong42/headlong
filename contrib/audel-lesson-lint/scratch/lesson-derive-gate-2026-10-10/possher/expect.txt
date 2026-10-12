@@ -5,3 +5,4 @@ a-her-sing.md accept
 a-his-plureg.md accept
 a-our-plureg.md accept
 g-obj-her.md refuse
+lesson-draft.md refuse

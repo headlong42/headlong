@@ -77,7 +77,17 @@ corpus_run() {
 # Vbshape pass finding 2026-10-11: adjrel, lexedge and sharedvp also sat
 # outside the runner (relcl flips in them were only ever seen by the ad-hoc
 # tree sweep), and the vbshape corpus joins here.
-for c in softspot seam counttrail barewidening sothat widenedge nounlead bothedge lexlead relcl adjrel lexedge sharedvp vbshape irrverb irrtail particle objslot objshape objpron herplural countshape objnp; do corpus_run "$c"; done
+# Enumerate .md fixture dirs so no corpus drops out when a name is added.
+# The four special corpora above (edge, reachgap, overreach, fold) are skipped.
+for d in "$B"/*/; do
+  cname=$(basename "$d")
+  case "$cname" in
+    edge|reachgap|overreach|fold) continue ;;
+  esac
+  if find "$d" -maxdepth 1 -name '*.md' -print -quit | grep -q .; then
+    corpus_run "$cname"
+  fi
+done
 
 echo "---"
 echo "pass=$pass fail=$fail"
