@@ -104,9 +104,11 @@ _refuse_json_body() {
     # single-quoted action key, and scan 40 lines instead of 8 so a long
     # pretty-printed object cannot hide its action key past the window.
     msg=$(printf '%s\n' "$msg" | sed -e '1s/^\xef\xbb\xbf//' -e 's/\r$//' -e '/^[[:space:]]*```[A-Za-z]*[[:space:]]*$/d' -e '/^[[:space:]]*~~~[A-Za-z]*[[:space:]]*$/d' -e '/^[[:space:]]*$/d')
-    first=$(printf '%s\n' "$msg" | head -1)
-    printf '%s' "$first" | grep -qE '^[[:space:]]*\{' || return 0
-    printf '%s\n' "$msg" | head -40 | grep -qE '["'"'"'\'']action["'"'"'\''][[:space:]]*:' || return 0
+    first=${msg%%$'\n'*}
+    [[ "$first" =~ ^[[:space:]]*\{ ]] || return 0
+    # Feed head without a pipe writer, and let grep drain all 40 lines.
+    # Early pipe closure otherwise either aborts chat or hides a matched key.
+    head -40 <<< "$msg" | grep -E '["'"'"'\'']action["'"'"'\''][[:space:]]*:' >/dev/null || return 0
     die "refusing to send: this message is a structured action object, not words for a person.
 A reply body must be plain text. If this really is meant literally, add --force."
 }
@@ -130,9 +132,11 @@ cmd_send() {
         message=$(cat)
     fi
     [[ -z "$message" ]] && die "No message provided. Usage: chat send [--from <name>] [--to <name>] <message>"
-    [[ "$force" -eq 1 ]] || _refuse_json_body "$message"
-
     _resolve_from_to
+    # People can send literal JSON into the identity; only guard our output.
+    if [[ "$force" -ne 1 ]] && ! _inbound_from "$from"; then
+        _refuse_json_body "$message"
+    fi
     _check_target "$to"
 
     # A self-addressed message re-triggers the identity's own message
