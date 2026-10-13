@@ -10,8 +10,12 @@
 # change belongs in the project, judged against CHARTER.md and the design
 # documents as they were before the change.
 #
-# Needs the OPENROUTER_API_KEY repository secret. Pull requests from forks
-# are skipped.
+# Pull requests from forks are reviewed too, under the same rule: only a
+# comment from someone with write access starts one. The workflow always runs
+# from the default branch, and the pull request's code is read and never run,
+# so a fork cannot change what runs or reach the key.
+#
+# Needs the OPENROUTER_API_KEY repository secret.
 name: Review
 
 on:
@@ -37,3 +41,4 @@ jobs:
         with:
           openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
           pr-number: ${{ inputs.pr-number }}
+          allow-forks: true
