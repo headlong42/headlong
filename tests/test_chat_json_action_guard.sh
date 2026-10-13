@@ -41,7 +41,8 @@ export IDENTITY_NAME="$ME" TRAJ_DIR="$ID/trajectories" TRAJ_ID="$TRAJ_ID"
 export HOME="$WORK/home"; mkdir -p "$HOME"
 printf 'default_send_from=%s\n' "$ME" > "$WORK/home/.chatrc"
 export CHATRC="$WORK/home/.chatrc"
-export CHAT_REPEAT_WINDOW=0
+# These cases deliberately repeat bodies; test the JSON guard independently.
+export CHAT_REPEAT_WINDOW=0 CHAT_REPLY_REPEAT_WINDOW=0
 
 printf '{"step_id":"%s","type":"trajectory","ts":"2026-01-01T00:00:00.000Z"}\n' "$TRAJ_ID" > "$TRAJ"
 
