@@ -15,7 +15,7 @@
 # answers a specific inbound is exempt. No LLM calls, no docker.
 
 set -uo pipefail
-unset IDENTITY_DIR IDENTITY_NAME MEM_DIR TRAJ_DIR TRAJ_ID ROOT_TRAJ_ID CHAT_REPEAT_WINDOW 2>/dev/null
+unset IDENTITY_DIR IDENTITY_NAME MEM_DIR TRAJ_DIR TRAJ_ID ROOT_TRAJ_ID CHAT_REPEAT_WINDOW CHAT_REPLY_REPEAT_WINDOW 2>/dev/null
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(dirname "$HERE")"
@@ -134,6 +134,48 @@ before=$(grep -c '"type":"message"' "$TRAJ")
 chat reply "$THEM" "still running" >/dev/null 2>&1; rc=$?
 [[ $rc -ne 0 && $(grep -c '"type":"message"' "$TRAJ") -eq $before ]] && ok "a proactive reply (nothing left to answer) with the same text is refused" || bad "proactive reply refused" "rc=$rc"
 chat reply --force "$THEM" "still running" >/dev/null 2>&1 && ok "--force lets the proactive repeat through" || bad "reply --force"
+
+
+# Long answers can share the index's 8,000-character prefix without being
+# repeats. Exercise both the truncation boundary and a body too large for a
+# single Linux argv string. All message bodies enter chat through stdin.
+for length in 8000 140000; do
+    target="long-$length"
+    jq -jn --argjson n "$length" '"x" * $n' > "$WORK/prefix"
+    for suffix in a b c; do
+        cat "$WORK/prefix" > "$WORK/answer-$suffix"
+        printf '\nConclusion %s' "$suffix" >> "$WORK/answer-$suffix"
+    done
+    msg "long-$length-1" "$target" "$ME" "first question" 5
+    msg "long-$length-2" "$target" "$ME" "second question" 4
+    msg "long-$length-3" "$target" "$ME" "third question" 3
+    chat reply --reply-to "long-$length-1" "$target" < "$WORK/answer-a" >/dev/null 2>&1 \
+        && ok "first long answer sends ($length)" || bad "first long answer sends ($length)"
+    chat reply --reply-to "long-$length-2" "$target" < "$WORK/answer-b" >/dev/null 2>&1
+    rc=$?
+    if [[ $rc -eq 0 ]] && jq -e --arg rt "long-$length-2" --rawfile want "$WORK/answer-b" \
+        'select(.type == "message" and .reply_to == $rt and .content == $want)' "$TRAJ" >/dev/null; then
+        ok "distinct suffix sends the complete answer ($length)"
+    else
+        bad "distinct suffix sends the complete answer ($length)" "rc=$rc"
+    fi
+    chat reply --follow-up --reply-to "long-$length-1" "$target" < "$WORK/answer-c" >/dev/null 2>&1
+    rc=$?
+    if [[ $rc -eq 0 ]] && jq -e --arg rt "long-$length-1" --rawfile want "$WORK/answer-c" \
+        'select(.type == "message" and .reply_to == $rt and .follow_up == true and .content == $want)' "$TRAJ" >/dev/null; then
+        ok "distinct long follow-up sends the complete result ($length)"
+    else
+        bad "distinct long follow-up sends the complete result ($length)" "rc=$rc"
+    fi
+    before=$(wc -l < "$TRAJ")
+    err=$(chat reply --reply-to "long-$length-3" "$target" < "$WORK/answer-a" 2>&1 >/dev/null); rc=$?
+    [[ $rc -ne 0 && $(wc -l < "$TRAJ") -eq $before && "$err" == *"already went to"* ]] \
+        && ok "an older identical long answer is refused despite newer prefix matches ($length)" \
+        || bad "identical long answer refused ($length)" "rc=$rc"
+    err=$(chat reply --follow-up --reply-to "long-$length-1" "$target" < "$WORK/answer-a" 2>&1 >/dev/null); rc=$?
+    [[ $rc -ne 0 && $(wc -l < "$TRAJ") -eq $before && "$err" == *"already went to"* ]] \
+        && ok "an identical long follow-up is refused ($length)" || bad "identical long follow-up refused ($length)" "rc=$rc"
+done
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ $fail -eq 0 ]]

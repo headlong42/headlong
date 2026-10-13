@@ -862,7 +862,23 @@ _refuse_repeat() {
         | [inputs | fromjson? // empty
            | select(.from == $me and .to == $to and (.content // "") == $want and secs >= (now - $w))]
         | sort_by(.ts // "") | last // empty
-        | "\(.ts) \(.step_id)"' -R < "$idx" 2>/dev/null) || hit=""
+        | if ($msg | length) > $cap then "truncated"
+          else "\(.ts) \(.step_id)" end' -R < "$idx" 2>/dev/null) || hit=""
+    # A matching truncated prefix is only a candidate, not an exact repeat.
+    # Consult full content only on this uncommon path; ordinary replies keep
+    # the index-only check. Consider every matching send, since the newest
+    # prefix match may differ while an older one is an exact repeat.
+    if [[ "$hit" == truncated ]]; then
+        hit=$(jq -rn --arg me "$from" --arg to "$to" --argjson w "$window_s" \
+                  --rawfile msg "$msg_file" '
+            def secs: (.ts // "")[0:19] + "Z" | try fromdateiso8601 catch 0;
+            [inputs | fromjson? // empty
+             | select(.type == "message" and .from == $me and .to == $to
+                      and (.content // "") == $msg and secs >= (now - $w))
+             | {ts, step_id}]
+            | sort_by(.ts // "") | last // empty
+            | "\(.ts) \(.step_id)"' -R < "$tf" 2>/dev/null) || hit=""
+    fi
     rm -f "$msg_file"
     [[ -z "$hit" ]] && return 0
     die "refusing to send: this exact message already went to '$to' at ${hit% *} (step ${hit#* }).
