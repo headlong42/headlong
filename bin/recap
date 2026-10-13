@@ -52,6 +52,10 @@ FANOUT="${ROLLUP_FANOUT:-10}"          # F: children per tier; tier k covers F^k
 CTX_BUDGET="${MONOLITH_CONTEXT_BUDGET:-auto}"   # token budget; auto = fraction of model window
 CTX_RAW_TAIL="${ROLLUP_RAW_TAIL:-auto}"         # R: verbatim recent steps; auto = from budget
 ROLLUP_PROMPT_VERSION=5                 # stamped into sealed blocks for honest determinism (v2: first-person voice; v3: outcomes, not temperament; v5: supersession citations)
+# Output cap for one rollup call. Thinking tokens count against it on
+# reasoning models: at 1024, Sonnet 5 spent about 700 thinking and was cut
+# off mid-JSON on a quarter of Audel's rollups (42 of 166, 2026-10-12).
+ROLLUP_MAX_TOKENS=4096
 
 usage() {
     cat <<'EOF'
@@ -563,7 +567,7 @@ _ctx_seal_tier1() {
     text=$(cut -f4 <<<"$rows")
     fid=$(head -1 <<<"$rows" | cut -f2); lid=$(tail -1 <<<"$rows" | cut -f2)
     note "rollup t1 [$s,$e)"
-    body=$(_llm_json "$MAP_MODEL" "$_ROLLUP_SYSTEM" "$text" 1024) || die "rollup t1 [$s,$e): bad JSON"
+    body=$(_llm_json "$MAP_MODEL" "$_ROLLUP_SYSTEM" "$text" "$ROLLUP_MAX_TOKENS") || die "rollup t1 [$s,$e): bad JSON"
     mkdir -p "$(dirname "$file")"
     jq -n -c --argjson tier 1 --argjson start "$s" --argjson end "$e" --argjson n "$((e - s))" \
         --argjson body "$body" --arg fid "$fid" --arg lid "$lid" \
@@ -589,7 +593,7 @@ _ctx_seal_tierk() {
         c=$((c + childblk))
     done
     note "rollup t$tier [$s,$e)"
-    body=$(_llm_json "$MAP_MODEL" "$_ROLLUP_SYSTEM" "$lines" 1024) || die "rollup t$tier [$s,$e): bad JSON"
+    body=$(_llm_json "$MAP_MODEL" "$_ROLLUP_SYSTEM" "$lines" "$ROLLUP_MAX_TOKENS") || die "rollup t$tier [$s,$e): bad JSON"
     local fb_json
     # awk, not `grep | head`: head's early exit SIGPIPEs grep under pipefail
     # once the payload outgrows the pipe buffer (large --fanout).
