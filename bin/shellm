@@ -411,14 +411,20 @@ redact_sensitive() {
         output="${output//${LLM_API_KEY}/<redacted-api-key>}"
     fi
 
-    # Every other credential env var is masked by value. A computed default
-    # may only beat an env fallback when its target is verified real, and the
-    # reverse holds here too: the value is what proves the credential, not the
-    # name, so a short or empty value is left alone rather than mangling prose.
+    # Preserve exact masking of every nonempty configured provider value,
+    # including short credentials. Quoting makes glob characters literal.
     local _key_var _key_val v
+    for _key_var in OPENAI_API_KEY OPENROUTER_API_KEY GEMINI_API_KEY OPENCODE_API_KEY; do
+        v="${!_key_var:-}"
+        if [[ -n "$v" ]]; then
+            output="${output//"$v"/<redacted-api-key>}"
+        fi
+    done
+
+    # Other credential variables retain the minimum length to avoid matching
+    # short placeholder values in ordinary prose.
     for _key_var in GITHUB_TOKEN GH_TOKEN HOMEBREW_GITHUB_API_TOKEN GITHUB_PAT \
-                    OPENAI_API_KEY OPENROUTER_API_KEY GEMINI_API_KEY GOOGLE_API_KEY \
-                    OPENCODE_API_KEY SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_USER_TOKEN \
+                    GOOGLE_API_KEY SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_USER_TOKEN \
                     SLACK_TOKEN TELEGRAM_BOT_TOKEN HF_TOKEN HUGGING_FACE_HUB_TOKEN \
                     AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_ACCESS_KEY_ID \
                     STRIPE_SECRET_KEY SENDGRID_API_KEY TWILIO_AUTH_TOKEN \
@@ -2439,24 +2445,51 @@ ${combined}"
 }
 
 # Stream lines past $2 from $1 to stderr (redacted), then print the new
-# total line count on stdout so the caller can update its cursor.
+# line count and PEM-block state on stdout. The caller carries both across
+# polls and resets them for each execution output file.
 _stream_new_output() {
-    local output_file="$1" lines_read="$2"
+    local output_file="$1" lines_read="$2" in_pem="${3:-0}"
+    local pem_begin='-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----'
+    local pem_end='-----END [A-Z0-9 ]*PRIVATE KEY-----'
     local total_lines
     total_lines=$(wc -l < "$output_file" 2>/dev/null || echo 0)
     total_lines=$(echo "$total_lines" | tr -d ' ')
-    if [[ "$total_lines" -gt "$lines_read" ]]; then
+    if [[ "$QUIET" -eq 0 && "$total_lines" -gt "$lines_read" ]]; then
         local new_count=$((total_lines - lines_read))
         local skip_n=$((lines_read + 1))
+        # Main limits echoed flood output. If lines are omitted, still track
+        # their delimiters in one process so a skipped header cannot expose
+        # the body. Only scan the newly omitted range, not earlier output.
+        local max_lines="${STREAM_MAX_LINES:-0}"
+        if [[ "$max_lines" -gt 0 && "$new_count" -gt "$max_lines" ]]; then
+            local omitted=$((new_count - max_lines))
+            in_pem=$( ( set +o pipefail; tail -n +"$skip_n" "$output_file" | head -n "$omitted" ) |
+                awk -v open="$in_pem" -v begin="$pem_begin" -v end="$pem_end" '
+                    $0 ~ begin { open=1 } $0 ~ end { open=0 } END { print open }')
+            printf '\033[90m  │ [... %s lines not shown ...]\033[0m\n' "$omitted" >&2
+            skip_n=$((skip_n + omitted))
+            new_count=$max_lines
+        fi
         # Use tail + head to get new lines (bash 3.2 safe). pipefail OFF in a
         # subshell: the output file is written CONCURRENTLY by the running
         # command, so `head` can close after $new_count lines while `tail` is
         # still reading freshly-appended lines → SIGPIPE to tail. Under the
         # global `set -o pipefail` that made the whole run exit rc=141 (on macOS
         # every streaming run died this way). See design/monolith_run_health.md.
-        ( set +o pipefail; tail -n +"$skip_n" "$output_file" | head -n "$new_count" ) | while IFS= read -r line; do
+        while IFS= read -r line; do
             local redacted_line
-            redacted_line=$(redact_sensitive "$line")
+            # A fresh sed per line cannot retain a multiline private-key range.
+            # Track it here, before value masking can hide a delimiter.
+            if [[ "$in_pem" -eq 1 ]]; then
+                [[ "$line" =~ $pem_end ]] && in_pem=0
+                continue
+            elif [[ "$line" =~ $pem_begin ]]; then
+                in_pem=1
+                [[ "$line" =~ $pem_end ]] && in_pem=0
+                redacted_line='<redacted:private-key>'
+            else
+                redacted_line=$(redact_sensitive "$line")
+            fi
             if [[ "$QUIET" -eq 0 ]]; then
                 if [[ "$redacted_line" == +* ]]; then
                     printf '\033[36m  $ %s\033[0m\n' "${redacted_line#+ }" >&2
@@ -2464,9 +2497,9 @@ _stream_new_output() {
                     printf '\033[90m  │ %s\033[0m\n' "$redacted_line" >&2
                 fi
             fi
-        done
+        done < <( set +o pipefail; tail -n +"$skip_n" "$output_file" | head -n "$new_count" )
     fi
-    printf '%s\n' "$total_lines"
+    printf '%s %s\n' "$total_lines" "$in_pem"
 }
 
 # ---------------------------------------------------------------------------
@@ -3183,9 +3216,9 @@ exit \$__shellm_rc
         printf '%s' "$watchdog_pid" > "$watchdog_pid_file"
 
         # Foreground: poll output file and stream new lines to stderr
-        local lines_read=0
+        local lines_read=0 pem_open=0
         while kill -0 "$exec_pid" 2>/dev/null; do
-            lines_read=$(_stream_new_output "$output_file" "$lines_read")
+            read -r lines_read pem_open <<< "$(_stream_new_output "$output_file" "$lines_read" "$pem_open")"
             sleep 0.2
         done
 
@@ -3197,7 +3230,7 @@ exit \$__shellm_rc
         wait "$watchdog_pid" 2>/dev/null || true
 
         # Drain any remaining output lines
-        _stream_new_output "$output_file" "$lines_read" >/dev/null
+        _stream_new_output "$output_file" "$lines_read" "$pem_open" >/dev/null
 
         # Check if we timed out. The marker carries why, so the feedback the
         # model gets names the real cause instead of guessing at a prompt.

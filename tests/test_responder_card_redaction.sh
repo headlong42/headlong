@@ -127,6 +127,22 @@ if printf '%s' "$sent" | grep -q '2110728612' && printf '%s' "$sent" | grep -q '
 printf '{"step_id":"trig-5","type":"message","from":"%s","to":"%s","content":"my card 5555 5555 5555 5555 for bookings","ts":"%s","source":"chat"}\n' "$THEM" "$ME" "$(now)" >> "$TRAJ"
 printf 'ok\n' > "$STUB_REPLY_FILE"
 printf 'notes: andy books tables, card 5555 5555 5555 5555\n' > "$STUB_NOTES_FILE"
+# These synthetic shapes are not exported, so only shape masking catches them.
+# The arbitrary value checks literal environment masking in the real writer.
+_note_secrets=(
+    "$(printf '%s' ghp_ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA)"
+    "$(printf '%s' xoxb- abcdefghijklmnopqrstuv)"
+    "$(printf '%s' npm_ abcdefghijklmnopqrstuvwxyz)"
+    "$(printf '%s' sk_live_ abcdefghijklmnopqrstuv)"
+    'PRIVATE_BODY_notes_fixture'
+)
+export TWILIO_AUTH_TOKEN='notes-value*[fixture]?end'
+_note_secrets+=("$TWILIO_AUTH_TOKEN")
+printf '%s\n' "${_note_secrets[0]}" "${_note_secrets[1]}" \
+    "${_note_secrets[2]}" "${_note_secrets[3]}" \
+    '-----BEGIN PRIVATE KEY-----' "${_note_secrets[4]}" \
+    '-----END PRIVATE KEY-----' "$TWILIO_AUTH_TOKEN" 'benign notes after credentials' >> "$STUB_NOTES_FILE"
+
 STUB_HISTORY_FILE="$WORK/history"
 printf '[{"ts":"2026-09-22T09:00:00.000Z","from":"%s","content":"my card 5555 5555 5555 5555 for bookings"}]\n' "$THEM" > "$STUB_HISTORY_FILE"
 run_responder "$(grep -F '"step_id":"trig-5"' "$TRAJ")" RESPONDER_PERSON_NOTES=1 RESPONDER_PERSON_NOTES_SYNC=1 STUB_HISTORY_FILE="$STUB_HISTORY_FILE"
@@ -134,6 +150,13 @@ _pn=$(grep -l '^type: person' "$ID/memories"/*.md 2>/dev/null | head -1)
 if [[ -n "$_pn" ]]; then ok "person notes: a person memory is written (the write path runs)"; else bad "person notes: a person memory is written (the write path runs)" "$(tail -3 "$WORK/step.log")"; fi
 if [[ -n "$_pn" ]] && grep -q 'andy books tables' "$_pn"; then ok "person notes: ordinary note text survives"; else bad "person notes: ordinary note text survives" "$(cat "$_pn" 2>/dev/null)"; fi
 if [[ -n "$_pn" ]] && grep -q '\[card redacted\]' "$_pn" && ! grep -q '5555 5555' "$_pn"; then ok "person notes: card digits replaced by the marker"; else bad "person notes: card digits replaced by the marker" "$(cat "$_pn" 2>/dev/null)"; fi
+for _secret in "${_note_secrets[@]}"; do
+    if [[ -n "$_pn" ]] && ! grep -qF "$_secret" "$_pn" && grep -q 'benign notes after credentials' "$_pn"; then
+        ok 'person notes: credential removed and surrounding text kept'
+    else
+        bad 'person notes: credential removed and surrounding text kept'
+    fi
+done
 # Control: the same run with the redaction pipe stripped must store the
 # digits, so the assertions above fail when the redaction is bypassed.
 # The step sources ../_lib/common.sh relative to its own path, so the
@@ -155,6 +178,15 @@ printf '{"step_id":"trig-5b","type":"message","from":"%s","to":"%s","content":"m
 printf '%s' "$(grep -F '"step_id":"trig-5b"' "$TRAJ")" | env "${ENV_COMMON[@]}" RESPONDER_PERSON_NOTES=1 RESPONDER_PERSON_NOTES_SYNC=1 STUB_HISTORY_FILE="$STUB_HISTORY_FILE" "$_noredact_dir/responder/step" >> "$WORK/step.log" 2>&1
 _pn2=$(grep -l '^type: person' "$ID/memories"/*.md 2>/dev/null | head -1)
 if [[ -n "$_pn2" ]] && grep -q '5555 5555 5555 5555' "$_pn2"; then ok "control: with the redaction stripped the same notes store the digits"; else bad "control: with the redaction stripped the same notes store the digits" "$(cat "$_pn2" 2>/dev/null)"; fi
+
+for _secret in "${_note_secrets[@]}"; do
+    if [[ -n "$_pn2" ]] && grep -qF "$_secret" "$_pn2"; then
+        ok 'control: unfiltered notes retain the credential fixture'
+    else
+        bad 'control: unfiltered notes retain the credential fixture'
+    fi
+done
+unset TWILIO_AUTH_TOKEN
 
 echo
 # --- 6..9. failure exits quote the trigger through the redacted excerpt -----
