@@ -13,8 +13,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(dirname "$HERE")"
 PATH="$REPO/bin:$PATH"
 
-WORK=$(mktemp -d)
-cleanup() { pkill -f "drain-test-sentinel" 2>/dev/null; rm -rf "$WORK"; }
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/thinkers-drain.XXXXXX") || exit 1
+cleanup() { pkill -f "$WORK/drain-test-sentinel" 2>/dev/null; rm -rf "$WORK"; }
 trap cleanup EXIT
 
 pass=0
@@ -55,7 +55,7 @@ env_thinkers() {
 spawn_step() { # spawn_step <thinker> <seconds> -> pid
     # fds detached: this runs inside $(...) and an inherited stdout pipe
     # would make the command substitution block until the sleep exits
-    bash -c "exec -a drain-test-sentinel sleep $2" </dev/null >/dev/null 2>&1 &
+    bash -c 'exec -a "$1" sleep "$2"' bash "$WORK/drain-test-sentinel" "$2" </dev/null >/dev/null 2>&1 &
     local pid=$!
     printf '%s %s\n' "$pid" "$1" >> "$RUN/step_pids"
     printf '%s\n' "$pid"

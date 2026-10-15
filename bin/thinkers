@@ -282,7 +282,7 @@ _start_dispatcher() {
     local run_dir="$IDENTITY_DIR/run"
     mkdir -p "$run_dir/logs" "$run_dir/thinkers"
 
-    local fifo
+    local fifo="" fifo_dir="" stale_fifo="" _my_tail_pids="" _dispatcher_owns_runtime=0
     local pid_file="$run_dir/dispatcher.pid"
     local tail_pids_file="$run_dir/tail_pids"
 
@@ -296,25 +296,7 @@ _start_dispatcher() {
         rm -f "$pid_file"
     fi
 
-    # Create the FIFO outside the identity dir. The mind walks its own
-    # identity dir, and anything that opens a fifo as a file blocks forever
-    # and steals step lines from the dispatcher (Audel 2026-09-25: a secret
-    # scan sat 3.5 h in read() on run/dispatch.fifo). /tmp, not $TMPDIR: a
-    # start from inside a shellm run gets a TMPDIR that dies with the run.
-    # run/fifo_path records where it is so stop and cleanup can find it.
-    _remove_fifo "$run_dir"
-    local fifo_dir
-    fifo_dir=$(mktemp -d "/tmp/headlong-dispatch.XXXXXX") \
-        || die "Could not create a fifo directory in /tmp"
-    fifo="$fifo_dir/dispatch.fifo"
-    mkfifo "$fifo" || die "Could not create $fifo"
-    printf '%s\n' "$fifo" > "$run_dir/fifo_path"
-
-    # Fresh pending-trigger flags (steps that arrived while a thinker was busy)
-    rm -rf "$run_dir/pending"
-    mkdir -p "$run_dir/pending"
-    # Left over from the mid-run "salience injection" (removed 2026-09-09).
-    rm -f "$run_dir/fb_injected"
+    stale_fifo=$(head -n 1 "$run_dir/fifo_path" 2>/dev/null) || stale_fifo=""
 
     # Ownership token: this instance owns the dispatcher role only while
     # dispatcher.token still holds its token. A newer start overwrites the
@@ -323,8 +305,18 @@ _start_dispatcher() {
     # dispatcher instances — which would double-dispatch every step —
     # self-terminating.
     local dispatcher_token
-    dispatcher_token="$(date +%s).$$.$RANDOM"
-    printf '%s' "$dispatcher_token" > "$run_dir/dispatcher.token"
+    # Minted from 16 bytes of /dev/urandom. The old date+pid+RANDOM mint
+    # collided when two dispatchers started in the same second (pids repeat
+    # across forks), so both passed the ownership check and double-dispatched
+    # every due wake (the 2026-09-22/23 5x and 2x sends).
+    dispatcher_token="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+    [[ -n "$dispatcher_token" ]] || dispatcher_token="$(date +%s)-$$-$RANDOM-$$"
+    # Write the token atomically (temp + rename). Two starts writing the same
+    # file in the same instant could otherwise interleave their writes and
+    # leave a token neither one owns, which would make every dispatcher exit
+    # on the ownership check and leave the mind with none.
+    printf '%s' "$dispatcher_token" > "$run_dir/dispatcher.token.$$"
+    mv "$run_dir/dispatcher.token.$$" "$run_dir/dispatcher.token"
 
     # Build subscription map: thinker_name -> [traj_file, types_pattern, trigger_self]
     # We store this as lines: THINKER_NAME\tTRAJ_FILE\tTYPES_REGEX\tTRIGGER_SELF
@@ -388,23 +380,13 @@ _start_dispatcher() {
     done < <(_list_thinker_dirs)
 
     if [[ -z "$sub_map" ]]; then
-        _remove_fifo "$run_dir"
         die "No valid subscriptions found"
     fi
-
-    # Write subscription map and traj files list for the dispatcher
-    printf '%s' "$sub_map" > "$run_dir/sub_map"
-    printf '%s\n' "$traj_files" > "$run_dir/traj_files"
 
     # Export env for dispatcher subprocess
     export IDENTITY_DIR IDENTITY_NAME MEM_DIR SKILLS_DIR SKILLS_KERNEL_DIR
     export TRAJ_DIR TRAJ_ID THINKERS_DIR SHELLM_HOME THINK_MODEL THINK_CONTEXT_TAIL
     export THINKERS_MAX_CONCURRENT NO_SELF_TRIGGER
-
-    # Fresh slate for the death-attribution markers: a stale deliberate_stop
-    # (stop requested while no dispatcher ran) must not launder the next
-    # unclean death, and last_signal only describes the run ahead.
-    rm -f "$run_dir/deliberate_stop" "$run_dir/last_signal"
 
     # setsid (util-linux) puts each step in its own session + process group,
     # so a group-directed signal from inside a step tree (kill 0 and
@@ -421,6 +403,58 @@ _start_dispatcher() {
         trap '_cleanup_dispatcher' EXIT
         trap '_dispatcher_on_signal INT' INT
         trap '_dispatcher_on_signal TERM' TERM
+        # Single-owner the dispatcher role with a real lock, held on fd 4
+        # for the life of the loop and released on exit. The token check alone
+        # could not stop two same-second starts from both dispatching.
+        exec 4>"$run_dir/dispatcher.lock"
+        if command -v flock >/dev/null 2>&1; then
+            # Wait for the lock instead of bowing out. A `thinkers start` means
+            # take over: it has already written its own token, so the incumbent
+            # exits within a tick of seeing it and releases the lock. Bowing out
+            # on contention (flock -n) left NO dispatcher at all whenever a
+            # start overlapped a live one - the incumbent exits on the token
+            # mismatch and the newcomer had already quit.
+            flock -w 15 4 || {
+                printf '%s [dispatcher] lock timeout waiting for the incumbent - exiting\n' \
+                    "$(date -u +%FT%TZ)" >&2
+                exit 0
+            }
+        fi
+
+        # A queued starter may have been superseded while waiting. It must
+        # not publish runtime files or clean up the winner's state.
+        [[ "$(cat "$run_dir/dispatcher.token" 2>/dev/null)" == "$dispatcher_token" ]] || exit 0
+        _dispatcher_owns_runtime=1
+        # Reap the previous owner's abandoned feeders/FIFO before publishing
+        # ours. The lock is ours now; claim receipts survive crash recovery.
+        _cleanup_run_state "$run_dir" "" "$stale_fifo" "$dispatcher_token" keep-token
+        [[ "$(cat "$run_dir/dispatcher.token" 2>/dev/null)" == "$dispatcher_token" ]] || exit 0
+        mkdir -p "$run_dir/pending"
+        printf '%s' "$sub_map" > "$run_dir/sub_map"
+        printf '%s\n' "$traj_files" > "$run_dir/traj_files"
+        rm -f "$run_dir/fb_injected" "$run_dir/deliberate_stop" "$run_dir/last_signal"
+
+        # Remove a leftover fifo at the legacy in-identity path (before the
+        # 2026-09-26 move). A crash before the move could leave one behind,
+        # and leaving it means the mind's identity-tree walk opens it and
+        # blocks forever. Creating our own after the lock made it never get
+        # cleaned, so clean it explicitly here.
+        rm -f "$run_dir/dispatch.fifo"
+
+        # Create OUR OWN fifo, outside the identity dir (the mind walks its
+        # own dir and anything that opens a fifo there blocks forever). This
+        # is done HERE, after we hold the lock, so no concurrent start can
+        # delete our fifo before we open fd 3: the 2026-10-12 race where a
+        # racing start removed the incumbent's fifo mid-open left zero
+        # dispatchers and a due wake never fired.
+        fifo_dir=$(mktemp -d "/tmp/headlong-dispatch.XXXXXX") \
+            || { printf '%s [dispatcher] could not create fifo dir — exiting\n' "$(date -u +%FT%TZ)" >&2; exit 1; }
+        fifo="$fifo_dir/dispatch.fifo"
+        mkfifo "$fifo" || { printf '%s [dispatcher] could not create fifo — exiting\n' "$(date -u +%FT%TZ)" >&2; rmdir "$fifo_dir" 2>/dev/null || true; exit 1; }
+        printf '%s\n' "$fifo" > "$run_dir/fifo_path"
+        # Release the startup stdout pipe only after pending/runtime setup.
+        # Named starts queue their kick after _start_dispatcher returns.
+        exec 5>&-
 
         # Start tail -F for each unique traj file, tagged with traj path.
         # Track our own tail PIDs separately from the shared tail_pids file:
@@ -448,14 +482,15 @@ _start_dispatcher() {
         # child of $! and _kill_tree reaps it. (Killing a bare pipeline's $!
         # only kills the last stage — the tail survives and leaks.) fd 3 is
         # the dispatcher's own fifo handle — close it so a feeder never
-        # holds a stray write end.
+        # holds a stray write end. Close fd 4 too: only the dispatcher owns
+        # the lifetime lock; orphaned feeders must not retain it.
         _spawn_feeder() {
             local _ftraj="$1"
             (
                 tail -n 0 -F "$_ftraj" 2>/dev/null | while IFS= read -r line; do
                     printf '%s\t%s\n' "$_ftraj" "$line"
                 done > "$fifo"
-            ) 3<&- &
+            ) 3<&- 4>&- &
             printf '%s\n' "$!" >> "$tail_pids_file"
             _my_tail_pids="${_my_tail_pids}${_my_tail_pids:+ }$!"
             local _fino _fsize
@@ -704,10 +739,12 @@ _start_dispatcher() {
             # step script starts, so viewers can attribute runs to thinkers.
             # $_setsid is deliberately unquoted: "setsid" on Linux, empty
             # (and word-split away) elsewhere.
+            # Close the lifetime lock in the child so drain stops can restart
+            # the dispatcher while this step finishes independently.
             # shellcheck disable=SC2086
             (
                 printf '%s' "$_djson" | SHELLM_LAUNCHED_BY="$_dname" $_setsid "$_dscript"
-            ) >> "$_dlog" 2>&1 3<&- &
+            ) >> "$_dlog" 2>&1 3<&- 4>&- &
             _step_entries="${_step_entries}${_step_entries:+ }${_dname}:$!"
             printf '%s %s\n' "$!" "$_dname" >> "$run_dir/step_pids"
             _wd_touch "$_dname"
@@ -922,8 +959,63 @@ _start_dispatcher() {
         # the monolith's old per-step `setsid` background timer, which never ran
         # on macOS (no setsid) so spontaneity silently died. Generic over any
         # thinker; the monolith is the only current writer.
+        # Crash recovery for claim receipts. claimed/<name> exists only between
+        # the claim and the launch of its step, so one older than
+        # THINKERS_CLAIM_STALE_SECS means the dispatcher died in that window and
+        # the send would otherwise be lost silently. Re-arm it as a due wake so
+        # the normal path fires it again: a scheduled wake is at-least-once, and
+        # a rare repeat is better than a post that never goes out.
+        _sweep_claims() {
+            local _cf _cbase _cm _cage _cwa _ct _wt _sf _sm _sage _stale="${THINKERS_CLAIM_STALE_SECS:-30}"
+            for _cf in "$run_dir"/claimed/*; do
+                [[ -f "$_cf" ]] || continue
+                _cm=$(stat -c %Y "$_cf" 2>/dev/null || stat -f %m "$_cf" 2>/dev/null || echo 0)
+                _cage=$(( $(date +%s) - _cm ))
+                (( _cage < _stale )) && continue
+                _cbase=$(basename "$_cf")
+                _cwa="$run_dir/$_cbase.wake_at"
+                # A stale claim and a wake_at for the same name collide on one
+                # name-keyed due time, and one pending due time per name is the
+                # scheduler's contract. The wake_at is the live schedule, so drop the
+                # claim and keep the scheduled time. The claim's own due time is in the
+                # past by the time it is stale (a claim only forms once its wake is
+                # already due) and the payload either one fires is the same constant
+                # wake for the name, so re-arming with the claim's time only fires the
+                # live occurrence early: the early send this sweep guards against.
+                if [[ -f "$_cwa" ]]; then
+                    _ct=$(cat "$_cf" 2>/dev/null) || _ct=""
+                    _wt=$(cat "$_cwa" 2>/dev/null) || _wt=""
+                    if [[ "$_wt" =~ ^[0-9]+$ ]]; then
+                        printf '%s [dispatcher]   dropped stale claim %s, kept scheduled wake_at %s\n' "$(date -u +%FT%TZ)" "$_cbase" "$_wt" >&2
+                    elif [[ "$_ct" =~ ^[0-9]+$ ]]; then
+                        printf '%s' "$_ct" > "$_cwa" 2>/dev/null || true
+                        printf '%s [dispatcher]   re-armed stale claim %s (age %ss)\n' "$(date -u +%FT%TZ)" "$_cbase" "$_cage" >&2
+                    else
+                        printf '%s [dispatcher]   dropped stale claim %s (unreadable due time), left the existing wake_at alone\n' "$(date -u +%FT%TZ)" "$_cbase" >&2
+                    fi
+                    rm -f "$_cf"
+                else
+                    mv -f "$_cf" "$_cwa" 2>/dev/null || rm -f "$_cf"
+                    printf '%s [dispatcher]   re-armed stale claim %s (age %ss)\n' "$(date -u +%FT%TZ)" "$_cbase" "$_cage" >&2
+                fi
+            done
+            # A sent receipt that outlived its step is a crash between the launch
+            # and the cleanup. The send already happened, so drop the evidence
+            # rather than re-arm it: re-arming here is exactly the double fire.
+            for _sf in "$run_dir"/sent/*; do
+                [[ -f "$_sf" ]] || continue
+                _sm=$(stat -c %Y "$_sf" 2>/dev/null || stat -f %m "$_sf" 2>/dev/null || echo 0)
+                _sage=$(( $(date +%s) - _sm ))
+                (( _sage < _stale )) && continue
+                rm -f "$_sf"
+                printf '%s [dispatcher]   dropped stale sent receipt %s (age %ss)\n' "$(date -u +%FT%TZ)" "$(basename "$_sf")" "$_sage" >&2
+            done
+            return 0
+        }
+
         _scheduled_wake_check() {
-            local _wf _wname _wat _now
+            local _wf _wname _wat _now _claim _sent
+            _sweep_claims
             _now=$(date +%s)
             for _wf in "$run_dir"/*.wake_at; do
                 [[ -f "$_wf" ]] || continue
@@ -937,10 +1029,38 @@ _start_dispatcher() {
                 _thinker_busy "$_wname" && continue
                 _count_active_steps
                 if [[ "$_active_step_count" -ge "$THINKERS_MAX_CONCURRENT" ]]; then continue; fi
-                rm -f "$_wf"
+                # Atomic claim: mv is the mutex. Exactly one dispatcher wins
+                # a due wake file; the others find it gone and skip, so one
+                # wake is dispatched however many dispatchers are ticking.
+                mkdir -p "$run_dir/claimed"
+                # Claim receipt: this file lives from the claim until the step
+                # is launched, so a crash in that window leaves evidence instead
+                # of swallowing the send. touch resets the clock, since mv keeps
+                # the mtime of the wake file's own write time (which can be
+                # hours old for a wake that was armed in advance).
+                _claim="$run_dir/claimed/$_wname"
+                mv "$_wf" "$_claim" 2>/dev/null || continue
+                touch "$_claim" 2>/dev/null
+                if [[ -n "${THINKERS_TEST_DIE_AFTER_CLAIM:-}" ]]; then
+                    # Fault injection for test_dispatcher_single_owner.sh: die
+                    # between the claim and the launch on purpose.
+                    bash -c 'kill -KILL "$PPID"' 2>/dev/null || exit 1
+                fi
+                # Sent receipt: renamed across atomically just before the launch.
+                # From here the send belongs to this dispatcher, and _sweep_claims
+                # never re-arms a sent receipt, so a crash after the launch cannot
+                # send the same wake twice. The trade is deliberate and narrow: a
+                # crash in the mv itself is still covered by the claim receipt
+                # above and stays at-least-once, while anything after the rename
+                # can at worst lose a send, never double it.
+                mkdir -p "$run_dir/sent"
+                _sent="$run_dir/sent/$_wname"
+                mv "$_claim" "$_sent" 2>/dev/null || continue
+                touch "$_sent" 2>/dev/null
                 printf '%s [dispatcher]   scheduled wake -> %s (due %ss ago)\n' "$(date -u +%FT%TZ)" "$_wname" "$((_now - _wat))" >&2
                 _dispatch_step "$_wname" "$(jq -nc --arg source monolith-timer \
                     '{type:"monolith-wake", content:"wake", source:$source}')"
+                rm -f "$_sent"
             done
         }
 
@@ -952,10 +1072,7 @@ _start_dispatcher() {
                 # files (fifo, sub_map, tail_pids, pending) belong to the
                 # new owner now — leave them untouched.
                 trap - EXIT INT TERM
-                local _mtp
-                for _mtp in $_my_tail_pids; do
-                    _kill_tree "$_mtp" TERM
-                done
+                _cleanup_dispatcher
                 exit 0
             fi
             _fire_pending
@@ -1196,7 +1313,7 @@ _start_dispatcher() {
                 _dispatch_step "$_name" "$_step_json"
             done < "$run_dir/sub_map"
         done
-    ) >> "$run_dir/logs/dispatcher.log" 2>&1 &
+    ) 5>&1 >> "$run_dir/logs/dispatcher.log" 2>&1 &
 
     local dispatcher_pid=$!
     printf '%s' "$dispatcher_pid" > "$pid_file"
@@ -1214,7 +1331,12 @@ _start_dispatcher() {
 # (removing the token also makes any stray dispatcher instance exit on its
 # next heartbeat).
 _cleanup_run_state() {
-    local run_dir="$1"
+    local run_dir="$1" expected_token="${4:-}" current_token
+    # The FIFO argument is a snapshot of this owner's resource, never a
+    # fresh read of a successor's pointer. Remove it even after ownership loss.
+    _remove_own_fifo "${3:-}"
+    current_token=$(cat "$run_dir/dispatcher.token" 2>/dev/null) || current_token=""
+    [[ -z "$current_token" || "$current_token" == "$expected_token" ]] || return 0
     local tail_pids_file="$run_dir/tail_pids"
     if [[ -f "$tail_pids_file" ]]; then
         local pid
@@ -1224,30 +1346,44 @@ _cleanup_run_state() {
         rm -f "$tail_pids_file"
     fi
     _kill_traj_tails "$run_dir" ${2:+"$2"}
-    _remove_fifo "$run_dir"
-    rm -f "$run_dir/sub_map" "$run_dir/traj_files" "$run_dir/dispatcher.token"
+    # A new start publishes its token before waiting for the lock.
+    current_token=$(cat "$run_dir/dispatcher.token" 2>/dev/null) || current_token=""
+    [[ -z "$current_token" || "$current_token" == "$expected_token" ]] || return 0
+    rm -f "$run_dir/fifo_path" "$run_dir/sub_map" "$run_dir/traj_files"
+    [[ "${5:-}" == keep-token ]] || rm -f "$run_dir/dispatcher.token"
     rm -rf "$run_dir/pending"
 }
 
-# Remove the dispatcher fifo named by run/fifo_path, and the run/dispatch.fifo
-# that dispatchers before 2026-09-26 kept inside the identity dir. Only a path
-# of the shape _start_dispatcher makes is removed, since fifo_path sits in a
-# directory the mind can write.
-_remove_fifo() {
-    local run_dir="$1" path=""
-    path=$(head -n 1 "$run_dir/fifo_path" 2>/dev/null) || true
+# Remove the dispatcher's OWN fifo, identified by the path it created and
+# holds in $fifo. Each dispatcher owns exactly one fifo; on exit it removes
+# only that one, never a successor's (the shared run/fifo_path is a debug
+# pointer and a racing newer start rewrites it before the old dispatcher's
+# exit trap runs). Only a path of the shape _start_dispatcher makes is
+# removed, since it sits in a directory the mind can write.
+_remove_own_fifo() {
+    local path="$1"
+    [[ -n "$path" ]] || return 0
     case "$path" in
         /tmp/headlong-dispatch.*/dispatch.fifo)
-            if [[ "$path" != *..* && -p "$path" ]]; then
+            if [[ "$path" != *..* ]]; then
                 rm -f "$path"
                 rmdir "${path%/dispatch.fifo}" 2>/dev/null || true
             fi ;;
     esac
-    rm -f "$run_dir/fifo_path" "$run_dir/dispatch.fifo"
 }
 
 _cleanup_dispatcher() {
-    _cleanup_run_state "$IDENTITY_DIR/run"
+    # Always release our own resources, including on setup failure. A starter
+    # that never acquired the role must not touch an incumbent's runtime.
+    local pid
+    for pid in ${_my_tail_pids:-}; do _kill_tree "$pid" TERM; done
+    _my_tail_pids=""
+    _remove_own_fifo "${fifo:-}"
+    if [[ "${_dispatcher_owns_runtime:-0}" -eq 1 &&
+          "$(cat "$IDENTITY_DIR/run/dispatcher.token" 2>/dev/null)" == "$dispatcher_token" ]]; then
+        _cleanup_run_state "$IDENTITY_DIR/run" "" "${fifo:-}" "$dispatcher_token"
+    fi
+    return 0
 }
 
 # Dispatcher INT/TERM handler. Sanctioned stops announce themselves:
@@ -1294,6 +1430,9 @@ _stop_dispatcher() {
 
     # Snapshot the traj-file list now: the dispatcher's trap cleanup removes
     # run/traj_files, and we need it below to sweep leaked tail feeders.
+    local fifo_snapshot token_snapshot
+    fifo_snapshot=$(head -n 1 "$run_dir/fifo_path" 2>/dev/null) || fifo_snapshot=""
+    token_snapshot=$(cat "$run_dir/dispatcher.token" 2>/dev/null) || token_snapshot=""
     local traj_files_snapshot=""
     if [[ -f "$run_dir/traj_files" ]]; then
         traj_files_snapshot=$(cat "$run_dir/traj_files" 2>/dev/null) || true
@@ -1322,13 +1461,17 @@ _stop_dispatcher() {
         else
             printf 'Dispatcher not running (cleaned up stale PID).\n' >&2
         fi
-        rm -f "$pid_file"
+        if [[ "$(cat "$pid_file" 2>/dev/null)" == "$pid" ]]; then rm -f "$pid_file"; fi
     else
         printf 'No dispatcher running.\n' >&2
     fi
 
-    _cleanup_run_state "$run_dir" "$traj_files_snapshot"
+    _cleanup_run_state "$run_dir" "$traj_files_snapshot" "$fifo_snapshot" "$token_snapshot"
 
+    # A concurrent start owns subsequent stop bookkeeping now too.
+    local current_token
+    current_token=$(cat "$run_dir/dispatcher.token" 2>/dev/null) || current_token=""
+    if [[ -n "$current_token" && "$current_token" != "$token_snapshot" ]]; then return 1; fi
     # Vitals check: warn if any tail feeders survived the kill/sweep
     _warn_stray_tails
 }
@@ -1628,17 +1771,6 @@ cmd_stop() {
         die "stop: refusing — this process would die with the $IDENTITY_NAME dispatcher it is asking to stop, leaving the mind down with nothing to restart it. To restart your own mind safely (e.g. to pick up a new thinker): sudo headlong-thinkersctl restart $IDENTITY_NAME — systemd completes the restart even after this step dies with the old dispatcher. To stop another identity: bash -c 'source <identities>/<name>/activate && thinkers stop'. To really stop your own mind, pass --self."
     fi
 
-    # Drop any pending scheduled-wake requests (design/monolith_backoff.md) when
-    # stopping the monolith or all thinkers, so a stale wake_at can't fire a
-    # thinker the operator just stopped. These are plain timestamp files (the
-    # dispatcher tick owns the clock now — no timer process to kill).
-    if [[ ${#names[@]} -eq 0 ]]; then
-        rm -f "$run_dir"/*.wake_at 2>/dev/null || true
-    else
-        local _wn
-        for _wn in "${names[@]}"; do rm -f "$run_dir/$_wn.wake_at" 2>/dev/null || true; done
-    fi
-
     # Default is a drain stop: deactivate (no new triggers), let in-flight
     # steps finish, escalate to kill only after --drain-timeout. --force
     # kills in-flight steps immediately (the old behavior).
@@ -1655,6 +1787,10 @@ cmd_stop() {
                 grep -vx "$name" "$run_dir/active_thinkers" > "$run_dir/active_thinkers.tmp" 2>/dev/null || true
                 mv "$run_dir/active_thinkers.tmp" "$run_dir/active_thinkers"
             fi
+
+            # Explicit stop cancels unlaunched wakes, including crash claims.
+            # Deactivate first so the sweep cannot dispatch the cancelled work.
+            rm -f "$run_dir/$name.wake_at" "$run_dir/claimed/$name" "$run_dir/sent/$name"
 
             # Collect this thinker's live in-flight steps
             local pids=() step_pid _step_name
@@ -1689,13 +1825,15 @@ cmd_stop() {
         remaining=$(grep -c . "$run_dir/active_thinkers" 2>/dev/null) || remaining=0
         if [[ "$remaining" -eq 0 ]]; then
             printf 'No active thinkers remain — stopping dispatcher.\n' >&2
-            _stop_dispatcher
+            _stop_dispatcher || return 0
         fi
         return
     fi
 
     # --- Stop all (no name given) ---
-    _stop_dispatcher
+    _stop_dispatcher || return 0
+    # Wait until the dispatcher is gone before cancelling its pending claims.
+    rm -f "$run_dir"/*.wake_at "$run_dir"/claimed/* "$run_dir"/sent/*
 
     # Collect all live in-flight steps
     local step_pids_file="$run_dir/step_pids"
@@ -2091,7 +2229,9 @@ Environment (set by `identity shell`):
   IDENTITY_DIR, IDENTITY_NAME, MEM_DIR, SKILLS_DIR,
   SKILLS_KERNEL_DIR, TRAJ_DIR, TRAJ_ID, THINKERS_DIR,
   SHELLM_HOME, THINK_MODEL, THINK_CONTEXT_TAIL,
-  THINKERS_MAX_CONCURRENT (default: 4)
+  THINKERS_MAX_CONCURRENT (default: 4),
+  THINKERS_CLAIM_STALE_SECS (default: 30),
+  THINKERS_TEST_DIE_AFTER_CLAIM (fault injection, any set value)
 EOF
     exit 0
 }

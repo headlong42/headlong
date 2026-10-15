@@ -21,7 +21,7 @@ fail=0
 ok()  { pass=$((pass+1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail+1)); printf 'FAIL %s%s\n' "$1" "${2:+ — $2}"; }
 
-TMP=$(mktemp -d)
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/thinkers-fifo.XXXXXX") || exit 1
 TRAJ_ID="cafe0000-0000-0000-0000-000000000009"
 RUN="$TMP/id/run"
 TRAJ="$TMP/id/trajectories/$TRAJ_ID/trajectory.jsonl"
@@ -84,6 +84,36 @@ if [[ ! -e "$fifo" && ! -e "${fifo%/dispatch.fifo}" && ! -e "$RUN/fifo_path" ]];
 else
     bad "stop removes the fifo, its dir, and fifo_path"
 fi
+
+# A crash skips the dispatcher's EXIT trap. Stop still owns the snapshotted
+# FIFO and must remove it. Signal only the PID of this disposable fixture.
+env_run thinkers start >/dev/null 2>&1
+sleep 2
+crashed_fifo=$(cat "$RUN/fifo_path")
+fixture_pid=$(cat "$RUN/dispatcher.pid")
+kill -KILL "$fixture_pid"
+sleep 1
+env_run thinkers stop >/dev/null 2>&1
+if [[ ! -e "$crashed_fifo" && ! -e "${crashed_fifo%/dispatch.fifo}" ]]; then
+    ok "stop removes a crashed owner's fifo and directory"
+else bad "stop removes a crashed owner's fifo and directory"; fi
+
+# Ownership loss must release only the old owner's FIFO. A successor's pointer
+# and pending work are written after changing the token, just as a takeover does.
+env_run thinkers start >/dev/null 2>&1
+sleep 2
+old_fifo=$(cat "$RUN/fifo_path")
+mkfifo "$TMP/successor-fifo"
+printf 'successor' > "$RUN/dispatcher.token"
+printf '%s\n' "$TMP/successor-fifo" > "$RUN/fifo_path"
+printf 'keep' > "$RUN/pending/successor"
+sleep 3
+if [[ ! -e "$old_fifo" && ! -e "${old_fifo%/dispatch.fifo}" &&
+      -p "$TMP/successor-fifo" && -f "$RUN/pending/successor" &&
+      "$(cat "$RUN/fifo_path")" == "$TMP/successor-fifo" ]]; then
+    ok "ownership loss removes only the old fifo, preserving successor state"
+else bad "ownership loss removes only the old fifo, preserving successor state"; fi
+env_run thinkers stop >/dev/null 2>&1
 
 # A fifo_path the mind rewrote to point elsewhere is never followed.
 decoy="$TMP/decoy"
