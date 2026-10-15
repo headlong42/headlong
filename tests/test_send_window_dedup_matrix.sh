@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/send-window-dedup-matrix.sh: duplicate-send guard matrix for bin/chat.
+# tests/test_send_window_dedup_matrix.sh: duplicate-send guard matrix for bin/chat.
 # Three guards are exercised. The keyed duty guard: a --key names the one duty a
 # send fulfils, so a second send carrying the same key is refused however the
 # text is reworded (on 2026-09-18 one papers post went out five times in three
@@ -11,20 +11,25 @@
 set -u
 
 here=$(cd "$(dirname "$0")" && pwd)
+export PATH="$here/../bin:$PATH"
+export SHELLM_ENV=local
 CHAT=${CHAT:-$here/../bin/chat}
 if [ ! -x "$CHAT" ]; then
   echo "send-window-dedup-matrix: no executable at $CHAT" >&2
   exit 2
 fi
 
-REFUSE_RE="refus|skipping duplicate|already sent|already has a reply|duty is done"
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/send-dedup.XXXXXXXX") || exit 2
+trap 'rm -rf "$WORK"' EXIT
+state_seq=0
 pass=0
 fail=0
 skip=0
 report=""
 
 fresh_state() {
-  ROOT=$(mktemp -d /tmp/sddm.XXXXXXXX) || exit 2
+  state_seq=$((state_seq+1))
+  ROOT="$WORK/$state_seq"
   HOME=$ROOT
   TRAJ_DIR=$ROOT/traj
   TRAJ_ID=sddm-$RANDOM-$RANDOM
@@ -42,7 +47,9 @@ fresh_state() {
 # outcome: REFUSE when the guard spoke, ALLOW on a clean send, ERROR when the
 # command failed for some other reason, which must never count as a pass.
 outcome() {
-  if printf %s "${OUT:-}" | grep -qiE "$REFUSE_RE"; then
+  if [[ "${RC:-1}" -eq 0 && "${OUT:-}" == chat:\ step\ *\ already\ has\ a\ reply\ from\ *\ —\ skipping\ duplicate\ send. ]]; then
+    echo REFUSE
+  elif [[ "${RC:-1}" -ne 0 ]] && printf '%s\n' "${OUT:-}" | grep -E "^chat: error: refusing to send: ('.*' was already sent at|this exact message already went to)" >/dev/null; then
     echo REFUSE
   elif [ ${RC:-1} -eq 0 ]; then
     echo ALLOW
@@ -90,12 +97,6 @@ PASS  $desc"
     report="$report
 FAIL  $desc (want $want, got $got)"
   fi
-}
-
-skipcase() {
-  skip=$((skip+1))
-  report="$report
-SKIP  $1"
 }
 
 MODE=arg
@@ -174,7 +175,7 @@ if [ "$(outcome)" = ALLOW ]; then
   _reply "trig-$RANDOM" "$A" "answer one in other words"
   expect "a reply to another trigger is allowed" ALLOW "$(outcome)"
 else
-  skipcase "reply guard cases skipped, a reply needs a real trigger step here"
+  expect "the initial reply succeeds" ALLOW "$(outcome)"
 fi
 
 printf %s "$report"

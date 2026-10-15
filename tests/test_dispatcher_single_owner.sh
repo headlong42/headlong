@@ -10,6 +10,7 @@
 # the wake file before dispatch. Fake thinker, no LLM calls, no docker.
 
 set -uo pipefail
+export SHELLM_ENV=local
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(dirname "$HERE")"
@@ -17,11 +18,13 @@ PATH="$REPO/bin:$PATH"
 
 pass=0
 fail=0
+skip=0
+skipcase() { skip=$((skip+1)); printf 'SKIP %s\n' "$1"; }
 want() { [[ -n "${TEST_FILTER:-}" && "$1" != *"$TEST_FILTER"* ]] && return 0; "$1"; }
 ok()  { pass=$((pass+1)); printf 'ok   %s\n' "$1"; }
 bad() { fail=$((fail+1)); printf 'FAIL %s%s\n' "$1" "${2:+ - $2}"; }
 
-TMP=$(mktemp -d)
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/dispatcher-owner.XXXXXX") || exit 1
 TRAJ_ID="cafe0000-0000-0000-0000-000000000007"
 RUN="$TMP/id/run"
 
@@ -33,6 +36,11 @@ env_run() {
 }
 
 cleanup() {
+    if [[ -n "${paused_fixture:-}" ]]; then
+        printf '%s' "$paused_fixture" > "$RUN/dispatcher.pid"
+        kill -CONT "$paused_fixture" 2>/dev/null || true
+    fi
+    rm -f "$TMP/id/hold"
     env_run thinkers stop >/dev/null 2>&1 || true
     rm -rf "$TMP"
 }
@@ -69,9 +77,8 @@ test_crash_after_launch_does_not_double_fire() {
     # out. If the stale-claim sweep re-arms that receipt the same wake is sent a
     # second time, which is the duplicate post this change exists to stop.
     #
-    # The crash goes in through a PATH shim for rm, the one command both the old
-    # and the new code run in that window, so this case can go red on the pre-fix
-    # commit without depending on instrumentation the old code does not have.
+    # The rm shim exercises receipt cleanup in this implementation. A version
+    # without receipts does not reach this injection point.
     setup_identity
     local shim="$TMP/shim2" shimlog="$TMP/shim2.log" crashflag="$TMP/crash2.fired"
     local realmv realrm sent_before sent_after leftovers i
@@ -128,7 +135,7 @@ SHIM
         bad "the wake goes out exactly once before the crash" "record count $sent_before"
     fi
 
-    env_run thinkers stop >/dev/null 2>&1 || true
+    # Recover directly: an explicit stop would cancel pending claim receipts.
     env_run env THINKERS_CLAIM_STALE_SECS=1 thinkers start >/dev/null 2>&1
     sleep 6
 
@@ -173,7 +180,7 @@ test_die_after_claim_recovers() {
     else
         bad "the crash leaves the claim receipt behind as evidence" "claims=$claims"
     fi
-    env_run thinkers stop >/dev/null 2>&1 || true
+    # Recover directly: an explicit stop would cancel pending claim receipts.
     env_run env THINKERS_CLAIM_STALE_SECS=1 thinkers start >/dev/null 2>&1
     sleep 5
     if [[ "$(record_count)" -eq 1 ]]; then
@@ -222,7 +229,8 @@ test_many_starts_one_dispatch() {
     # that minted colliding tokens and double-dispatched every due wake.
     for ((i = 0; i < n; i++)); do env_run thinkers start >/dev/null 2>&1 & done
     wait
-    sleep 6
+    # Check after every 15-second lock waiter has had time to settle.
+    sleep 18
 
     printf '%s' "$(( $(now) - 1 ))" > "$RUN/napper.wake_at"
     sleep 4
@@ -245,7 +253,7 @@ test_many_starts_one_dispatch() {
 
 test_lock_is_held() {
     if ! command -v flock >/dev/null 2>&1; then
-        ok "the running dispatcher holds its lock (skipped, no flock here)"
+        skipcase "the running dispatcher holds its lock: flock unavailable"
         return
     fi
     setup_identity
@@ -265,7 +273,7 @@ test_lock_is_held() {
 
 test_lock_timeout_exits() {
     if ! command -v flock >/dev/null 2>&1; then
-        ok "a blocked start waits for the lock then exits (skipped, no flock here)"
+        skipcase "lock timeout: flock unavailable"
         return
     fi
     setup_identity
@@ -280,10 +288,9 @@ test_lock_timeout_exits() {
     exec 9>"$RUN/dispatcher.lock"
     flock -x 9 2>/dev/null
 
-    # `thinkers start` returns as soon as it forks the dispatcher loop, so
-    # the flock block lives in that background child. Poll the dispatcher's
-    # own log for the timeout line: it must appear within the 15s lock
-    # window plus a couple of ticks, and nothing may dispatch.
+    # The lock wait runs in the background child. Startup holds its stdout
+    # pipe until setup completes or that child exits. Check the timeout log
+    # as well: nothing may dispatch after the failed start.
     env_run thinkers start >/dev/null 2>&1
     local timed_out=0
     for ((i = 0; i < 25; i++)); do
@@ -323,10 +330,10 @@ test_tokens_unique() {
         bad "each start mints a fresh ownership token" "a=$a b=$b"
     fi
 
-    if [[ "${#a}" -ge 16 ]]; then
-        ok "the token is high entropy, not date plus pid"
+    if [[ "$a" =~ ^[0-9a-f]{32}$ && "$b" =~ ^[0-9a-f]{32}$ ]]; then
+        ok "tokens contain exactly 16 bytes encoded as hex"
     else
-        bad "the token is high entropy, not date plus pid" "length ${#a}"
+        bad "tokens contain exactly 16 bytes encoded as hex" "a=$a b=$b"
     fi
 
     env_run thinkers stop >/dev/null 2>&1
@@ -338,9 +345,8 @@ test_shim_crash_mid_send_recovers() {
     # bin/thinkers uses to move a due wake into its claim slot, performs the
     # real move and then kills the dispatcher before it can send. The
     # injection lives entirely in this test file, so the case reproduces the
-    # crash window without any test-only hook in bin/thinkers, and it runs
-    # against pre-receipt code where the send was swallowed with nothing left
-    # behind.
+    # crash window without the test-only hook in bin/thinkers. A version
+    # without receipts does not reach this injection point.
     setup_identity
 
     local shim="$TMP/shim" shimlog="$TMP/shim.log" crashflag="$TMP/crash.fired"
@@ -402,7 +408,7 @@ SHIM
     fi
 
     # Recovery: a fresh dispatcher sweeps the orphaned claim and fires it.
-    env_run thinkers stop >/dev/null 2>&1 || true
+    # Recover directly: an explicit stop would cancel pending claim receipts.
     env_run env THINKERS_CLAIM_STALE_SECS=1 thinkers start >/dev/null 2>&1
     sleep 5
 
@@ -479,6 +485,162 @@ test_stale_claim_non_numeric_wake_at() {
     env_run thinkers stop >/dev/null 2>&1
 }
 
+
+test_waiter_preserves_incumbent() {
+    if ! command -v flock >/dev/null 2>&1; then
+        skipcase "incumbent timeout test: flock unavailable"
+        return
+    fi
+    setup_identity
+    start_thinkers
+    local incumbent token fifo tails i
+    incumbent=$(cat "$RUN/dispatcher.pid")
+    token=$(cat "$RUN/dispatcher.token")
+    fifo=$(cat "$RUN/fifo_path")
+    tails=$(cat "$RUN/tail_pids")
+    paused_fixture="$incumbent"
+    # Freeze only our disposable dispatcher, then simulate its lost PID file.
+    # It cannot observe the contender's token while the 15s wait expires.
+    kill -STOP "$incumbent"
+    rm -f "$RUN/dispatcher.pid"
+    printf 'keep' > "$RUN/pending/timeout-sentinel"
+    env_run thinkers start >/dev/null 2>&1
+    for ((i=0; i<25; i++)); do
+        grep -q 'lock timeout waiting' "$RUN/logs/dispatcher.log" && break
+        sleep 1
+    done
+    if [[ -p "$fifo" && -f "$RUN/pending/timeout-sentinel" &&
+          -f "$RUN/sub_map" && -f "$RUN/traj_files" && -s "$RUN/dispatcher.token" &&
+          "$(cat "$RUN/tail_pids" 2>/dev/null)" == "$tails" &&
+          "$(cat "$RUN/fifo_path" 2>/dev/null)" == "$fifo" ]]; then
+        ok "timed-out contender preserves incumbent runtime"
+    else bad "timed-out contender preserves incumbent runtime"; fi
+    # Restore its ownership so the test can prove the preserved loop still works.
+    printf '%s' "$token" > "$RUN/dispatcher.token"
+    printf '%s' "$incumbent" > "$RUN/dispatcher.pid"
+    rm -f "$RUN/pending/timeout-sentinel"
+    kill -CONT "$incumbent"
+    paused_fixture=""
+    printf '%s' "$(( $(now) - 1 ))" > "$RUN/napper.wake_at"
+    for ((i=0; i<50; i++)); do
+        [[ "$(record_count)" -eq 1 ]] && break
+        sleep 0.1
+    done
+    if [[ "$(record_count)" -eq 1 ]]; then ok "incumbent still dispatches after contender timeout"
+    else bad "incumbent still dispatches after contender timeout"; fi
+    env_run thinkers stop >/dev/null 2>&1
+}
+
+test_named_start_keeps_kick() {
+    setup_identity
+    env_run thinkers start napper >/dev/null 2>&1
+    local i
+    for ((i=0; i<50; i++)); do
+        [[ "$(record_count)" -eq 1 ]] && break
+        sleep 0.1
+    done
+    if [[ "$(record_count)" -eq 1 ]]; then ok "named start queues its kick after runtime setup"
+    else bad "named start queues its kick after runtime setup"; fi
+    env_run thinkers stop >/dev/null 2>&1
+}
+
+test_drain_restart_releases_lock() {
+    if ! command -v flock >/dev/null 2>&1; then
+        skipcase "drain/restart lock test: flock unavailable"
+        return
+    fi
+    setup_identity
+    cat > "$TMP/id/thinkers/napper/step" <<'EOF'
+#!/usr/bin/env bash
+cat >> "$IDENTITY_DIR/record"
+printf '\n' >> "$IDENTITY_DIR/record"
+while [[ -f "$IDENTITY_DIR/hold" ]]; do sleep 0.1; done
+EOF
+    touch "$TMP/id/hold"
+    start_thinkers
+    printf '%s' "$(( $(now) - 1 ))" > "$RUN/napper.wake_at"
+    local i old_step
+    for ((i=0; i<50; i++)); do
+        [[ "$(record_count)" -eq 1 ]] && break
+        sleep 0.1
+    done
+    old_step=$(awk 'NR==1 {print $1}' "$RUN/step_pids")
+    if [[ -z "$old_step" ]]; then bad "long step started"; return; fi
+    env_run thinkers stop >/dev/null 2>&1
+    env_run thinkers start >/dev/null 2>&1
+    sleep 17
+    if kill -0 "$old_step" 2>/dev/null; then ok "old step still drains during restart"
+    else bad "old step still drains during restart"; fi
+    printf '%s' "$(( $(now) - 1 ))" > "$RUN/napper.wake_at"
+    for ((i=0; i<50; i++)); do
+        [[ "$(record_count)" -eq 2 ]] && break
+        sleep 0.1
+    done
+    if [[ "$(record_count)" -eq 2 ]]; then ok "replacement dispatches while old step drains"
+    else bad "replacement dispatches while old step drains"; fi
+    rm -f "$TMP/id/hold"
+    sleep 1
+    env_run thinkers stop >/dev/null 2>&1
+}
+
+test_crashed_owner_releases_feeder_lock() {
+    if ! command -v flock >/dev/null 2>&1; then
+        skipcase "feeder lock test: flock unavailable"
+        return
+    fi
+    setup_identity
+    start_thinkers
+    local dispatcher feeder i
+    dispatcher=$(cat "$RUN/dispatcher.pid")
+    feeder=$(head -n 1 "$RUN/tail_pids")
+    # Both ids were created by this test's disposable identity.
+    kill -KILL "$dispatcher"
+    sleep 1
+    if kill -0 "$feeder" 2>/dev/null; then ok "feeder survives its dispatcher for the probe"
+    else bad "feeder survives its dispatcher for the probe"; fi
+    exec 9>"$RUN/dispatcher.lock"
+    if flock -n 9; then
+        ok "surviving feeder does not retain dispatcher lock"
+        flock -u 9
+    else bad "surviving feeder does not retain dispatcher lock"; fi
+    exec 9>&-
+    env_run thinkers start >/dev/null 2>&1
+    printf '%s' "$(( $(now) - 1 ))" > "$RUN/napper.wake_at"
+    for ((i=0; i<50; i++)); do
+        [[ "$(record_count)" -eq 1 ]] && break
+        sleep 0.1
+    done
+    if [[ "$(record_count)" -eq 1 ]]; then ok "restart after crash dispatches once"
+    else bad "restart after crash dispatches once"; fi
+    env_run thinkers stop >/dev/null 2>&1
+}
+
+test_stop_cancels_claims() {
+    setup_identity
+    mkdir -p "$RUN/claimed" "$RUN/sent"
+    printf 'napper\nother\n' > "$RUN/active_thinkers"
+    printf '1' > "$RUN/claimed/napper"
+    printf '1' > "$RUN/claimed/other"
+    printf '1' > "$RUN/sent/napper"
+    env_run thinkers stop napper >/dev/null 2>&1
+    if [[ ! -f "$RUN/claimed/napper" && ! -f "$RUN/sent/napper" && -f "$RUN/claimed/other" ]]; then
+        ok "named stop cancels only that thinker's receipts"
+    else bad "named stop cancels only that thinker's receipts"; fi
+    env_run thinkers stop >/dev/null 2>&1
+    if [[ ! -f "$RUN/claimed/other" ]]; then ok "stop-all cancels every claim"
+    else bad "stop-all cancels every claim"; fi
+    env_run env THINKERS_CLAIM_STALE_SECS=0 thinkers start >/dev/null 2>&1
+    sleep 3
+    if [[ "$(record_count)" -eq 0 ]]; then ok "cancelled claims do not wake after restart"
+    else bad "cancelled claims do not wake after restart"; fi
+    env_run thinkers stop >/dev/null 2>&1
+}
+
+want test_waiter_preserves_incumbent
+want test_named_start_keeps_kick
+want test_drain_restart_releases_lock
+want test_crashed_owner_releases_feeder_lock
+want test_stop_cancels_claims
 want test_stale_claim_non_numeric_wake_at
 want test_many_starts_one_dispatch
 want test_lock_timeout_exits
@@ -489,5 +651,5 @@ want test_shim_crash_mid_send_recovers
 want test_crash_after_launch_does_not_double_fire
 want test_stale_claim_keeps_freshest_wake
 
-printf 'cases: pass=%d fail=%d skip=0\n' "$pass" "$fail"
+printf 'cases: pass=%d fail=%d skip=%d\n' "$pass" "$fail" "$skip"
 [[ "$fail" -eq 0 ]] || exit 1
