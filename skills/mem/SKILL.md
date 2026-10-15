@@ -24,3 +24,10 @@ Each memory/task/etc. is stored as a markdown file in my memories directory with
 IMPORTANT: I actively keep track of semantically important events in my life using my life context system. So I quick to create a new mem anytime something important or memorable or suprising happens.
 
 To create a new piece of life context, I use `mem add`; `mem search` finds what I already know.
+
+`mem add` and `mem edit` redact known credential values and formats, private-key
+blocks, and common card numbers with valid checksums before saving. Summaries and
+filenames, including an explicit `--slug`, use redacted text. Incomplete or nested
+private-key blocks fail without changing the memory. Detection is best effort;
+this is not a secret store. Pipe sensitive or large bodies through stdin, and do
+not put secrets in command arguments or slugs.

@@ -121,7 +121,22 @@ parse_filename() {
 # credential formats whatever their origin, value rules cover the tokens this
 # machine holds in its environment.
 mem_redact() {
-    local s="$1" v n
+    local rest="$1" s="" v n header footer payload
+    local begin='-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----'
+    # Replace only the delimited block, preserving text on its boundary lines.
+    # An incomplete or nested block is ambiguous: refuse the write, not the
+    # rest of the memory. Do this before value masking can hide a delimiter.
+    while [[ "$rest" =~ $begin ]]; do
+        header="${BASH_REMATCH[0]}"
+        footer="${header/BEGIN/END}"
+        s+="${rest%%"$header"*}<redacted:private-key>"
+        rest="${rest#*"$header"}"
+        [[ "$rest" == *"$footer"* ]] || { die "Incomplete private-key block; memory not written"; }
+        payload="${rest%%"$footer"*}"
+        [[ "$payload" != *'-----BEGIN '* ]] || { die "Nested private-key block; memory not written"; }
+        rest="${rest#*"$footer"}"
+    done
+    s+="$rest"
     for n in GITHUB_TOKEN GH_TOKEN HOMEBREW_GITHUB_API_TOKEN GITHUB_PAT \
              ANTHROPIC_API_KEY LLM_API_KEY OPENAI_API_KEY OPENROUTER_API_KEY \
              GEMINI_API_KEY GOOGLE_API_KEY OPENCODE_API_KEY SLACK_BOT_TOKEN \
@@ -138,16 +153,11 @@ mem_redact() {
         -e 's/github_pat_[A-Za-z0-9_]{20,}/<redacted:github-token>/g' \
         -e 's/xox[a-z]-[A-Za-z0-9_.-]{10,}/<redacted:slack-token>/g' \
         -e 's/(^|[^A-Za-z0-9])sk-[A-Za-z0-9_.=-]{20,}/\1<redacted:api-key>/g' \
-        -e 's/(^|[^0-9])[0-9]{4}([ -][0-9]{4}){2,3}([^0-9]|$)/\1<redacted:card>\3/g' \
-        -e 's/(^|[^0-9A-Za-z])[0-9]{15,16}([^0-9]|$)/\1<redacted:card>\2/g' \
-        -e 's/(^|[^0-9A-Za-z])(card|pan|credit|debit|amex|visa|mastercard)[^A-Za-z0-9]{0,8}(the |is |was )?[0-9][0-9 -]{11,27}[0-9]/\1\2 <redacted:card>/Ig' \
         -e 's/hf_[A-Za-z0-9]{20,}/<redacted:hf-token>/g' \
         -e 's/AIza[A-Za-z0-9_-]{30,}/<redacted:google-key>/g' \
         -e 's/(AKIA|ASIA)[A-Z0-9]{16}/<redacted:aws-key>/g' \
         -e 's/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/<redacted:jwt>/g' \
         -e 's#://[^/@[:space:]]+:[^/@[:space:]]+@#://<redacted:basic-auth>@#g' \
-        -e '/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/,/-----END [A-Z0-9 ]*PRIVATE KEY-----/c\
-<redacted:private-key>' \
         -e 's#"auth"[[:space:]]*:[[:space:]]*"[A-Za-z0-9+/=]{16,}"#"auth": "<redacted:docker-auth>"#g' \
         -e 's/(^|[^A-Za-z0-9])((sk|rk)_live_[A-Za-z0-9]{8,})/\1<redacted:stripe-key>/g' \
         -e 's/(^|[^A-Za-z0-9])(whsec_[A-Za-z0-9]{8,})/\1<redacted:stripe-hook>/g' \
@@ -157,7 +167,46 @@ mem_redact() {
         -e 's/(^|[^A-Za-z0-9])(SG\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})/\1<redacted:sendgrid-key>/g' \
         -e 's/(^|[^A-Za-z0-9])(SK[0-9a-f]{32})/\1<redacted:twilio-key>/g' \
         -e 's/(^|[^A-Za-z0-9])(key-[A-Za-z0-9]{20,})/\1<redacted:mailgun-key>/g' \
-        -e 's/((aws|AWS)_secret_access_key)[[:space:]]*[=:][[:space:]]*[^[:space:]]+/\1=<redacted:aws-secret>/g'
+        -e 's/(((aws|AWS)_secret_access_key)[[:space:]]*[=:][[:space:]]*)[^[:space:]]+/\1<redacted:aws-secret>/g' | mem_redact_cards
+}
+
+# Length alone also matches dates, year lists and timestamps. Recognize common
+# PAN layouts only with an issuer prefix and a valid Luhn checksum. This is a
+# heuristic, not a guarantee that every possible card or secret is recognized.
+mem_redact_cards() {
+    LC_ALL=C awk '
+        function card(s,    n, i, d, sum, twice, prefix) {
+            gsub(/[ -]/, "", s); n = length(s); prefix = substr(s, 1, 4) + 0
+            if (!((s ~ /^4/ && (n == 13 || n == 16 || n == 19)) ||
+                  (s ~ /^3[47]/ && n == 15) ||
+                  (n == 16 && (s ~ /^5[1-5]/ || (prefix >= 2221 && prefix <= 2720))) ||
+                  ((n == 16 || n == 19) && (s ~ /^(6011|65|64[4-9])/ ||
+                    (prefix >= 3528 && prefix <= 3589))))) return 0
+            for (i = n; i > 0; i--) {
+                d = substr(s, i, 1) + 0
+                if (twice) { d *= 2; if (d > 9) d -= 9 }
+                sum += d; twice = !twice
+            }
+            return sum % 10 == 0
+        }
+        {
+            rest = $0; out = ""
+            while (match(rest, /[0-9]{4}([ -][0-9]{4}){3}([ -][0-9]{3})?|[0-9]{4}[ -][0-9]{6}[ -][0-9]{5}|[0-9]{13,19}/)) {
+                before = substr(rest, 1, RSTART - 1)
+                candidate = substr(rest, RSTART, RLENGTH)
+                rest = substr(rest, RSTART + RLENGTH)
+                # A following three-digit code (or next card) is not part of
+                # a valid 16-digit PAN just because it shares a separator.
+                if (length(candidate) == 23 && (!card(candidate) || rest ~ /^[0-9]/)) {
+                    rest = substr(candidate, 20) rest
+                    candidate = substr(candidate, 1, 19)
+                }
+                if ((out before) !~ /[[:alnum:]_]$/ && rest !~ /^[[:alnum:]_]/ && card(candidate))
+                    candidate = "<redacted:card>"
+                out = out before candidate
+            }
+            print out rest
+        }'
 }
 
 action_add() {
@@ -177,7 +226,7 @@ action_add() {
         [[ -z "$text" ]] && die "No text provided"
     fi
 
-    text=$(mem_redact "$text")
+    text=$(mem_redact "$text") || die "Redaction failed; memory not written"
 
     mkdir -p "$MEM_DIR"
 
@@ -186,7 +235,8 @@ action_add() {
     hex=$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')
     slug=$(slugify "$text")
     filename="${timestamp}_${hex}_${slug}"
-    summary=$(printf '%s' "$text" | head -1 | cut -c1-80)
+    # Drain the body so upstream writers cannot fail with SIGPIPE.
+    summary=$(printf '%s' "$text" | sed '/^[[:space:]]*$/d' | sed -n '1p' | cut -c1-80)
     created=$(date +"%Y-%m-%d %H:%M:%S")
 
     cat > "$MEM_DIR/${filename}.md" << EOF
@@ -533,7 +583,11 @@ action_edit() {
         [[ -z "$text" ]] && die "No text provided"
     fi
 
-    text=$(mem_redact "$text")
+    text=$(mem_redact "$text") || die "Redaction failed; memory not written"
+
+    if [[ -n "$slug" ]]; then
+        slug=$(mem_redact "$slug") || die "Slug redaction failed; memory not written"
+    fi
 
     local now
     now=$(date +"%Y-%m-%d %H:%M:%S")
@@ -542,7 +596,8 @@ action_edit() {
     # edit: a todo shortlist that is appended to during the day must still
     # expire that night. So do `schedule:` and `tz:` (design/scheduled_goals.md).
     local summary type created id until _k _v
-    summary=$(printf '%s' "$text" | head -1 | head -c 80)
+    # Drain the body so upstream writers cannot fail with SIGPIPE.
+    summary=$(printf '%s' "$text" | sed '/^[[:space:]]*$/d' | sed -n '1p' | cut -c1-80)
     type=$(frontmatter_field "$file" "type")
     created=$(frontmatter_field "$file" "created")
     id=$(frontmatter_field "$file" "id")
@@ -632,6 +687,13 @@ Usage:
   mem show <id>                  Show a memory's full contents
   mem forget <id>                Delete a memory by hex ID
   mem edit <id> [--slug SLUG] <text>  Update body (or pipe via stdin)
+
+Storage:
+  Add/edit redact known credential values and formats, private-key blocks, and
+  common card numbers with valid checksums before saving. Summaries and filenames
+  (including --slug) use redacted text. Incomplete private-key blocks fail without
+  changing the memory. Detection is best effort; do not use mem as a secret store.
+  Pipe sensitive or large bodies via stdin so they do not appear in process argv.
 
 List options:
   -s, --short        Concise one-line-per-memory view
