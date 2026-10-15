@@ -118,6 +118,11 @@ case "$mode" in
         printf '{"choices":[{"message":{"content":"truncated tex"},"finish_reason":"length"}]}' > "$out_file"
         printf '200'
         ;;
+    sse-refusal)  # Anthropic via OpenRouter refusing: clean stream, no content
+        printf 'data: {"provider":"Claude Platform on AWS","choices":[{"delta":{"content":""},"finish_reason":null}]}\n\n'
+        printf 'data: {"provider":"Claude Platform on AWS","choices":[{"delta":{},"finish_reason":"content_filter","native_finish_reason":"refusal"}]}\n\n'
+        printf 'data: [DONE]\n'
+        ;;
     sse-finish-length)  # streamed output whose final chunk reports the cap
         printf 'data: {"choices":[{"delta":{"content":"truncated te"},"finish_reason":null}]}\n\n'
         printf 'data: {"choices":[{"delta":{"content":"x"},"finish_reason":null}]}\n\n'
@@ -163,6 +168,21 @@ check "persistent failure fails"     test "$rc" -ne 0
 check "no output on failure"         test -z "$out"
 check "three attempts then give up"  test "$(calls)" = "3"
 check "original error preserved"     grep -q "llm: error: API error: Provider returned error" "$WORK/stderr"
+
+# ---------------------------------------------------------------------------
+# Streaming refusal (finish_reason content_filter, no content): named as a
+# refusal, not an empty stream, and not retried. Harris's rollups sat behind
+# one refused block for 12 days while the log said "empty response".
+# ---------------------------------------------------------------------------
+
+reset "sse-refusal"
+out=$(LLM_RETRIES=2 run_llm)
+rc=$?
+check "refusal fails"                 test "$rc" -ne 0
+check "refusal has no output"         test -z "$out"
+check "refusal not retried"           test "$(calls)" = "1"
+check "refusal named on stderr"       grep -q "refused: the provider content filter" "$WORK/stderr"
+check_not "refusal not called empty"  grep -q "empty response" "$WORK/stderr"
 
 # ---------------------------------------------------------------------------
 # LLM_RETRIES=0 restores single-shot behavior

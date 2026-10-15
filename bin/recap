@@ -56,6 +56,8 @@ ROLLUP_PROMPT_VERSION=5                 # stamped into sealed blocks for honest 
 # reasoning models: at 1024, Sonnet 5 spent about 700 thinking and was cut
 # off mid-JSON on a quarter of Audel's rollups (42 of 166, 2026-10-12).
 ROLLUP_MAX_TOKENS=4096
+ROLLUP_MAX_SEALS="${ROLLUP_MAX_SEALS:-20}"   # blocks one --context call may seal (0 = no cap)
+_CTX_SEALED=0
 
 usage() {
     cat <<'EOF'
@@ -165,6 +167,7 @@ ROLLUP_LOCK="$ROLLUP_DIR/.lock"
 ROLLUP_META="$ROLLUP_DIR/meta.json"
 
 [[ "$FANOUT" =~ ^[0-9]+$ && "$FANOUT" -ge 2 ]] || die "--fanout must be a number >= 2"
+[[ "$ROLLUP_MAX_SEALS" =~ ^[0-9]+$ ]] || die "ROLLUP_MAX_SEALS must be a number (0 = no cap)"
 # Validated only when --context/--backfill will actually read them: both are
 # seeded from env (MONOLITH_CONTEXT_BUDGET, ROLLUP_RAW_TAIL), and a malformed
 # identity .env must not break plain `recap`, which never consults them.
@@ -281,16 +284,23 @@ _llm_json() {
     # _llm_json <model> <system_prompt> <user_text> [max_tokens]
     # Returns validated JSON or fails. The cap must leave room for
     # reasoning-channel tokens on models that bill them against max_tokens.
-    local model="$1" system="$2" user="$3" max_tokens="${4:-2048}" attempt raw cleaned
+    # Returns 2 when the model refused the input: that is decided by the
+    # content, so a retry gets the same answer.
+    local model="$1" system="$2" user="$3" max_tokens="${4:-2048}" attempt raw cleaned errf
+    errf=$(mktemp "${TMPDIR:-/tmp}/recap-llm.XXXXXX") || return 1
     for attempt in 1 2; do
-        raw=$(printf '%s' "$user" | llm -m "$model" -t "$max_tokens" -s "$system") || { raw=""; }
+        raw=$(printf '%s' "$user" | llm -m "$model" -t "$max_tokens" -s "$system" 2>"$errf") || { raw=""; }
+        cat "$errf" >&2
+        if grep -q 'refused:' "$errf"; then rm -f "$errf"; return 2; fi
         cleaned=$(printf '%s\n' "$raw" | sed '/^```/d')
         if printf '%s' "$cleaned" | jq -e . >/dev/null 2>&1; then
+            rm -f "$errf"
             printf '%s' "$cleaned"
             return 0
         fi
         note "model returned invalid JSON (attempt $attempt), retrying"
     done
+    rm -f "$errf"
     return 1
 }
 
@@ -554,6 +564,23 @@ _ctx_resolve_R() {
     printf '%s' "$r"
 }
 
+# The JSON body for one block. When the model refuses the window (a content
+# filter, decided by the text, so it would refuse again on every call), the
+# block is sealed with a placeholder so the build moves past it: Harris's
+# summary sat frozen for 12 days behind one refused block (2026-10-03). Any
+# other failure leaves the block unsealed and stops this build; the next
+# call tries again.
+_ctx_rollup_body() {
+    local tier=$1 s=$2 e=$3 input=$4 rc=0
+    _llm_json "$MAP_MODEL" "$_ROLLUP_SYSTEM" "$input" "$ROLLUP_MAX_TOKENS" || rc=$?
+    case "$rc" in
+        0) ;;
+        2) note "rollup t$tier [$s,$e): the model refused this window, sealing a placeholder"
+           printf '{"summary":"(Not summarized: the summary model refused this window.)","themes":[],"step_ids":[],"refused":true}' ;;
+        *) note "rollup t$tier [$s,$e): no valid JSON, stopping the build here"; return 1 ;;
+    esac
+}
+
 # Write one sealed tier-1 block over filtered-step indices [s,e) (TSV lines s+1..e).
 _ctx_seal_tier1() {
     local s=$1 e=$2 file rows text fid lid body
@@ -567,7 +594,7 @@ _ctx_seal_tier1() {
     text=$(cut -f4 <<<"$rows")
     fid=$(head -1 <<<"$rows" | cut -f2); lid=$(tail -1 <<<"$rows" | cut -f2)
     note "rollup t1 [$s,$e)"
-    body=$(_llm_json "$MAP_MODEL" "$_ROLLUP_SYSTEM" "$text" "$ROLLUP_MAX_TOKENS") || die "rollup t1 [$s,$e): bad JSON"
+    body=$(_ctx_rollup_body 1 "$s" "$e" "$text") || return 1
     mkdir -p "$(dirname "$file")"
     jq -n -c --argjson tier 1 --argjson start "$s" --argjson end "$e" --argjson n "$((e - s))" \
         --argjson body "$body" --arg fid "$fid" --arg lid "$lid" \
@@ -575,7 +602,9 @@ _ctx_seal_tier1() {
         {tier:$tier, start:$start, end:$end, n:$n,
          summary:($body.summary // ""), themes:($body.themes // []),
          step_ids:(($body.step_ids // []) | if length==0 then [$fid,$lid] else . end),
-         model:$model, prompt_version:$pv, created:$created}' > "$file"
+         model:$model, prompt_version:$pv, created:$created}
+        + (if $body.refused then {refused:true} else {} end)' > "$file"
+    _CTX_SEALED=$((_CTX_SEALED + 1))
 }
 
 # Write one sealed tier-k block (k>1) over indices [s,e), rolled up from tier k-1.
@@ -593,7 +622,7 @@ _ctx_seal_tierk() {
         c=$((c + childblk))
     done
     note "rollup t$tier [$s,$e)"
-    body=$(_llm_json "$MAP_MODEL" "$_ROLLUP_SYSTEM" "$lines" "$ROLLUP_MAX_TOKENS") || die "rollup t$tier [$s,$e): bad JSON"
+    body=$(_ctx_rollup_body "$tier" "$s" "$e" "$lines") || return 1
     local fb_json
     # awk, not `grep | head`: head's early exit SIGPIPEs grep under pipefail
     # once the payload outgrows the pipe buffer (large --fanout).
@@ -605,7 +634,9 @@ _ctx_seal_tierk() {
         {tier:$tier, start:$start, end:$end, n:$n,
          summary:($body.summary // ""), themes:($body.themes // []),
          step_ids:(($body.step_ids // []) | if length==0 then $fb else . end),
-         model:$model, prompt_version:$pv, created:$created}' > "$file"
+         model:$model, prompt_version:$pv, created:$created}
+        + (if $body.refused then {refused:true} else {} end)' > "$file"
+    _CTX_SEALED=$((_CTX_SEALED + 1))
 }
 
 # The filtered-step index from which blocks are auto-built. First run records
@@ -630,15 +661,26 @@ _ctx_start_index() {
 # Lazily seal every complete block at or after `start`, bottom-up. Existing
 # files are skipped, so this is incremental (only the frontier calls the LLM)
 # and idempotent. Blocks older than `start` are left for `recap --backfill`.
+# One call seals at most ROLLUP_MAX_SEALS blocks (0 = no cap; --backfill has
+# none): the build runs inside a wake, and a backlog of hundreds of blocks
+# would hold that wake for hours. The rest waits for the next call.
 _ctx_build() {
-    local n=$1 start=$2 tier=1 blk nblocks b s e
+    local n=$1 start=$2 tier=1 blk nblocks b s e max
+    max=$ROLLUP_MAX_SEALS
+    [[ "$BACKFILL" -eq 1 ]] && max=0
     blk=$FANOUT
     while (( blk <= n )); do
         nblocks=$(( n / blk ))
         for (( b = 0; b < nblocks; b++ )); do
             s=$(( b * blk )); e=$(( (b + 1) * blk ))
             (( s < start )) && continue
-            if (( tier == 1 )); then _ctx_seal_tier1 "$s" "$e"; else _ctx_seal_tierk "$tier" "$s" "$e"; fi
+            [[ -f "$(_ctx_blockfile "$tier" "$s" "$e")" ]] && continue
+            if (( max > 0 && _CTX_SEALED >= max )); then
+                note "sealed $_CTX_SEALED blocks, the cap for one call; the rest waits"
+                return 0
+            fi
+            if (( tier == 1 )); then _ctx_seal_tier1 "$s" "$e" || return 1
+            else _ctx_seal_tierk "$tier" "$s" "$e" || return 1; fi
         done
         tier=$(( tier + 1 )); blk=$(( blk * FANOUT ))
     done
@@ -896,7 +938,11 @@ _ctx_run() {
             '{start_index:$s, updated:$u}' > "$ROLLUP_META"
     fi
     [[ "$MODE" == "rebuild" ]] && rm -rf "$ROLLUP_DIR"/t* 2>/dev/null || true
-    [[ "$MODE" != "cached" ]] && _ctx_build "$n" "$start"
+    # A failed build still prints the blocks that exist: dying here left the
+    # mind with no life summary at all.
+    if [[ "$MODE" != "cached" ]]; then
+        _ctx_build "$n" "$start" || note "rollup build stopped early; printing the blocks that exist"
+    fi
     _ctx_assemble "$n" "$r" "$start"
 }
 

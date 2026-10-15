@@ -1174,8 +1174,13 @@ stream_openai() {
             # Only the final chunk carries a non-null finish_reason; the glob
             # keeps jq off the hot per-delta path.
             if [[ "$json" == *'"finish_reason"'* && "$json" != *'"finish_reason":null'* ]]; then
-                if [[ "$(printf '%s' "$json" | jq -r '.choices[0].finish_reason // empty' 2>/dev/null)" == "length" ]]; then
-                    warn_truncated
+                local _fr
+                _fr=$(printf '%s' "$json" | jq -r '.choices[0].finish_reason // empty' 2>/dev/null) || _fr=""
+                [[ "$_fr" == "length" ]] && warn_truncated
+                # A refusal ends the stream cleanly with no content. Name it,
+                # or the retry loop reports it as an empty stream.
+                if [[ "$_fr" == "content_filter" && -n "${LLM_RETRY_ERR:-}" && ! -e "${LLM_DATA_MARKER:-}" ]]; then
+                    printf 'refused: the provider content filter blocked this request (finish_reason content_filter)' > "$LLM_RETRY_ERR" 2>/dev/null || true
                 fi
             fi
             # Usage chunk (present when stream_options.include_usage was
@@ -1471,10 +1476,11 @@ if [[ "$LLM_STREAM" -eq 1 ]]; then
             # but kept the 200 alive with whitespace padding, so no data
             # event ever arrived. Exiting 0 here made the caller read an
             # empty answer as success.
-            _retry_msg="empty response: stream ended without emitting anything"
+            _retry_msg="${_retry_msg:-empty response: stream ended without emitting anything}"
             _rc=1
         fi
-        if [[ "$_emitted" -eq 0 && "$_attempt" -lt "$_max_attempts" ]]; then
+        # A refusal is decided by the content, so a retry gets the same answer.
+        if [[ "$_emitted" -eq 0 && "$_attempt" -lt "$_max_attempts" && "$_retry_msg" != refused:* ]]; then
             echo "llm: transient API failure (attempt $_attempt/$_max_attempts): ${_retry_msg:-${_ce:-exit $_rc}} — retrying" >&2
             sleep $(( LLM_RETRY_BACKOFF * _attempt ))
             continue
