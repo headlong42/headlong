@@ -417,14 +417,58 @@ redact_sensitive() {
         output="${output//${LLM_API_KEY}/<redacted-api-key>}"
     fi
 
-    local _key_var
+    # Preserve exact masking of every nonempty configured provider value,
+    # including short credentials. Quoting makes glob characters literal.
+    local _key_var _key_val v
     for _key_var in OPENAI_API_KEY OPENROUTER_API_KEY GEMINI_API_KEY OPENCODE_API_KEY; do
-        if [[ -n "${!_key_var:-}" ]]; then
-            output="${output//${!_key_var}/<redacted-api-key>}"
+        v="${!_key_var:-}"
+        if [[ -n "$v" ]]; then
+            output="${output//"$v"/<redacted-api-key>}"
         fi
     done
 
-    printf '%s' "$output" | LC_ALL=C sed -E 's/sk-ant-[A-Za-z0-9._-]+/<redacted-anthropic-key>/g'
+    # Other credential variables retain the minimum length to avoid matching
+    # short placeholder values in ordinary prose.
+    for _key_var in GITHUB_TOKEN GH_TOKEN HOMEBREW_GITHUB_API_TOKEN GITHUB_PAT \
+                    GOOGLE_API_KEY SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_USER_TOKEN \
+                    SLACK_TOKEN TELEGRAM_BOT_TOKEN HF_TOKEN HUGGING_FACE_HUB_TOKEN \
+                    AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_ACCESS_KEY_ID \
+                    STRIPE_SECRET_KEY SENDGRID_API_KEY TWILIO_AUTH_TOKEN \
+                    DATABASE_URL REDIS_URL; do
+        _key_val="${!_key_var:-}"
+        if [[ -n "$_key_val" && ${#_key_val} -ge 8 ]]; then
+            v="$_key_val"
+            output="${output//"$v"/<redacted:value>}"
+        fi
+    done
+
+    # Shape pass for credentials that arrived as text and so have no env var to
+    # match against. The sk-ant- rule stays first and keeps its marker: it is
+    # the one shape a reader can attribute to a provider, and
+    # tests/test_redact_sensitive.sh asserts on that exact string.
+    printf '%s' "$output" | LC_ALL=C sed -E \
+        -e 's/sk-ant-[A-Za-z0-9._-]+/<redacted-anthropic-key>/g' \
+        -e 's/(^|[^A-Za-z0-9])(sk-[A-Za-z0-9_.=-]{12,})/\1<redacted:api-key>/g' \
+        -e 's/(^|[^A-Za-z0-9])(gh[pousr]_[A-Za-z0-9]{12,})/\1<redacted:github-token>/g' \
+        -e 's/(^|[^A-Za-z0-9])(github_pat_[A-Za-z0-9_]{12,})/\1<redacted:github-token>/g' \
+        -e 's/(^|[^A-Za-z0-9])(xox[a-z]-[A-Za-z0-9_.-]{8,})/\1<redacted:slack-token>/g' \
+        -e 's/(^|[^A-Za-z0-9])(hf_[A-Za-z0-9]{12,})/\1<redacted:hf-token>/g' \
+        -e 's/AIza[A-Za-z0-9_-]{25,}/<redacted:google-key>/g' \
+        -e 's/(AKIA|ASIA)[A-Z0-9]{16}/<redacted:aws-key>/g' \
+        -e 's/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/<redacted:jwt>/g' \
+        -e 's#://[^/@[:space:]]+:[^/@[:space:]]+@#://<redacted:basic-auth>@#g' \
+        -e '/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/,/-----END [A-Z0-9 ]*PRIVATE KEY-----/c\
+<redacted:private-key>' \
+        -e 's#"auth"[[:space:]]*:[[:space:]]*"[A-Za-z0-9+/=]{16,}"#"auth": "<redacted:docker-auth>"#g' \
+        -e 's/(^|[^A-Za-z0-9])((sk|rk)_live_[A-Za-z0-9]{8,})/\1<redacted:stripe-key>/g' \
+        -e 's/(^|[^A-Za-z0-9])(whsec_[A-Za-z0-9]{8,})/\1<redacted:stripe-hook>/g' \
+        -e 's/(^|[^A-Za-z0-9])(npm_[A-Za-z0-9]{20,})/\1<redacted:npm-token>/g' \
+        -e 's/(^|[^A-Za-z0-9])(glpat-[A-Za-z0-9_-]{10,})/\1<redacted:gitlab-token>/g' \
+        -e 's/(^|[^A-Za-z0-9])(dckr_pat-[A-Za-z0-9_.-]{10,})/\1<redacted:docker-token>/g' \
+        -e 's/(^|[^A-Za-z0-9])(SG\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})/\1<redacted:sendgrid-key>/g' \
+        -e 's/(^|[^A-Za-z0-9])(SK[0-9a-f]{32})/\1<redacted:twilio-key>/g' \
+        -e 's/(^|[^A-Za-z0-9])(key-[A-Za-z0-9]{20,})/\1<redacted:mailgun-key>/g' \
+        -e 's/((aws|AWS)_secret_access_key)[[:space:]]*[=:][[:space:]]*[^[:space:]]+/\1=<redacted:aws-secret>/g'
 }
 
 # ---------------------------------------------------------------------------
@@ -2425,9 +2469,12 @@ ${combined}"
 }
 
 # Stream lines past $2 from $1 to stderr (redacted), then print the new
-# total line count on stdout so the caller can update its cursor.
+# line count and PEM-block state on stdout. The caller carries both across
+# polls and resets them for each execution output file.
 _stream_new_output() {
-    local output_file="$1" lines_read="$2"
+    local output_file="$1" lines_read="$2" in_pem="${3:-0}"
+    local pem_begin='-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----'
+    local pem_end='-----END [A-Z0-9 ]*PRIVATE KEY-----'
     local total_lines
     total_lines=$(wc -l < "$output_file" 2>/dev/null || echo 0)
     total_lines=$(echo "$total_lines" | tr -d ' ')
@@ -2448,7 +2495,26 @@ _stream_new_output() {
         # still reading freshly-appended lines → SIGPIPE to tail. Under the
         # global `set -o pipefail` that made the whole run exit rc=141 (on macOS
         # every streaming run died this way). See design/monolith_run_health.md.
-        ( set +o pipefail; tail -n +"$skip_n" "$output_file" | head -n "$new_count" ) | while IFS= read -r line; do
+        # On versions with a display limit, skip_n can omit newly appended
+        # lines. Track delimiters there before displaying the remaining body.
+        # Read only that new range, keeping the existing display policy intact.
+        if [[ "$skip_n" -gt $((lines_read + 1)) ]]; then
+            local omitted=$((skip_n - lines_read - 1))
+            in_pem=$( ( set +o pipefail; tail -n +"$((lines_read + 1))" "$output_file" | head -n "$omitted" ) |
+                awk -v open="$in_pem" -v begin="$pem_begin" -v end="$pem_end" '
+                    $0 ~ begin { open=1 } $0 ~ end { open=0 } END { print open }')
+        fi
+        while IFS= read -r line; do
+            # A fresh sed per line cannot retain a multiline private-key range.
+            # Track it here, before value masking can hide a delimiter.
+            if [[ "$in_pem" -eq 1 ]]; then
+                [[ "$line" =~ $pem_end ]] && in_pem=0
+                continue
+            elif [[ "$line" =~ $pem_begin ]]; then
+                in_pem=1
+                [[ "$line" =~ $pem_end ]] && in_pem=0
+                line='<redacted:private-key>'
+            fi
             local redacted_line
             redacted_line=$(redact_sensitive "$line")
             if [[ "$redacted_line" == +* ]]; then
@@ -2456,9 +2522,9 @@ _stream_new_output() {
             else
                 printf '\033[90m  │ %s\033[0m\n' "$redacted_line" >&2
             fi
-        done
+        done < <( set +o pipefail; tail -n +"$skip_n" "$output_file" | head -n "$new_count" )
     fi
-    printf '%s\n' "$total_lines"
+    printf '%s %s\n' "$total_lines" "$in_pem"
 }
 
 # ---------------------------------------------------------------------------
@@ -3175,9 +3241,9 @@ exit \$__shellm_rc
         printf '%s' "$watchdog_pid" > "$watchdog_pid_file"
 
         # Foreground: poll output file and stream new lines to stderr
-        local lines_read=0
+        local lines_read=0 pem_open=0
         while kill -0 "$exec_pid" 2>/dev/null; do
-            lines_read=$(_stream_new_output "$output_file" "$lines_read")
+            read -r lines_read pem_open <<< "$(_stream_new_output "$output_file" "$lines_read" "$pem_open")"
             sleep 0.2
         done
 
@@ -3189,7 +3255,7 @@ exit \$__shellm_rc
         wait "$watchdog_pid" 2>/dev/null || true
 
         # Drain any remaining output lines
-        _stream_new_output "$output_file" "$lines_read" >/dev/null
+        _stream_new_output "$output_file" "$lines_read" "$pem_open" >/dev/null
 
         # Check if we timed out. The marker carries why, so the feedback the
         # model gets names the real cause instead of guessing at a prompt.
