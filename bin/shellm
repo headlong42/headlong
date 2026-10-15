@@ -2473,7 +2473,6 @@ _stream_new_output() {
                     $0 ~ begin { open=1 } $0 ~ end { open=0 } END { print open }')
         fi
         while IFS= read -r line; do
-            local redacted_line
             # A fresh sed per line cannot retain a multiline private-key range.
             # Track it here, before value masking can hide a delimiter.
             if [[ "$in_pem" -eq 1 ]]; then
@@ -2484,6 +2483,7 @@ _stream_new_output() {
                 [[ "$line" =~ $pem_end ]] && in_pem=0
                 line='<redacted:private-key>'
             fi
+            local redacted_line
             redacted_line=$(redact_sensitive "$line")
             if [[ "$redacted_line" == +* ]]; then
                 printf '\033[36m  $ %s\033[0m\n' "${redacted_line#+ }" >&2
