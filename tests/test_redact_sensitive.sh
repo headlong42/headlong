@@ -120,6 +120,9 @@ trap 'rm -rf "$WORK"' EXIT
 # Used by the extracted function.
 # shellcheck disable=SC2034
 QUIET=0
+# Main defines this limit; extracted helpers need the same test default.
+# shellcheck disable=SC2034
+STREAM_MAX_LINES=200
 stream_poll() {
     read -r cursor pem_open <<< "$(_stream_new_output "$WORK/output" "$cursor" "$pem_open" 2>> "$WORK/display")"
 }

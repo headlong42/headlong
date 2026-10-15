@@ -2457,25 +2457,21 @@ _stream_new_output() {
     if [[ "$QUIET" -eq 0 && "$total_lines" -gt "$lines_read" ]]; then
         local new_count=$((total_lines - lines_read))
         local skip_n=$((lines_read + 1))
-        # Main limits echoed flood output. If lines are omitted, still track
-        # their delimiters in one process so a skipped header cannot expose
-        # the body. Only scan the newly omitted range, not earlier output.
-        local max_lines="${STREAM_MAX_LINES:-0}"
-        if [[ "$max_lines" -gt 0 && "$new_count" -gt "$max_lines" ]]; then
-            local omitted=$((new_count - max_lines))
-            in_pem=$( ( set +o pipefail; tail -n +"$skip_n" "$output_file" | head -n "$omitted" ) |
-                awk -v open="$in_pem" -v begin="$pem_begin" -v end="$pem_end" '
-                    $0 ~ begin { open=1 } $0 ~ end { open=0 } END { print open }')
-            printf '\033[90m  │ [... %s lines not shown ...]\033[0m\n' "$omitted" >&2
-            skip_n=$((skip_n + omitted))
-            new_count=$max_lines
-        fi
         # Use tail + head to get new lines (bash 3.2 safe). pipefail OFF in a
         # subshell: the output file is written CONCURRENTLY by the running
         # command, so `head` can close after $new_count lines while `tail` is
         # still reading freshly-appended lines → SIGPIPE to tail. Under the
         # global `set -o pipefail` that made the whole run exit rc=141 (on macOS
         # every streaming run died this way). See design/monolith_run_health.md.
+        # On versions with a display limit, skip_n can omit newly appended
+        # lines. Track delimiters there before displaying the remaining body.
+        # Read only that new range, keeping the existing display policy intact.
+        if [[ "$skip_n" -gt $((lines_read + 1)) ]]; then
+            local omitted=$((skip_n - lines_read - 1))
+            in_pem=$( ( set +o pipefail; tail -n +"$((lines_read + 1))" "$output_file" | head -n "$omitted" ) |
+                awk -v open="$in_pem" -v begin="$pem_begin" -v end="$pem_end" '
+                    $0 ~ begin { open=1 } $0 ~ end { open=0 } END { print open }')
+        fi
         while IFS= read -r line; do
             local redacted_line
             # A fresh sed per line cannot retain a multiline private-key range.
@@ -2486,16 +2482,13 @@ _stream_new_output() {
             elif [[ "$line" =~ $pem_begin ]]; then
                 in_pem=1
                 [[ "$line" =~ $pem_end ]] && in_pem=0
-                redacted_line='<redacted:private-key>'
-            else
-                redacted_line=$(redact_sensitive "$line")
+                line='<redacted:private-key>'
             fi
-            if [[ "$QUIET" -eq 0 ]]; then
-                if [[ "$redacted_line" == +* ]]; then
-                    printf '\033[36m  $ %s\033[0m\n' "${redacted_line#+ }" >&2
-                else
-                    printf '\033[90m  │ %s\033[0m\n' "$redacted_line" >&2
-                fi
+            redacted_line=$(redact_sensitive "$line")
+            if [[ "$redacted_line" == +* ]]; then
+                printf '\033[36m  $ %s\033[0m\n' "${redacted_line#+ }" >&2
+            else
+                printf '\033[90m  │ %s\033[0m\n' "$redacted_line" >&2
             fi
         done < <( set +o pipefail; tail -n +"$skip_n" "$output_file" | head -n "$new_count" )
     fi
