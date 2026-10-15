@@ -787,3 +787,87 @@ _build_shellm_flags() {
         printf '%s\n' "--bin" "$path"
     done
 }
+
+# ---------------------------------------------------------------------------
+# Prompt redaction
+# ---------------------------------------------------------------------------
+
+# Scrub credentials out of a wakeup prompt before it reaches a model. The
+# recent stream, the outbound ledger and the routing signals quote the mind
+# log verbatim, and one pasted token was re-quoted into 133 later log entries
+# because every prompt covering its window carried it back in. A companion
+# change scrubs the same shapes at the traj append write point, but the log
+# already holds the old values and every prompt re-quotes them, so the prompt
+# boundary is where they must stop for good. Keep the shape rules and the env
+# name list in sync with traj_redact in bin/traj.
+prompt_redact() (
+    # Export shell-local credentials only to this subshell; jq reads env, not argv.
+    local n
+    for n in GITHUB_TOKEN GH_TOKEN HOMEBREW_GITHUB_API_TOKEN GITHUB_PAT \
+             ANTHROPIC_API_KEY LLM_API_KEY OPENAI_API_KEY OPENROUTER_API_KEY \
+             GEMINI_API_KEY GOOGLE_API_KEY OPENCODE_API_KEY SLACK_BOT_TOKEN \
+             SLACK_APP_TOKEN SLACK_USER_TOKEN SLACK_TOKEN TELEGRAM_BOT_TOKEN \
+             HF_TOKEN HUGGING_FACE_HUB_TOKEN AWS_SECRET_ACCESS_KEY \
+             AWS_SESSION_TOKEN AWS_ACCESS_KEY_ID STRIPE_SECRET_KEY \
+             SENDGRID_API_KEY TWILIO_AUTH_TOKEN DATABASE_URL REDIS_URL; do export "${n?}"; done
+    printf '%s' "$1" | jq -Rsrj '
+        (["GITHUB_TOKEN", "GH_TOKEN", "HOMEBREW_GITHUB_API_TOKEN", "GITHUB_PAT",
+          "ANTHROPIC_API_KEY", "LLM_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY",
+          "GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENCODE_API_KEY", "SLACK_BOT_TOKEN",
+          "SLACK_APP_TOKEN", "SLACK_USER_TOKEN", "SLACK_TOKEN", "TELEGRAM_BOT_TOKEN",
+          "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "AWS_SECRET_ACCESS_KEY",
+          "AWS_SESSION_TOKEN", "AWS_ACCESS_KEY_ID", "STRIPE_SECRET_KEY",
+          "SENDGRID_API_KEY", "TWILIO_AUTH_TOKEN", "DATABASE_URL", "REDIS_URL"]
+         | map(env[.] // "") | map(select(length >= 8))) as $values |
+        def redact_string:
+            reduce $values[] as $v (. ; split($v) | join("<redacted:value>"))
+            | gsub("gh[pousr]_[A-Za-z0-9]{20,}"; "<redacted:github-token>")
+            | gsub("github_pat_[A-Za-z0-9_]{20,}"; "<redacted:github-token>")
+            | gsub("xox[a-z]-[A-Za-z0-9_.-]{10,}"; "<redacted:slack-token>")
+            | gsub("(?<edge>^|[^A-Za-z0-9])sk-[A-Za-z0-9_.=-]{20,}"; "\(.edge)<redacted:api-key>")
+            | gsub("(?<edge>^|[^0-9])[0-9]{4}([ -][0-9]{4}){2,3}(?<end>[^0-9]|$)"; "\(.edge)<redacted:card>\(.end)")
+            | gsub("(?<edge>^|[^0-9A-Za-z])[0-9]{15,16}(?<end>[^0-9]|$)"; "\(.edge)<redacted:card>\(.end)")
+            | gsub("(?<edge>^|[^0-9A-Za-z])(?<label>card|pan|credit|debit|amex|visa|mastercard)[^A-Za-z0-9]{0,8}(the |is |was )?[0-9][0-9 -]{11,27}[0-9]"; "\(.edge)\(.label) <redacted:card>"; "i")
+            | gsub("hf_[A-Za-z0-9]{20,}"; "<redacted:hf-token>")
+            | gsub("AIza[A-Za-z0-9_-]{30,}"; "<redacted:google-key>")
+            | gsub("(AKIA|ASIA)[A-Z0-9]{16}"; "<redacted:aws-key>")
+            | gsub("eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}"; "<redacted:jwt>")
+            | gsub("://[^/@[:space:]]+:[^/@[:space:]]+@"; "://<redacted:basic-auth>@")
+            | gsub("\"auth\"[[:space:]]*:[[:space:]]*\"[A-Za-z0-9+/=]{16,}\""; "\"auth\": \"<redacted:docker-auth>\"")
+            | gsub("(?<edge>^|[^A-Za-z0-9])(sk|rk)_live_[A-Za-z0-9]{8,}"; "\(.edge)<redacted:stripe-key>")
+            | gsub("(?<edge>^|[^A-Za-z0-9])whsec_[A-Za-z0-9]{8,}"; "\(.edge)<redacted:stripe-hook>")
+            | gsub("(?<edge>^|[^A-Za-z0-9])npm_[A-Za-z0-9]{20,}"; "\(.edge)<redacted:npm-token>")
+            | gsub("(?<edge>^|[^A-Za-z0-9])glpat-[A-Za-z0-9_-]{10,}"; "\(.edge)<redacted:gitlab-token>")
+            | gsub("(?<edge>^|[^A-Za-z0-9])dckr_pat-[A-Za-z0-9_.-]{10,}"; "\(.edge)<redacted:docker-token>")
+            | gsub("(?<edge>^|[^A-Za-z0-9])SG\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}"; "\(.edge)<redacted:sendgrid-key>")
+            | gsub("(?<edge>^|[^A-Za-z0-9])SK[0-9a-f]{32}"; "\(.edge)<redacted:twilio-key>")
+            | gsub("(?<edge>^|[^A-Za-z0-9])key-[A-Za-z0-9]{20,}"; "\(.edge)<redacted:mailgun-key>")
+            | gsub("(?<name>(aws|AWS)_secret_access_key)[[:space:]]*[=:][[:space:]]*[^[:space:]]+"; "\(.name)=<redacted:aws-secret>");
+        def redact_record:
+            if type == "string" then
+                # A decoded field is a safe boundary for an incomplete block.
+                gsub("-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(-----END [A-Z0-9 ]*PRIVATE KEY-----|$)"; "<redacted:private-key>"; "p")
+                | redact_string
+            elif type == "array" then map(redact_record)
+            elif type == "object" then with_entries(
+                .key |= redact_string |
+                .value |= redact_record |
+                if .key == "auth" and (.value | type) == "string"
+                    and (.value | test("^[A-Za-z0-9+/=]{16,}$"))
+                then .value = "<redacted:docker-auth>" else . end)
+            else . end;
+        # Recent-stream records are JSON lines. Decode before masking, so
+        # escaping cannot hide credentials or make a PEM range eat later sections.
+        split("\n") | map(. as $line | (try fromjson catch null) as $record
+            | if ($record | type) == "object" or ($record | type) == "array"
+              then ($record | redact_record) as $clean
+                   | if $clean == $record then $line else ($clean | tojson) end
+              else $line end) | join("\n")
+        # Plain prompt sections can also contain PEM. Replace complete blocks
+        # in place. For an incomplete block, consume only encoded body lines,
+        # never an open-ended range through the following prompt sections.
+        | gsub("-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----(?:(?!-----BEGIN).)*?-----END [A-Z0-9 ]*PRIVATE KEY-----"; "<redacted:private-key>"; "p")
+        | gsub("-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[^\\r\\n]*(?:\\r?\\n[A-Za-z0-9+/=]+(?=\\r?\\n|$))*"; "<redacted:private-key>")
+        | redact_string
+    '
+)
