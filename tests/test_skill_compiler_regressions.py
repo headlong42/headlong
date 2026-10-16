@@ -119,7 +119,7 @@ class Case:
         self.cache = self.root / 'compiled'
         self.env = dict(os.environ)
         for key in list(self.env):
-            if key.startswith(('SKILL_', 'SC_', 'SHELLM_', 'HEADLONG_', 'LLM_', 'TRAJ_', 'MEM_', 'ROOT_TRAJ_')):
+            if key.startswith(('SKILL_', 'SC_', 'SHELLM_', 'HEADLONG_', 'LLM_', 'TRAJ_', 'MEM_', 'ROOT_TRAJ_')) or key.endswith(('_API_KEY', '_TOKEN')):
                 self.env.pop(key)
         self.env.update(HOME=str(self.root/'home'), HEADLONG_HOME=str(self.root/'state'),
                         SKILLS_DIR=str(self.skills), SKILLS_KERNEL_DIR=str(self.root/'kernel'),
@@ -528,6 +528,221 @@ def direct_cache():
         assert sentinel.read_text()=='retain' and c.cache.parent==c.root
     finally: SC=original
 check('direct helper leaves sibling cache untouched',direct_cache)
+
+
+# Third repair: actual configuration loaders, stopped before any provider call.
+def operator_config():
+    import shlex
+    repo = Path(__file__).resolve().parents[1]
+    originals = {name: (STUBS/name).read_text() for name in ('llm','shellm')}
+    keys = ['OPENROUTER_API_KEY','OPENAI_API_KEY','SHELLM_MODEL','SHELLM_API_URL',
+            'LLM_API_URL','LLM_API_KEY','LLM_PROVIDER','LLM_ADAPTER','LLM_OR_ONLY',
+            'LLM_OR_ZDR','LLM_RETRIES','SHELLM_EFFORT']
+    capture = ('import os,json; print(json.dumps({k:os.environ.get(k) for k in '
+               + repr(keys+['TRAJ_DIR','LLM_USAGE_LEDGER']) + '}))')
+    prefixes = {}
+    for name, marker in [('llm','\nLLM_MODEL='), ('shellm','\nSHELLM_MAX_TOKENS=')]:
+        source = (repo/'bin'/name).read_text()
+        assert marker in source
+        prefixes[name] = source[:source.index(marker)]
+    impl = ROOT/'loader-impl'; impl.mkdir()
+    try:
+        for name in originals:
+            (impl/name).write_text(originals[name])
+            wrapper = ('#!/bin/bash\n'+shlex.quote(PYTHON)+' -c '+shlex.quote(capture)
+                       + ' > "$CASE_ROOT/'+name+'-before-config.json"\n'
+                       + prefixes[name] + '\nexport SHELLM_MODEL SHELLM_API_URL\n'
+                       + shlex.quote(PYTHON) + ' -c ' + shlex.quote(capture)
+                       + ' > "$CASE_ROOT/'+name+'-config.json"\n'
+                       + 'exec '+shlex.quote(PYTHON)+' '+shlex.quote(str(impl/name))+' "$@"\n')
+            (STUBS/name).write_text(wrapper)
+        for mode in ('state','cwd','both','exported','empty','key-only','file-alias',
+                     'export-alias','empty-alias','empty-shellm-alias','config-dir','cwd-selector','default-home','legacy-home','layered-values'):
+            c=Case('config-'+mode)
+            state=c.root/'state'
+            if mode=='default-home':
+                c.env.pop('HEADLONG_HOME');state=c.root/'home'/'.headlong'
+            elif mode=='legacy-home':
+                c.env.pop('HEADLONG_HOME');c.env['SHELLM_HOME']=str(state)
+            state.mkdir()
+            config=("OPENROUTER_API_KEY='dummy & \\\\ key'\nSHELLM_MODEL=synthetic-model\n"
+                    "SHELLM_API_URL=https://synthetic.invalid/v1\nLLM_API_URL=https://other.invalid/v1\n"
+                    "LLM_API_KEY=dummy-generic\nLLM_PROVIDER=openai-compatible\n"
+                    "LLM_ADAPTER=/synthetic/adapter\nLLM_OR_ONLY=synthetic-host\n"
+                    "LLM_OR_ZDR=true\nLLM_RETRIES=0\nSHELLM_EFFORT=low\n"
+                    + 'TRAJ_DIR='+shlex.quote(str(c.root/'unused-live-traj'))+'\n'
+                    + 'LLM_USAGE_LEDGER='+shlex.quote(str(c.root/'unused-ledger'))+'\n')
+            if mode=='key-only': config='OPENAI_API_KEY=dummy-openai\n'
+            if mode=='file-alias': config=config.replace('SHELLM_API_URL=https://synthetic.invalid/v1\n','')
+            if mode in ('cwd','cwd-selector'):
+                (c.root/'.env').write_text(config)
+            else: (state/'.env').write_text(config)
+            if mode=='layered-values':
+                (c.root/'.env').write_text('PROVIDER_ENDPOINT=https://layered.invalid/v1\n')
+                (state/'.env').write_text(config.replace('https://synthetic.invalid/v1', '$PROVIDER_ENDPOINT'))
+            if mode=='both': (c.root/'.env').write_text('SHELLM_MODEL=cwd-model\nOPENROUTER_API_KEY=dummy-cwd\n')
+            if mode=='exported':
+                c.env.update(OPENROUTER_API_KEY='dummy-exported',SHELLM_MODEL='exported-model',
+                             SHELLM_API_URL='https://exported.invalid/v1',LLM_OR_ONLY='exported-host')
+            if mode=='empty': c.env.update(OPENROUTER_API_KEY='',SHELLM_MODEL='',LLM_PROVIDER='',LLM_OR_ONLY='')
+            if mode=='export-alias': c.env['LLM_API_URL']='https://export-alias.invalid/v1'
+            if mode=='empty-alias': c.env['LLM_API_URL']=''
+            if mode=='empty-shellm-alias': c.env['SHELLM_API_URL']=''
+            if mode in ('config-dir','cwd-selector'):
+                conf=c.root/'config-dir';conf.mkdir();(conf/'.env').write_text(config.replace('synthetic-model','config-model'))
+                if mode=='config-dir': c.env['SHELLM_CONF_DIR']=str(conf)
+                else: (c.root/'.env').write_text('SHELLM_CONF_DIR='+shlex.quote(str(conf))+'\n')
+            reference={}
+            for name in originals:
+                script=prefixes[name]+'\nexport SHELLM_MODEL SHELLM_API_URL\n'+shlex.quote(PYTHON)+' -c '+shlex.quote(capture)
+                r=subprocess.run(['/bin/bash','-c',script],cwd=c.root,env=c.env,text=True,capture_output=True,check=True)
+                reference[name]=json.loads(r.stdout)
+            c.run()
+            for name in originals:
+                actual=json.loads((c.root/(name+'-config.json')).read_text())
+                assert all(actual[k]==reference[name][k] for k in keys), (mode,name,'configuration differs from original loader')
+                if name=='shellm':
+                    assert Path(actual['TRAJ_DIR']).is_relative_to(c.root/'runs')
+                    assert actual['LLM_USAGE_LEDGER'] is None
+            if mode=='key-only':
+                before=json.loads((c.root/'shellm-before-config.json').read_text())
+                assert before['OPENROUTER_API_KEY'] is None and before['LLM_API_URL'] is None
+                assert before['SHELLM_API_URL'] is None
+            assert not (c.root/'unused-live-traj').exists() and not (c.root/'unused-ledger').exists()
+            # No copied config or secret-bearing files remain in disposable runs.
+            assert not list((c.root/'runs').rglob('.env'))
+    finally:
+        for name,source in originals.items(): (STUBS/name).write_text(source)
+check('repair3 actual loader configuration and alias precedence',operator_config)
+
+
+def obsidian_refusal():
+    c=Case('obsidian-refusal');c.skill('obsidian','Synthetic vault test only.')
+    vault=c.root/'vault';vault.mkdir();sentinel=vault/'sentinel';sentinel.write_text('untouched')
+    c.env['OBSIDIAN_VAULT']=str(vault)
+    for command in ('compile','pool'):
+        r=c.run(command,skill='obsidian',success=False)
+        assert r.returncode!=0 and 'skip-list' in r.stderr
+    assert not (c.root/'teacher-count').exists() and not (c.root/'shell-prompt').exists()
+    assert sentinel.read_text()=='untouched'
+check('repair3 obsidian refused before probing or model calls',obsidian_refusal)
+
+
+def documented_output(kind, json_output=False):
+    c=Case('documented-'+kind+('-json' if json_output else ''));phrase='Canonical documented success'
+    if json_output: phrase=json.dumps({'result': phrase})
+    c.skill('probe','Run probe.py\n```text\n'+phrase+'\n```\n','print('+repr(phrase)+')\n')
+    c.tests([dict(name='documented',prompt='Execute the probe.',expect=kind,expect_contains=[phrase])])
+    row=dict(type=kind,**({'stdout':phrase,'exit':0} if kind=='shell-output' else {'content':phrase}))
+    (c.root/'trajectory.jsonl').write_text(json.dumps(row)+'\n')
+    c.run();assert c.result()['tests'][0]['verification']=='VERIFIED'
+for kind in ('observation','shell-output','final'):
+    check('repair3 documented '+kind+' remains evidence',lambda kind=kind:documented_output(kind))
+    check('repair3 documented JSON '+kind+' remains evidence',lambda kind=kind:documented_output(kind,True))
+
+
+def probe_children(mode):
+    import time
+    c=Case('probe-child-'+mode)
+    source=SC.read_text();helper=c.root/'bounded.sh'
+    helper.write_text(source[source.index('_sc_bounded() {'):source.index('\nexecute_test() {')]+'\n_sc_bounded "$@"\n')
+    child=c.root/'child.py';marker=c.root/'survived';pidfile=c.root/'child-pid'
+    # Finite children ensure even the old, broken helper cannot leak a long-lived process.
+    child.write_text('import time,pathlib\ntime.sleep(1)\npathlib.Path('+repr(str(marker))+').write_text("survived")\n')
+    parent=c.root/'parent.py'
+    parent.write_text('import subprocess,sys,pathlib,time\np=subprocess.Popen([sys.executable,'+repr(str(child))+'])\n'
+                      'pathlib.Path('+repr(str(pidfile))+').write_text(str(p.pid))\n'
+                      + ('time.sleep(1)\n' if mode=='timeout' else ''))
+    start=time.monotonic()
+    r=subprocess.run([os.environ.get('SC_TEST_BASH','/bin/bash'),str(helper),'0.2',PYTHON,str(parent)],
+                     env=c.env,text=True,capture_output=True,timeout=4)
+    elapsed=time.monotonic()-start
+    # Wait past the finite child's write deadline before asserting it was killed.
+    time.sleep(max(0,1.2-(time.monotonic()-start)))
+    assert r.returncode==(124 if mode=='timeout' else 0),(r.returncode,r.stderr)
+    assert elapsed<0.8 and not marker.exists(),(mode,elapsed,'descendant survived deadline')
+for mode in ('normal','timeout'):
+    check('repair3 probe descendants bounded on '+mode,lambda mode=mode:probe_children(mode))
+
+
+def option_validation():
+    c=Case('option-validation')
+    for opt in ('--skill','--teacher-model','--num-tests','--max-iterations'):
+        r=c.run(extra=(opt,),success=False)
+        assert r.returncode!=0 and 'requires a value' in r.stderr and 'unbound variable' not in r.stderr
+    for opt in ('--num-tests','--max-iterations'):
+        for val in ('0','-1','abc','1.5','','9223372036854775808'):
+            r=c.run(extra=(opt,val),success=False)
+            assert r.returncode!=0 and opt in r.stderr
+    assert not (c.root/'teacher-count').exists()
+    c.tests([dict(name='case'+str(i),prompt='Run.',expect='final',expect_contains=[]) for i in range(3)])
+    c.run(extra=('--num-tests','01','--max-iterations','02'))
+    assert len(c.result()['tests'])==1
+check('repair3 options validate before calls and test count is a ceiling',option_validation)
+
+
+def harvest_minimum():
+    c=Case('harvest-minimum');td=c.root/'history';td.mkdir()
+    rows=[dict(type='reasoning',run_id='a',cmd='python3 probe.py'),
+          dict(type='shell-output',run_id='a',stdout='Historical diagnostic output')]
+    (td/'events.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in rows))
+    c.env.update(SKILL_AUTO_HARVEST='1',SKILL_HARVEST_TRAJ_DIR=str(td),SKILL_HARVEST_MIN_COUNT='1')
+    assert 'Historical diagnostic output' in json.loads(c.run('pool').stdout)
+    c.env['SKILL_HARVEST_MIN_COUNT']='01'
+    assert 'Historical diagnostic output' in json.loads(c.run('pool').stdout)
+    for value in ('abc','','0','-1','1.5','9223372036854775808'):
+        c.env['SKILL_HARVEST_MIN_COUNT']=value;r=c.run('pool',success=False)
+        assert r.returncode!=0 and 'SKILL_HARVEST_MIN_COUNT' in r.stderr
+check('repair3 history minimum diagnostic and valid history control',harvest_minimum)
+
+
+def unchecked_literals():
+    c=Case('unchecked-literals');c.output('Victory phrase stable','Victory phrase stable');c.env['RUNNER_RC']='1'
+    c.run(success=False);r=c.result()['tests'][0]
+    assert not r['pass'] and r['harness_error'] and r['expect_contains_missed']==[]
+    assert r['expect_contains_unchecked']==['Victory phrase stable']
+    del c.env['RUNNER_RC'];c.output('Different output','Different final');c.run();r=c.result()['tests'][0]
+    assert r['expect_contains_missed']==['Victory phrase stable'] and r['expect_contains_unchecked']==[]
+check('repair3 unchecked literals differ from checked misses',unchecked_literals)
+
+
+def coarse_error_contract():
+    c=Case('coarse-error');c.tests([dict(name='error',prompt='Verify probe rejects bad input.',expect='error',expect_contains=[])])
+    rows=[dict(type='reasoning',cmd='ls missing'),dict(type='shell-output',exit=2,stderr='No such file'),
+          dict(type='reasoning',cmd='python3 probe.py'),dict(type='shell-output',exit=0,stdout='Victory phrase stable')]
+    (c.root/'trajectory.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in rows))
+    c.run();assert c.result()['tests'][0]['verification']=='GREEN-NO-LITERALS'
+    c.env['RUNNER_RC']='1';c.run(success=False);assert not c.result()['tests'][0]['pass']
+check('repair3 coarse error contract is not behavioral verification or runner failure',coarse_error_contract)
+
+
+def cache_commands():
+    c=Case('cache-commands')
+    # Case.run supplies --skill even to list; invoke the documented list form here.
+    def listing():
+        return subprocess.run([os.environ.get('SC_TEST_BASH','/bin/bash'),str(SC),'list'],env=c.env,cwd=c.root,
+                              text=True,capture_output=True,check=True).stdout
+    assert listing().strip()=='No compiled skills'
+    c.run();assert listing().splitlines()==['probe']
+    sentinel=c.root/'outside.md';sentinel.write_text('untouched')
+    for command in ('show','clean'):
+        for name in ('../outside','/outside','probe/../outside'):
+            r=c.run(command,skill=name,success=False)
+            assert r.returncode!=0 and 'invalid skill name' in r.stderr
+        r=c.run(command,extra=('--skill',),success=False)
+        assert r.returncode!=0 and 'requires a value' in r.stderr
+    assert sentinel.read_text()=='untouched'
+    c.run('show');c.run('clean');assert listing().strip()=='No compiled skills'
+check('repair3 list and invalid show clean names',cache_commands)
+
+
+def command_echo():
+    c=Case('command-echo');phrase='echo Victory phrase stable'
+    c.tests([dict(name='echo',prompt='Execute the probe.',expect='shell-output',expect_contains=[phrase])])
+    rows=[dict(type='reasoning',cmd=phrase),dict(type='shell-output',stdout=phrase,exit=0)]
+    (c.root/'trajectory.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in rows))
+    c.run();assert not c.result()['tests'][0]['pass']
+check('repair3 recorded command echo is not assertion evidence',command_echo)
 
 print(f'{count-failed} regression checks passed, {failed} failed',flush=True)
 sys.exit(bool(failed))

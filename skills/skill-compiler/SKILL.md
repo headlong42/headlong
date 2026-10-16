@@ -20,7 +20,7 @@ sc="$HOME/.skills/core-skills/skill-compiler/skill-compiler"
 
 The installer does not put the executable on PATH. From a source checkout use
 `sc="$PWD/skills/skill-compiler/skill-compiler"`. Use `--teacher-model` only to
-override the teacher's configured model. Defaults are eight cases and fifteen
+override the teacher's configured model. Defaults are up to eight cases and fifteen
 iterations per case.
 
 Both compile and pool can execute a skill script with no arguments and with

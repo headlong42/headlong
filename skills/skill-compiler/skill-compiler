@@ -53,7 +53,7 @@ Usage:
 Options:
   --skill NAME            Skill to compile (directory name under skills/ or kernel/)
   --teacher-model MODEL   Teacher model for test synthesis (default: llm configuration)
-  --num-tests N           Number of test cases to synthesize (default: 8)
+  --num-tests N           Maximum test cases to execute (default: 8)
   --max-iterations N      Max shellm iterations per test (default: 15)
 
 Commands:
@@ -139,20 +139,75 @@ PY
 # STORE-ISOLATION 2026-09-22: skills we refuse to compile. Auth skills need
 # credentials; side-effect skills write the live identity store or message
 # humans; git-diff-summarizer has no runnable command for a test to execute.
-COMPILE_SKIP_SKILLS="github-api telegram googleworkspace chat slack mem traj recap goal-review git-diff-summarizer"
+COMPILE_SKIP_SKILLS="obsidian github-api telegram googleworkspace chat slack mem traj recap goal-review git-diff-summarizer"
 
-assert_compile_allowed() {
-    local skill_name=""
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --skill) skill_name="$2"; shift 2 ;;
-            *) shift ;;
-        esac
+# Validate before any model call. Reject another option as a missing value.
+_sc_option_value() {
+    [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || die "$1 requires a value"
+}
+_sc_positive_integer() {
+    [[ "$2" =~ ^[0-9]+$ && "$2" =~ [1-9] ]] || die "$1 must be a positive decimal integer"
+    # shellm uses signed Bash arithmetic for its iteration counter.
+    python3 - "$1" "$2" <<'PY_INT'
+import sys
+value = sys.argv[2].lstrip("0")
+if len(value) > 19 or int(value) > 9223372036854775807:
+    raise SystemExit(sys.argv[1] + " must be a positive decimal integer <= 9223372036854775807")
+PY_INT
+}
+
+# Resolve only model/provider settings before changing cwd or mutable state.
+# The core loaders fill unset keys from cwd .env, then state/config .env;
+# even explicitly empty process values win. Extract values in subshells as
+# they do, so shell quoting works without importing live state pointers.
+_sc_operator_config() (
+    local kind_key config_keys key val envfile config_home
+    local process_shellm_set="${SHELLM_API_URL+x}" process_shellm="${SHELLM_API_URL-}"
+    local process_llm_set="${LLM_API_URL+x}" process_llm="${LLM_API_URL-}"
+    config_keys="ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY OPENROUTER_API_KEY OPENCODE_API_KEY LLM_API_KEY \
+        LLM_API_URL LLM_ADAPTER LLM_ASSUME_THINKING LLM_PROVIDER LLM_MODEL LLM_MAX_TOKENS \
+        LLM_OR_ONLY LLM_OR_DATA_COLLECTION LLM_OR_ZDR LLM_RETRIES LLM_RETRY_BACKOFF LLM_CONNECT_TIMEOUT \
+        LLM_MAX_TIME LLM_SPEED_LIMIT LLM_SPEED_TIME SHELLM_MODEL SHELLM_API_URL SHELLM_MAX_TOKENS \
+        SHELLM_EFFORT SHELLM_STOP_AFTER_CODE_BLOCK SHELLM_MAX_CONSECUTIVE_FAILURES SHELLM_MAX_REPEAT_FAILURES SHELLM_TRUNCATE SHELLM_CONTEXT_SCOPE \
+        SHELLM_CONTEXT_RUN_TAIL SHELLM_CONTEXT_RUN_TAIL_BLOCK SHELLM_CONTEXT_BLOCK_LIMIT SHELLM_CONTEXT_WHOLE_BLOCKS"
+    # Resolve file variables privately, including selectors and values referenced
+    # by the second layer. Only config_keys are emitted to the runner.
+    for kind_key in cwd config; do
+        if [[ "$kind_key" == cwd ]]; then envfile=.env
+        else
+            config_home="${HEADLONG_HOME:-${SHELLM_HOME:-$HOME/.headlong}}"
+            envfile="${SHELLM_CONF_DIR:-$config_home}/.env"
+        fi
+        [[ -f "$envfile" ]] || continue
+        while IFS= read -r key; do
+            [[ -n "$key" ]] || continue
+            [[ -n "${!key+x}" ]] && continue
+            # shellcheck disable=SC1090 # operator config, matching core loaders
+            val=$(set -a; . "$envfile" >/dev/null 2>&1; printf '%s' "${!key}") || {
+                printf '[skill-compiler] warning: could not read operator config %s\n' "$envfile" >&2
+                break
+            }
+            export "$key=$val"
+        done < <(sed -n 's/^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}\([A-Za-z_][A-Za-z0-9_]*\)[[:space:]]*=.*/\2/p' "$envfile")
     done
-    [[ -n "$skill_name" ]] || return 0
-    if [[ " $COMPILE_SKIP_SKILLS " == *" $skill_name "* ]]; then
-        die "skill $skill_name is on the compile skip-list (auth, live-store writes, messaging humans, or no runnable command)"
+    # Alias precedence must be resolved against the ORIGINAL process env,
+    # before file values become exported inputs to the isolated shellm.
+    if [[ -n "$process_shellm_set" ]]; then SHELLM_API_URL="$process_shellm"
+    elif [[ -n "$process_llm_set" ]]; then SHELLM_API_URL="$process_llm"
+    elif [[ -n "${SHELLM_API_URL+x}${LLM_API_URL+x}" ]]; then
+        SHELLM_API_URL="${SHELLM_API_URL:-${LLM_API_URL:-}}"
     fi
+    for key in $config_keys; do
+        [[ -z "${!key+x}" ]] || printf '%s\0%s\0' "$key" "${!key}"
+    done
+)
+
+_sc_load_operator_config() {
+    local key val
+    # Builtin printf/read/export keep values out of argv and disk artifacts.
+    while IFS= read -r -d '' key && IFS= read -r -d '' val; do
+        export "$key=$val"
+    done < <(_sc_operator_config)
 }
 
 # Parse SKILL.md into JSON spec
@@ -252,6 +307,9 @@ raise SystemExit(0 if found else 1)
 # captured history. History output is paired with the command in the same run.
 # This is vocabulary provenance, not proof that a test detects faulty behavior.
 harvest_history_pool() {
+    local SKILL_HARVEST_MIN_COUNT="${SKILL_HARVEST_MIN_COUNT:-2}"
+    SKILL_HARVEST_MIN_COUNT=$(python3 -c 'import sys; print(int(sys.argv[1]))' "${SKILL_HARVEST_MIN_COUNT:-2}") || return 1
+
     local skill_abs="${1:-}"
     [[ -n "$skill_abs" && -d "$skill_abs" ]] || return 1
     local skill_name script
@@ -401,6 +459,8 @@ _sc_isolate_state() {
 }
 
 capture_phrase_pool() {
+    _sc_positive_integer SKILL_HARVEST_MIN_COUNT "${SKILL_HARVEST_MIN_COUNT-2}" || return 1
+
     local skill_abs="$1"
     local cap src_cap live_cap hist_cap
     cap=$(_sc_cap SKILL_POOL_CAP "${SKILL_POOL_CAP-400}") || return 1
@@ -610,7 +670,7 @@ synthesize_tests() {
     local skill_spec
     skill_spec=$(printf '%s' "$spec_json" | _sc_jq -c .)
     # Tell the teacher which declared binaries the
-    # test environment has (rule 18). A test that needs a missing binary dies at
+    # test environment has (the dependency rule). A test that needs a missing binary dies at
     # exit 127 and the stall guard kills the run before any expected line.
     local bins_status="none declared"
     local declared_bin
@@ -657,10 +717,10 @@ clean case must expect the all-clear phrase, not a bare error/violation word.
 Do not expect fixture data echoed from the prompt, a file, or command text.
 Leave expect_contains empty if no pool phrase fits; this checks the terminal
 step only and cannot provide literal attestation or prove behavior quality.
-15. PROMPT-EXPECT AGREEMENT: require only output the requested task can produce.
-16. NO PLACEHOLDER SCAFFOLDING: never expect example slot names.
-17. EXPECT THE OUTPUT NOT THE COMMAND: do not pin command spelling or quotes.
-18. DEPENDENCY: avoid absent binaries or test a documented graceful failure.
+1. PROMPT-EXPECT AGREEMENT: require only output the requested task can produce.
+2. NO PLACEHOLDER SCAFFOLDING: never expect example slot names.
+3. EXPECT THE OUTPUT NOT THE COMMAND: do not pin command spelling or quotes.
+4. DEPENDENCY: avoid absent binaries or test a documented graceful failure.
 
 SKILL SPECIFICATION (JSON):
 __SKILL_SPEC__
@@ -715,7 +775,8 @@ print(json.dumps(obj))
           and ((.expect_contains // []) | type == "array" and all(.[]; type == "string")))
     ' >/dev/null || die "Teacher returned invalid test cases"
 
-    printf '%s' "$tests_json"
+    # The requested count is a budget ceiling, even if the teacher returns more.
+    printf '%s' "$tests_json" | _sc_jq --argjson n "$num_tests" '.[:$n]'
 }
 
 # Execute a single test case
@@ -723,13 +784,19 @@ print(json.dumps(obj))
 _sc_bounded() {
     python3 - "$@" <<'PY'
 import os, signal, subprocess, sys
-p = subprocess.Popen(sys.argv[2:], start_new_session=True)
+p = subprocess.Popen(sys.argv[2:], start_new_session=True, stdin=subprocess.DEVNULL)
 try:
     rc = p.wait(timeout=float(sys.argv[1]))
 except subprocess.TimeoutExpired:
-    os.killpg(p.pid, signal.SIGKILL)
-    p.wait()
     rc = 124
+finally:
+    # A normally exiting parent may leave children holding the pipeline open.
+    # Always retire the entire probe group before returning its status.
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    p.wait()
 raise SystemExit(rc)
 PY
 }
@@ -743,7 +810,7 @@ execute_test() {
     test_name=$(printf '%s' "$test_json" | _sc_jq -r '.name')
     prompt=$(printf '%s' "$test_json" | _sc_jq -r '.prompt')
     # Deterministic fallback: rewrite relative skill paths to absolute so the
-    # checker script resolves even if the teacher ignored rule 7.
+    # checker script resolves even if the teacher used a relative path.
     prompt=$(printf '%s' "$prompt" | python3 -c '
 import re,sys
 root=sys.argv[1].rstrip("/") + "/"
@@ -771,6 +838,7 @@ print(re.sub(r"(?<![/A-Za-z0-9_.-])skills/", lambda m:root, sys.stdin.read()), e
     printf '%s\n' "$rundir" >> "$SC_SCRATCH/runs"
     export TMPDIR="$rundir"
 
+    _sc_load_operator_config
     export SKILLS_DIR="$SKILLS_DIR"
     export SKILLS_KERNEL_DIR="$KERNEL_DIR"
     _sc_isolate_state "$rundir" || die "cannot create test state: $rundir"
@@ -803,15 +871,6 @@ ${skill_content}"
 
     # Run shellm
     local rc=0
-    # Pass through LLM API environment variables
-    export OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-}"
-    export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
-    export OPENAI_API_KEY="${OPENAI_API_KEY:-}"
-    export GEMINI_API_KEY="${GEMINI_API_KEY:-}"
-    export LLM_API_KEY="${LLM_API_KEY:-}"
-    export LLM_API_URL="${LLM_API_URL:-}"
-    export LLM_PROVIDER="${LLM_PROVIDER:-}"
-
     printf '%s' "$full_prompt" > "$rundir/prompt.txt"
     ( cd "$rundir" && shellm --max-iterations "$max_iterations" --workdir "$rundir" --prompt-file "$rundir/prompt.txt" ) >"$rundir/runner.stdout" 2>"$rundir/runner.stderr" || rc=$?
 
@@ -877,39 +936,28 @@ PY_ROOT
         # whose term appears in the final answer could never pass (hello-world
         # false-fail). Final steps are in the evidence pool now, still subject to
         # the echo filter and the denial-aware matching below.
-    local ec_matched=0 ec_missed="$expect_contains"
+    local ec_matched=0 ec_missed='[]' ec_unchecked="$expect_contains"
     if [[ $pass == true ]] && [[ $(printf '%s' "$expect_contains" | _sc_jq 'length') -gt 0 ]]; then
         pass=false
-        ec_missed='[]'
+        ec_unchecked='[]'
         local exec_content=""
         if [[ -n "$actual_traj_file" && -f "$actual_traj_file" ]]; then
             exec_content=$(_sc_jq -rs '[.[] | select(.type=="shell-output" or .type=="observation" or .type=="final") | (if .type=="shell-output" then ([.stdout // .content // "", .stderr // ""] | join("\n")) else (.content // .details // "") end)] | join("\n")' "$actual_traj_file" 2>/dev/null || true)
         fi
         local fixture_rows=""
         if [[ -d "$rundir" ]]; then
-            fixture_rows=$(find "$rundir" -type f ! -path "$traj_dir/*" ! -path '*/memories/*' ! -name 'echo-filter*' ! -name 'root-evidence.jsonl' ! -name 'runner.*' -print0 2>/dev/null | xargs -0 grep -hE '^[[:space:]]*[{\[]' 2>/dev/null || true)
+            fixture_rows=$(find "$rundir" -type f ! -path "$traj_dir/*" ! -path '*/memories/*' ! -name 'echo-filter*' ! -name 'root-evidence.jsonl' ! -name 'prompt.txt' ! -name 'runner.*' -print0 2>/dev/null | xargs -0 grep -hE '^[[:space:]]*[{\[]' 2>/dev/null || true)
         fi
         local exec_filter_file="${TMPDIR:-/tmp}/echo-filter-exec.$$"
-        printf '%s\n%s\n' "$full_prompt" "$fixture_rows" | sed '/^[[:space:]]*$/d' > "$exec_filter_file"
+        local command_rows
+        command_rows=$(_sc_jq -rs '[.[] | .cmd? | select(type=="string")] | join("\n")' "$actual_traj_file")
+        # Documentation is vocabulary, not an echo exclusion: genuine tool
+        # output may use the documented phrase. Exclude task/command echoes.
+        printf '%s\n%s\n%s\n' "$prompt" "$command_rows" "$fixture_rows" | sed '/^[[:space:]]*$/d' > "$exec_filter_file"
         exec_content=$(printf '%s\n' "$exec_content" | _sc_subtract_lines "$exec_filter_file")
         # Files in the workdir may be inputs, source, or invented notes.
         # Only trajectory output and answers are assertion evidence.
         rm -f "$exec_filter_file"
-        # FINAL-AS-EXPECTED-FIX 2026-09-22: the agent's own final answer is its
-        # own words. Subtract prompt and known fixture echoes, but not lines
-        # from the pre-loaded skill text: a skill's canonical output phrase
-        # (hello-world "Hello, World!") is exactly what expect_contains asks for,
-        # so filtering the final against skill content made an expect=final test
-        # whose answer equals the expected phrase impossible to pass.
-        local final_only
-        final_only=$(printf '%s\n' "$final_content")
-        if [[ -n "$final_only" ]]; then
-            local prompt_only_filter="${TMPDIR:-/tmp}/echo-filter-prompt.$$"
-            printf '%s\n%s\n' "$prompt" "$fixture_rows" | sed '/^[[:space:]]*$/d' > "$prompt_only_filter" 2>/dev/null || true
-            final_only=$(printf '%s\n' "$final_only" | _sc_subtract_lines "$prompt_only_filter")
-            rm -f "$prompt_only_filter"
-            exec_content=$(printf '%s\n%s\n' "$exec_content" "$final_only")
-        fi
         # DENIAL-FIX 2026-09-22: a line that denies the term ("No violations
         # found", "Not a violation", "0 violations") is evidence of absence, not
         # of the term.
@@ -999,10 +1047,10 @@ PY_ROOT
         --arg final "$final_content" \
         --arg exit_code "$rc" \
         --arg ec_matched "$ec_matched" \
-        --argjson ec_missed "$ec_missed" \
+        --argjson ec_missed "$ec_missed" --argjson ec_unchecked "$ec_unchecked" \
         --arg harness_error "$harness_error" --arg runner_stderr "$runner_stderr" \
         --arg final_len "$final_len" \
-        '{test:$test, pass:($pass=="true"), last_step_type:$last_step_type, last_step_content:$last_step_content, final:$final, exit_code:($exit_code|tonumber), expect_contains_matched:($ec_matched|tonumber), expect_contains_missed:$ec_missed, final_len:($final_len|tonumber), runner_stderr:$runner_stderr} + (if $harness_error=="" then {} else {harness_error:$harness_error} end)'
+        '{test:$test, pass:($pass=="true"), last_step_type:$last_step_type, last_step_content:$last_step_content, final:$final, exit_code:($exit_code|tonumber), expect_contains_matched:($ec_matched|tonumber), expect_contains_missed:$ec_missed, expect_contains_unchecked:$ec_unchecked, final_len:($final_len|tonumber), runner_stderr:$runner_stderr} + (if $harness_error=="" then {} else {harness_error:$harness_error} end)'
 }
 
 # Write cache files
@@ -1288,14 +1336,20 @@ cmd_compile() {
     local skill_name="" teacher_model="" num_tests=8 max_iterations=15
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --skill) skill_name="$2"; shift 2 ;;
-            --teacher-model) teacher_model="$2"; shift 2 ;;
-            --num-tests) num_tests="$2"; shift 2 ;;
-            --max-iterations) max_iterations="$2"; shift 2 ;;
+            --skill) _sc_option_value "$@"; skill_name="$2"; shift 2 ;;
+            --teacher-model) _sc_option_value "$@"; teacher_model="$2"; shift 2 ;;
+            --num-tests) _sc_option_value "$@"; num_tests="$2"; shift 2 ;;
+            --max-iterations) _sc_option_value "$@"; max_iterations="$2"; shift 2 ;;
             *) die "Unknown option: $1" ;;
         esac
     done
     [[ -n "$skill_name" ]] || die "--skill is required"
+
+    _sc_positive_integer --num-tests "$num_tests"
+    _sc_positive_integer --max-iterations "$max_iterations"
+    # Normalize leading zeros without Bash arithmetic overflow/octal rules.
+    num_tests=$(python3 -c 'import sys; print(int(sys.argv[1]))' "$num_tests")
+    max_iterations=$(python3 -c 'import sys; print(int(sys.argv[1]))' "$max_iterations")
 
     local skill_dir
     skill_dir=$(resolve_skill "$skill_name") || return 1
@@ -1346,7 +1400,7 @@ cmd_pool() {
     local skill_name=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --skill) skill_name="$2"; shift 2 ;;
+            --skill) _sc_option_value "$@"; skill_name="$2"; shift 2 ;;
             *) die "Unknown option: $1" ;;
         esac
     done
@@ -1368,7 +1422,7 @@ cmd_show() {
     local skill_name=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --skill) skill_name="$2"; shift 2 ;;
+            --skill) _sc_option_value "$@"; skill_name="$2"; shift 2 ;;
             *) die "Unknown option: $1" ;;
         esac
     done
@@ -1386,7 +1440,7 @@ cmd_clean() {
     local skill_name=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --skill) skill_name="$2"; shift 2 ;;
+            --skill) _sc_option_value "$@"; skill_name="$2"; shift 2 ;;
             *) die "Unknown option: $1" ;;
         esac
     done
@@ -1400,7 +1454,7 @@ cmd_clean() {
 
 # Dispatch
 case "${1:-}" in
-    compile) shift; assert_compile_allowed "$@"; cmd_compile "$@" ;;
+    compile) shift; cmd_compile "$@" ;;
     list) cmd_list ;;
     pool) shift; cmd_pool "$@" ;;
     show) shift; cmd_show "$@" ;;

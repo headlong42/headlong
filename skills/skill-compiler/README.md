@@ -26,15 +26,30 @@ sc="$HOME/.skills/core-skills/skill-compiler/skill-compiler"
 From a source checkout, use `sc="$PWD/skills/skill-compiler/skill-compiler"`.
 `SKILLS_DIR` defaults to the directory containing this skill;
 `SKILLS_KERNEL_DIR` selects a second search root. An existing `SKILLS_DIR`
-setting takes precedence. Test count defaults to 8, maximum iterations to 15.
+setting takes precedence. `--num-tests` is a ceiling on cases executed (default
+8); fewer returned cases are accepted and reported, and excess cases are dropped.
+It and `--max-iterations` (default 15) require positive decimal integers within
+the signed 64-bit range used by Bash.
+Missing option values are rejected before any model call.
+
+The teacher uses the normal llm loader in the original working directory. Before
+isolating each runner, the validator resolves model/provider settings from the
+original environment, cwd `.env`, then `${SHELLM_CONF_DIR:-<state-home>}/.env`,
+using shellm's precedence. Explicit exports win even when empty; endpoint aliases
+retain their process precedence. Only provider keys, model, endpoint, adapter,
+routing, retry, and generation/context controls are forwarded from files. Live
+state pointers and unrelated settings are not imported, and `.env` is never
+copied into the workdir. Existing process exports remain inherited except the
+state and identity selectors that isolation redirects.
 
 Only run trusted skills. Both `compile` and `pool` can execute a skill script
 with no arguments and with `--help`, in scratch with a 15-second deadline.
+Remaining probe process-group members are killed on normal exit and timeout.
 Both probes and tests use separate work, state-home, memory and trajectory
 directories and clear caller identity/run selectors. This is not an OS
 sandbox and does not revoke inherited credentials or other filesystem access.
 The fixed refusal list excludes known messaging, credential and live-store
-skills. It rejects path spellings and aliases that bypass those names; installed
+skills, including Obsidian. It rejects path spellings and aliases that bypass those names; installed
 directory symlinks must retain the name, and files must remain inside the
 resolved skill directory. This does not detect equivalent behavior in arbitrary
 new skill code. Use an isolated environment for skills with side effects.
@@ -57,9 +72,14 @@ actual launched root run. A nested run's answer or another run's rows cannot
 satisfy a case. `final` requires a nonempty final answer. `observation` and
 `shell-output` require nonempty content of their named type; they do not also
 require a final answer. `error` requires a shell-output record with a nonzero
-command `exit` value (excluding execution timeouts). A provider failure, stall, or generic error record is not
+command `exit` value (excluding execution timeouts) anywhere in that root run.
+This coarse condition can be met by an incidental failed command; it does not
+establish that the skill rejected the intended input. Review the generated case
+and prefer a diagnostic literal relevant to that operation. Without literals a
+passing case is only `GREEN-NO-LITERALS`. A provider failure, stall, or generic error record is not
 an expected skill error. All requested literals must also match recorded output
-or the root final answer. Arbitrary workdir files are not evidence.
+or the root final answer. Documented output remains eligible when actually
+recorded; task and command echoes are excluded. Arbitrary workdir files are not evidence.
 
 Matching is case-insensitive for both words and phrases. Words match whole
 words with optional s/es plurals; phrases match substrings with digit boundaries.
@@ -70,6 +90,9 @@ Setup, runner, or root-selection failure records `harness_error`, retains prior
 results, and returns nonzero. JSON results retain the runner exit code and up to
 2,000 bytes of stderr for diagnosis. Ordinary failed assertions are recorded in
 the report; compile can still exit zero, so inspect `summary.fail`.
+`expect_contains_missed` contains checked but absent assertions;
+`expect_contains_unchecked` contains assertions skipped because the runner or
+required outcome failed. Neither skipped assertions nor absent literals pass.
 
 Literal labels are `POOL-EXACT`, `POOL-FRAGMENT`, `POOL-DROPPED` (eligible
 vocabulary omitted by a cap), or `INVENTED` (not found in the collected pool).
@@ -94,6 +117,10 @@ accepted, and zero offers no entries from that source. Invalid settings name
 the offending variable. Stable deduplication preserves source priority: script,
 live output, history, then documentation. History entries rank by descending
 count before their source cap; explicit string arrays keep their input order.
+`SKILL_HARVEST_MIN_COUNT` (default 2) requires a positive decimal integer and
+selects the minimum observation count for a historical line (within the same
+signed 64-bit range). Invalid values
+fail with the setting's name, rather than silently dropping history.
 History is a sample of up to 300 matching trajectory files, not exhaustive output.
 `SKILL_AUTO_HARVEST=0` disables history reads; otherwise it uses
 `SKILL_HARVEST_TRAJ_DIR`, `TRAJ_DIR`, or `<state-home>/trajectories`.
