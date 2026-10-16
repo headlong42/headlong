@@ -1,86 +1,96 @@
 ---
 name: skill-compiler
-description: Compile a skill specification (SKILL.md) into a validated, cached adapter by synthesizing test cases with a teacher model, executing them, and storing working few-shots as a compiled adjunct.
+description: Generate and run validation cases for a trusted skill, then inspect a saved report of results and assertion provenance.
 ---
 
 # skill-compiler
 
-## When to use
+Use this when developing a skill or checking its documented behavior. It calls
+`llm` to propose cases, runs each through `shellm`, and saves results. It does
+not train an adapter, alter the skill, or add examples to `skills show`.
 
-- You have a SKILL.md that defines a capability but lacks validation examples
-- You want to "compile" a skill by generating and testing concrete usage examples
-- You're building a new skill and want to verify it works before promoting it
-- You want to cache working few-shots so the skill loads faster and more reliably
+## Requirements and invocation
 
-## What this skill does
+Requires Bash, Python 3, jq, and the existing `llm`, `shellm`, and `skills`
+commands. Model calls use your normal llm configuration and can incur charges.
+`--teacher-model` overrides only the teacher model; otherwise llm resolves its
+model and provider normally, including `SHELLM_MODEL` and `LLM_PROVIDER`.
 
-This skill implements the "Compile by Training" pattern for Headlong skills:
-
-1. **Read spec** — Parse a SKILL.md file (frontmatter + body) as the specification
-2. **Synthesize** — Call a teacher model (via `llm`) to generate validation test cases from the spec
-3. **Execute** — Run each test case through `shellm` with the skill available
-4. **Validate** — Check that the trajectory produces the expected step type and content
-5. **Cache** — Store passing test cases as a compiled markdown adjunct (`.compiled/<skill>.md`)
-
-The compiled cache serves as a "few-shot adapter" — future loads of the skill can include validated examples without re-synthesizing.
-
-## Usage
+The installer copies this directory but does not add its executable to PATH.
+For a standard installation:
 
 ```bash
-# Compile a skill (generates tests, runs them, caches results)
-skill-compiler compile --skill shellm --num-tests 3 --max-iterations 5
-
-# List compiled skills
-skill-compiler list
-
-# Show the phrase pool a compile hands the teacher
-skill-compiler pool --skill shellm
-
-# Show compiled cache for a skill
-skill-compiler show --skill shellm
-
-# Clean cache
-skill-compiler clean --skill shellm
+sc="$HOME/.skills/core-skills/skill-compiler/skill-compiler"
+"$sc" compile --skill shellm --num-tests 3 --max-iterations 5
+"$sc" pool --skill shellm
+"$sc" list
+"$sc" show --skill shellm
+"$sc" clean --skill shellm
 ```
 
-## Options
+From a source checkout, use `sc="$PWD/skills/skill-compiler/skill-compiler"`.
+`SKILLS_DIR` defaults to the directory containing this skill;
+`SKILLS_KERNEL_DIR` selects a second search root. An existing `SKILLS_DIR`
+setting takes precedence. Test count defaults to 8, maximum iterations to 15.
 
-| Option | Description |
-|--------|-------------|
-| `--skill NAME` | Skill directory name under `skills/` or `kernel/` |
-| `--teacher-model MODEL` | Teacher model for test synthesis (default: `nvidia/nemotron-3-ultra-550b-a55b`) |
-| `--num-tests N` | Number of test cases to synthesize (default: 8) |
-| `--max-iterations N` | Max shellm iterations per test (default: 15) |
+Only run trusted skills. Both `compile` and `pool` can execute a skill script
+with no arguments and with `--help`, in scratch with a 15-second deadline.
+Tests use separate work, memory and trajectory directories. This is not an OS
+sandbox and does not revoke inherited credentials or other filesystem access.
+The fixed refusal list excludes known messaging, credential and live-store
+skills. It rejects path spellings and aliases that bypass those names; installed
+directory symlinks must retain the name, and files must remain inside the
+resolved skill directory. This does not detect equivalent behavior in arbitrary
+new skill code. Use an isolated environment for skills with side effects.
 
-Skills that need credentials, write the live memory store, or message humans are refused at compile time; the skip list lives in the script.
+## Results and limits
 
-## Output
+Reports live in `<state-home>/skill-compiler/compiled`, independently of skill
+reinstallation. State home follows `HEADLONG_HOME`, then `SHELLM_HOME`, then
+`~/.headlong` (or existing `~/.shellm` if `~/.headlong` is absent).
+`SKILL_COMPILED_DIR` overrides the report directory.
 
-- `.compiled/<skill>.md` — Human-readable summary with pass/fail for each test and the literal provenance
-- `.compiled/<skill>.json` — Self-describing results: a `summary` object (total/passed/verified counts, green-on-invented count, literal provenance) plus `tests`, each entry carrying `literal_labels` and a `verification` status (VERIFIED / GREEN-ON-INVENTED / FAIL)
+Each skill has a Markdown summary, JSON results, a `.json.prov` provenance
+sidecar, and `pool-<skill>.json` containing offered and dropped vocabulary.
+`clean` removes all four. Invocation scratch and completed test runs are removed
+on exit. Set `SC_KEEP_RUNS=1` to retain them for debugging; their location is
+printed to stderr. `SC_TMP_BASE` and `SC_RUNS_BASE` override scratch locations.
 
-A pass counts as verified only when every `expect_contains` literal came from the phrase pool the teacher was handed: the tool's own output vocabulary, harvested from its scripts and its documented output, never strings the teacher invented. Literal labels are POOL-EXACT (a whole pool entry), POOL-FRAGMENT (a constant fragment of one), INVENTED (nowhere in the pool, unverified).
+`pass` checks the expected terminal step and all requested literals in recorded
+output or the final answer. Arbitrary workdir files are not evidence. A harness
+setup failure records a failed case, retains preceding results, and returns a
+nonzero status. Ordinary failed assertions are recorded in the report; compile
+can still exit zero, so inspect `summary.fail`.
 
-## Test case format
+Literal labels are `POOL-EXACT`, `POOL-FRAGMENT`, `POOL-DROPPED` (eligible
+vocabulary omitted by a cap), or `INVENTED` (not found in the collected pool).
+Only passes with at least one literal and exclusively exact/fragment labels
+are `VERIFIED`. Other statuses are `GREEN-ON-DROPPED`, `GREEN-ON-INVENTED`,
+`GREEN-NO-LITERALS`, and `FAIL`. Counts are separate in the JSON summary.
 
-Each synthesized test case is a JSON object:
+VERIFIED means vocabulary attestation, not meaningful behavioral coverage.
+Short or common phrases can be weak assertions. Review generated cases and
+include negative cases that should fail. No literal length proves test quality.
+`literal_sources` distinguishes actual captured `TOOL-OUTPUT` from script text,
+documentation, metadata, and unattested strings. Static text alone does not
+prove that a tool emitted it.
 
-```json
-{
-  "name": "short-identifier",
-  "prompt": "exact prompt to send to shellm",
-  "expect": "observation|thought|error",
-  "expect_contains": ["substring1", "substring2"]
-}
-```
+## Pool controls
 
-## Requirements
+`SKILL_POOL_SRC_CAP` (200 per static source), `SKILL_POOL_LIVE_CAP` (80),
+`SKILL_HARVEST_MAX_ENTRIES` (300), and `SKILL_POOL_CAP` (400 combined) limit
+offered vocabulary while retaining eligible omitted entries for provenance.
+History is a sample of up to 300 matching trajectory files, not exhaustive output.
+`SKILL_AUTO_HARVEST=0` disables history reads; otherwise it uses
+`SKILL_HARVEST_TRAJ_DIR`, `TRAJ_DIR`, or `<state-home>/trajectories`.
+`SKILL_HISTORY_POOL` supplies captured history explicitly, and
+`SKILL_REAL_OUTPUT` supplies output for source classification. History JSON uses
+`entries[].line`; metadata fields are never treated as output.
 
-- `llm` CLI (for teacher model calls)
-- `shellm` (for test execution)
-- `jq` (for JSON processing)
-- `SKILLS_DIR` and `SKILLS_KERNEL_DIR` environment variables set (the script defaults to its own parent directory and the kernel dir beside it)
+History caches live under `<state-home>/skill-compiler/history`, overridden by
+`SKILL_HARVEST_CACHE`. TTL is `SKILL_HARVEST_TTL` seconds (3600);
+`SKILL_HARVEST_REFRESH=1` rebuilds. `SKILL_HARVEST_ECHO_FILTER=music` optionally
+filters note/interval echoes; it is off for general skills.
 
-## Future: Trained adapter compilation
-
-This skill currently implements the "fast compiler" (prompt scaffolds + validation). The CbT paper suggests a second phase: training LoRA adapters on the validated examples for fuzzy-spec breakthrough. That would be a separate `skill-compiler-train` skill or mode.
+Generated tests contain `name`, `prompt`, `expect` (`final`, `observation`,
+`shell-output`, or `error`), and optional `expect_contains` strings.

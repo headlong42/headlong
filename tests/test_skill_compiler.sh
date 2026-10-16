@@ -14,7 +14,7 @@ unset IDENTITY_DIR IDENTITY_NAME MEM_DIR TRAJ_DIR TRAJ_ID ROOT_TRAJ_ID 2>/dev/nu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(dirname "$HERE")"
-SC="$REPO/skills/skill-compiler/skill-compiler"
+compiler_source="${SKILL_COMPILER_TEST_SOURCE:-$REPO/skills/skill-compiler/skill-compiler}"
 
 pass=0
 fail=0
@@ -24,12 +24,28 @@ bad() { fail=$((fail+1)); printf 'FAIL %s%s\n' "$1" "${2:+ — $2}"; }
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/sc-test.XXXXXX") || exit 1
 trap 'rm -rf "$WORK"' EXIT
 
+# Isolate all state, credentials and tool configuration, including when run alone.
+for var in $(env | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p'); do
+    case "$var" in
+        SKILL_*|SC_*|HEADLONG_*|SHELLM_*|LLM_*|*_API_KEY|*_TOKEN|MEM_DIR|TRAJ_*|ROOT_TRAJ_ID) unset "$var" ;;
+    esac
+done
+export HOME="$WORK/home" HEADLONG_HOME="$WORK/home/.headlong" SHELLM_ENV=local
+export SC_TMP_BASE="$WORK/tmp" SC_RUNS_BASE="$WORK/runs" SKILL_AUTO_HARVEST=0
+export SKILL_COMPILED_DIR="$WORK/compiler/.compiled"
+mkdir -p "$HOME" "$WORK/compiler" "$SC_TMP_BASE"
+cp "$compiler_source" "$WORK/compiler/skill-compiler"
+SC="$WORK/compiler/skill-compiler"
+
 STUB="$WORK/stubs"
 mkdir -p "$STUB"
 
 cat > "$STUB/llm" <<'STUBLEOF'
 #!/usr/bin/env bash
-[ -n "${STUB_LLM_LOG:-}" ] && printf '%s\n' "$*" >> "$STUB_LLM_LOG"
+if [ -n "${STUB_LLM_LOG:-}" ]; then
+  printf '%s\n' "$*" >> "$STUB_LLM_LOG"
+  cat >> "$STUB_LLM_LOG"
+fi
 if [ "${STUB_MODE:-}" = "many" ]; then
   cat <<'JSONM'
 [{"name":"many-dropped","prompt":"Run the skill and report what it prints.","expect":"final","expect_contains":["zeta phrase 09 stable output"]}]
@@ -158,11 +174,11 @@ fi
 
 # Full compile against the stubs: cache must be self-describing and label every
 # literal's provenance, verifying only on pool-attested vocabulary.
-rm -rf "$REPO/skills/skill-compiler/.compiled/fixture-greet.json" "$REPO/skills/skill-compiler/.compiled/fixture-greet.md"
+rm -rf "$SKILL_COMPILED_DIR/fixture-greet.json" "$SKILL_COMPILED_DIR/fixture-greet.md"
 out=$(run_sc compile --skill fixture-greet --num-tests 3 --max-iterations 3 2>&1); rc=$?
 if [ "$rc" -eq 0 ]; then ok "compile runs end to end against stubs"; else bad "compile runs end to end against stubs" "rc=$rc out=${out:0:300}"; fi
 
-CACHE="$REPO/skills/skill-compiler/.compiled/fixture-greet.json"
+CACHE="$SKILL_COMPILED_DIR/fixture-greet.json"
 if [ -f "$CACHE" ] && jq -e '.summary and .tests' "$CACHE" >/dev/null 2>&1; then
   ok "cache json is self-describing (summary plus tests)"
 else
@@ -197,7 +213,7 @@ else
   bad "verification: only pool-attested passes count as VERIFIED" "status=$(jq -c '[.tests[] | .verification]' "$CACHE" 2>/dev/null)"
 fi
 
-MD_CACHE="$REPO/skills/skill-compiler/.compiled/fixture-greet.md"
+MD_CACHE="$SKILL_COMPILED_DIR/fixture-greet.md"
 if [ -f "$MD_CACHE" ] && grep -q '## Summary: 3 / 3 passed, 2 / 3 verified' "$MD_CACHE" && grep -q '## Pass verification' "$MD_CACHE"; then
   ok "markdown cache carries the summary and the pass verification section"
 else
@@ -238,12 +254,12 @@ if [[ -f "$STUB_LLM_LOG" ]] && grep -q 'PROMPT-EXPECT AGREEMENT' "$STUB_LLM_LOG"
 else
   bad "teacher prompt carries rules 15-18 and the bins install status" "log=$WORK/llm-bins.log"
 fi
-rm -rf "$REPO/skills/skill-compiler/.compiled/fixture-bins.json" "$REPO/skills/skill-compiler/.compiled/fixture-bins.md"
+rm -rf "$SKILL_COMPILED_DIR/fixture-bins.json" "$SKILL_COMPILED_DIR/fixture-bins.md"
 
 # FIX3 2026-09-27: a pinned command line passes when the agent writes the other
 # quote style of the same command (quote-fold matching).
 export STUB_MODE=quote
-rm -f "$REPO/skills/skill-compiler/.compiled/fixture-greet.json"
+rm -f "$SKILL_COMPILED_DIR/fixture-greet.json"
 run_sc compile --skill fixture-greet --num-tests 1 --max-iterations 3 >/dev/null 2>&1 || true
 unset STUB_MODE
 if [[ -f "$CACHE" ]] && jq -e '.tests[0].pass == true' "$CACHE" >/dev/null 2>&1; then
@@ -333,7 +349,7 @@ if [[ "$nfull" =~ ^[0-9]+$ && "$nfull" -gt 6 ]]; then
 else
   bad "fixture-many yields a pool larger than the test cap" "pool entries=$nfull"
 fi
-POOLFILE="$REPO/skills/skill-compiler/.compiled/pool-fixture-many.json"
+POOLFILE="$SKILL_COMPILED_DIR/pool-fixture-many.json"
 export SKILL_POOL_CAP=3
 run_sc pool --skill fixture-many >/dev/null 2>&1 || true
 unset SKILL_POOL_CAP
@@ -344,10 +360,10 @@ else
 fi
 export STUB_MODE=many
 export SKILL_POOL_CAP=3
-rm -f "$REPO/skills/skill-compiler/.compiled/fixture-many.json" "$POOLFILE"
+rm -f "$SKILL_COMPILED_DIR/fixture-many.json" "$POOLFILE"
 run_sc compile --skill fixture-many --num-tests 1 --max-iterations 3 >/dev/null 2>&1 || true
 unset STUB_MODE SKILL_POOL_CAP
-CM="$REPO/skills/skill-compiler/.compiled/fixture-many.json"
+CM="$SKILL_COMPILED_DIR/fixture-many.json"
 if [ -f "$CM" ] && jq -e '.tests[0].literal_labels["zeta phrase 09 stable output"] == "POOL-DROPPED"' "$CM" >/dev/null 2>&1; then
   ok "a dropped-but-real literal is labeled POOL-DROPPED, not INVENTED"
 else
@@ -389,9 +405,10 @@ cat > "$TRAJX/run.jsonl" <<'JSONEOF'
 {"type":"reasoning","cmd":"python3 fixture_echo.py"}
 {"type":"shell-output","stdout":"Notes: A1 B2 C3 D4 E4 F4 G4\nIntervals: major- minor- perfec octave\nVerdict: A1 X9 tune kept in pool"}
 JSONEOF
-export SKILL_HARVEST_CACHE="$WORK/harvest-echo" SKILL_HARVEST_TRAJ_DIR="$TRAJX" SKILL_HARVEST_REFRESH=1 SKILL_HARVEST_MIN_COUNT=1
+export SKILL_AUTO_HARVEST=1 SKILL_HARVEST_ECHO_FILTER=music SKILL_HARVEST_CACHE="$WORK/harvest-echo" SKILL_HARVEST_TRAJ_DIR="$TRAJX" SKILL_HARVEST_REFRESH=1 SKILL_HARVEST_MIN_COUNT=1
 run_sc pool --skill fixture-echo >/dev/null 2>&1 || true
-unset SKILL_HARVEST_CACHE SKILL_HARVEST_TRAJ_DIR SKILL_HARVEST_REFRESH SKILL_HARVEST_MIN_COUNT
+unset SKILL_HARVEST_CACHE SKILL_HARVEST_TRAJ_DIR SKILL_HARVEST_REFRESH SKILL_HARVEST_MIN_COUNT SKILL_HARVEST_ECHO_FILTER
+export SKILL_AUTO_HARVEST=0
 HBLOB="$WORK/harvest-echo/pool-history-fixture-echo.json"
 if [ -f "$HBLOB" ] && jq -e '.echo_dropped == 2 and .invocations >= 1' "$HBLOB" >/dev/null 2>&1; then
   ok "harvest drops note and interval echoes and counts them (echo_dropped 2)"
@@ -403,12 +420,18 @@ if [ -f "$HBLOB" ] && jq -e '[.entries[].line] | any(. == "Verdict: A1 X9 tune k
 else
   bad "a labelled near-miss line survives the echo filter" "entries=$(jq -c '[.entries[].line]' "$HBLOB" 2>/dev/null)"
 fi
-rm -f "$REPO/skills/skill-compiler/.compiled/pool-fixture-echo.json"
+rm -f "$SKILL_COMPILED_DIR/pool-fixture-echo.json"
 
-rm -f "$REPO/skills/skill-compiler/.compiled/fixture-many.json" "$REPO/skills/skill-compiler/.compiled/fixture-many.md" "$POOLFILE"
-rm -f "$REPO/skills/skill-compiler/.compiled/pool-fixture-greet.json"
+rm -f "$SKILL_COMPILED_DIR/fixture-many.json" "$SKILL_COMPILED_DIR/fixture-many.md" "$POOLFILE"
+rm -f "$SKILL_COMPILED_DIR/pool-fixture-greet.json"
 
-rm -f "$REPO/skills/skill-compiler/.compiled/fixture-greet.json"
+rm -f "$SKILL_COMPILED_DIR/fixture-greet.json"
+
+if python3 "$HERE/test_skill_compiler_regressions.py" "$SC" "$WORK/regressions"; then
+  ok "repair regression suite"
+else
+  bad "repair regression suite"
+fi
 
 echo "$pass passed, $fail failed"
 [[ $fail -eq 0 ]]
