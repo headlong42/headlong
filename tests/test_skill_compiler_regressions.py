@@ -41,11 +41,21 @@ if name == 'mkdir':
     os.execv('/bin/mkdir', ['mkdir']+sys.argv[1:])
 if name == 'skills':
     sys.exit(0)
+if name == 'sleep':
+    with (root/'sleeps').open('a') as f: f.write(sys.argv[1]+'\n')
+    sys.exit(0)
 if name == 'llm':
+    counter=root/'teacher-count'
+    n=int(counter.read_text())+1 if counter.exists() else 1
+    counter.write_text(str(n))
     (root/'teacher-args.json').write_text(json.dumps(sys.argv[1:]))
     prompt = sys.stdin.read()
     if not prompt and len(sys.argv)>1: prompt=sys.argv[-1]
     (root/'teacher-prompt').write_text(prompt)
+    if n <= int(os.environ.get('TEACHER_FAILURES','0')):
+        print('synthetic teacher failure',file=sys.stderr)
+        sys.exit(1)
+    if os.environ.get('TEACHER_EMPTY') == '1': sys.exit(0)
     print((root/'tests.json').read_text())
     sys.exit(0)
 if name == 'shellm':
@@ -55,12 +65,30 @@ if name == 'shellm':
     else: prompt=args[-1]
     (root/'shell-prompt').write_text(prompt)
     traj=pathlib.Path(os.environ['TRAJ_DIR']);traj.mkdir(parents=True,exist_ok=True)
-    (traj/'stub.jsonl').write_text((root/'trajectory.jsonl').read_text())
+    if os.environ.get('NO_TRAJECTORY') != '1':
+        run_id='new-root-run'
+        header=[dict(type='trajectory',step_id='new-root-trajectory'),
+                dict(type='shellm-run',step_id=run_id)]
+        rows=[json.loads(line) for line in (root/'trajectory.jsonl').read_text().splitlines()]
+        rows=[dict(r,run_id=r.get('run_id',run_id)) for r in rows]
+        parent=traj/'root';parent.mkdir()
+        (parent/'trajectory.jsonl').write_text(''.join(json.dumps(r,separators=(',',':'))+'\n' for r in header+rows))
+        if os.environ.get('SHELLM_RUN_ID_OUT') and os.environ.get('NO_RUN_HANDSHAKE') != '1':
+            pathlib.Path(os.environ['SHELLM_RUN_ID_OUT']).write_text(run_id)
+        if os.environ.get('NESTED_TRAJECTORY') == '1':
+            child=parent/'child';child.mkdir()
+            child_rows=[dict(type='trajectory',step_id='child',parent_traj='new-root-trajectory'),
+                        dict(type='shellm-run',step_id='child-run'),
+                        dict(type='final',content='Child-only success',run_id='child-run')]
+            (child/'trajectory.jsonl').write_text(''.join(json.dumps(r,separators=(',',':'))+'\n' for r in child_rows))
+        if os.environ.get('AMBIGUOUS_ROOT') == '1':
+            (traj/'duplicate.jsonl').write_text((parent/'trajectory.jsonl').read_text())
     if (root/'fixture.txt').exists():
         (pathlib.Path(os.environ['SHELLM_RUNDIR'])/'input.txt').write_text((root/'fixture.txt').read_text())
-    sys.exit(0)
+    print('synthetic runner diagnostic',file=sys.stderr)
+    sys.exit(int(os.environ.get('RUNNER_RC','0')))
 '''
-for name in ('llm', 'shellm', 'skills', 'jq', 'python3', 'mkdir'):
+for name in ('llm', 'shellm', 'skills', 'jq', 'python3', 'mkdir', 'sleep'):
     p = STUBS / name
     p.write_text('#!' + PYTHON + '\n' + STUB)
     p.chmod(0o755)
@@ -88,8 +116,7 @@ class Case:
         self.root.mkdir()
         self.skills = self.root / 'skills & #'
         self.skills.mkdir()
-        self.cache = SC.parent / '.compiled'
-        shutil.rmtree(self.cache, ignore_errors=True)
+        self.cache = self.root / 'compiled'
         self.env = dict(os.environ)
         for key in list(self.env):
             if key.startswith(('SKILL_', 'SC_', 'SHELLM_', 'HEADLONG_', 'LLM_', 'TRAJ_', 'MEM_', 'ROOT_TRAJ_')):
@@ -120,7 +147,7 @@ class Case:
         (self.root/'trajectory.jsonl').write_text(''.join(json.dumps(r,separators=(',',':'))+'\n' for r in records))
 
     def run(self, command='compile', skill='probe', extra=(), success=True):
-        r=subprocess.run(['/bin/bash' if sys.platform=='darwin' else 'bash', str(SC), command, '--skill',skill,*extra],
+        r=subprocess.run([os.environ.get('SC_TEST_BASH', '/bin/bash' if sys.platform=='darwin' else 'bash'), str(SC), command, '--skill',skill,*extra],
                          env=self.env,cwd=self.root,text=True,capture_output=True,timeout=90)
         with (self.root/'commands.log').open('a') as f:
             f.write(f'{command} {skill}: rc={r.returncode}\n'+r.stdout+r.stderr)
@@ -330,6 +357,177 @@ def history_defaults():
     legacy=c.root/'home'/'.shellm';shutil.copytree(c.root/'state',legacy)
     pool=json.loads(c.run('pool').stdout);assert 'Verdict line from history' in pool
 check('state-home history, reusable TTL and opt-in music filter',history_defaults)
+
+
+
+def teacher_bytes():
+    c=Case('teacher-bytes')
+    body=r'cd x && y; literal \path\ and __SKILL_ABS__ __NUM_TESTS__ __BINS_STATUS__'
+    phrase=r'alpha & beta \slash __SKILL_SPEC__ __SKILL_ABS__'
+    c.skill('probe',body+'\n','print('+repr(phrase)+')\n')
+    c.run(); text=(c.root/'teacher-prompt').read_text()
+    spec,_=json.JSONDecoder().raw_decode(text.split('SKILL SPECIFICATION (JSON):\n')[1])
+    pool,_=json.JSONDecoder().raw_decode(text.split('PHRASE POOL (verbatim vocabulary, not a claim of behavioral coverage):\n')[1])
+    offered=json.loads((c.cache/'pool-probe.json').read_text())['offered']
+    assert spec['body']==body+'\n',spec['body']
+    assert pool==offered and phrase in pool
+    assert str(c.skills/'probe')+'/<file>' in text
+check('verbatim teacher interpolation, ampersands, backslashes and placeholder data',teacher_bytes)
+
+
+def ranking():
+    c=Case('ranking');c.skill('probe','Example `aaa documentation phrase`.\n','print("zzz live script phrase")\n')
+    c.env['SKILL_POOL_CAP']='1'
+    assert json.loads(c.run('pool').stdout)==['zzz live script phrase']
+check('script and live source priority survives combined cap',ranking)
+
+
+def history_ranking():
+    c=Case('history-ranking')
+    h=c.root/'history.json'
+    h.write_text(json.dumps(dict(entries=[dict(line='aaa rare output',count=2),dict(line='zzz frequent output',count=100),dict(line='zzz frequent output',count=100)])))
+    c.env.update(SKILL_HISTORY_POOL=str(h),SKILL_HARVEST_MAX_ENTRIES='1',SKILL_POOL_CAP='100')
+    pool=json.loads(c.run('pool').stdout)
+    assert 'zzz frequent output' in pool and 'aaa rare output' not in pool
+    dropped=json.loads((c.cache/'pool-probe.json').read_text())['dropped']
+    assert 'aaa rare output' in dropped
+check('history frequency survives source cap and deduplication',history_ranking)
+
+
+def outcome(expect):
+    c=Case('outcome-'+expect)
+    c.tests([dict(name='outcome',prompt='Run the probe.',expect=expect,expect_contains=[])])
+    def run(rows,rc,want,harness=False):
+        (c.root/'trajectory.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in rows))
+        c.env['RUNNER_RC']=str(rc)
+        r=c.run(success=False);test=c.result()['tests'][0]
+        assert test['pass'] is want,(expect,rows,rc,test)
+        assert ('harness_error' in test) is harness
+        assert (r.returncode!=0) is harness
+        assert test['runner_stderr']=='synthetic runner diagnostic\n'.rstrip('\n')
+    named=dict(type=expect,content='Actual evidence')
+    if expect=='shell-output': named=dict(type=expect,stdout='Actual evidence',**{'exit':0})
+    if expect=='error': named=dict(type='shell-output',stderr='Actual skill failure',**{'exit':2})
+    # First assert the reported false-positive path on the original compiler.
+    run([] if expect=='error' else [named],1,False,True)
+    # Each outcome also has a valid case without requiring an unrelated final.
+    run([named],0,True)
+    run([dict(type='reasoning',content='Still planning')],0,False)
+    if expect in ('observation','shell-output'):
+        run([dict(type='final',content='Wrong evidence kind')],0,False)
+    run([],1,False,True)
+    run([named],1,False,True)
+    if expect=='error':
+        run([dict(type='error',content='Provider failed',reason='stall')],0,False)
+        run([dict(type='shell-output',stderr='No failure',**{'exit':0})],0,False)
+        run([dict(type='shell-output',stderr='Timed out',timed_out=True,**{'exit':124})],0,False)
+    else:
+        run([dict(type=expect,content=' ',stdout='')],0,False)
+    literal='Actual skill failure' if expect=='error' else 'Actual evidence'
+    c.tests([dict(name='named-literal',prompt='Run the probe.',expect=expect,expect_contains=[literal])])
+    run([named],0,True)
+    # Literals cannot rescue an unsuccessful runner, including a final answer.
+    c.tests([dict(name='attested-failure',prompt='Run the probe.',expect=expect,expect_contains=['Victory phrase stable'])])
+    run([dict(named,content='Victory phrase stable',stdout='Victory phrase stable')],1,False,True)
+    assert c.result()['tests'][0]['verification']=='FAIL'
+for expected in ('final','observation','shell-output','error'):
+    check('runner success and named evidence for '+expected,lambda e=expected:outcome(e))
+
+
+def root_selection():
+    c=Case('root-selection');c.env['NESTED_TRAJECTORY']='1'
+    c.tests([dict(name='root',prompt='Run the probe.',expect='final',expect_contains=[])])
+    def rows(values): (c.root/'trajectory.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in values))
+    # Root is unfinished, child and a different run in the root file have finals.
+    rows([dict(type='reasoning',content='Planning'),dict(type='final',content='Other run',run_id='other-run')])
+    c.run();t=c.result()['tests'][0];assert not t['pass'] and t['final']==''
+    c.env['RUNNER_RC']='1';c.run(success=False);assert not c.result()['tests'][0]['pass']
+    c.env['RUNNER_RC']='0';rows([dict(type='final',content='Root success')]);c.run()
+    assert c.result()['tests'][0]['final']=='Root success'
+    c.tests([dict(name='child-literal',prompt='Run the probe.',expect='final',expect_contains=['Child-only success'])])
+    c.run();assert not c.result()['tests'][0]['pass']
+    for key in ('NO_RUN_HANDSHAKE','AMBIGUOUS_ROOT','NO_TRAJECTORY'):
+        c.env[key]='1';r=c.run(success=False);t=c.result()['tests'][0]
+        assert r.returncode!=0 and not t['pass'] and 'harness_error' in t,key
+        del c.env[key]
+check('actual root handshake excludes nested and unrelated run evidence',root_selection)
+
+
+def probe_isolation(kind):
+    c=Case('probe-isolation-'+kind);live=c.root/'pretend-live';live.mkdir()
+    paths=('MEM_DIR','TRAJ_DIR','SHELLM_TRAJ_DIR','HEADLONG_HOME','SHELLM_HOME','SHELLM_CONF_DIR','SHELLM_ENVS_DIR')
+    for k in paths:
+        d=live/k;d.mkdir();(d/'sentinel').write_text('unchanged');c.env[k]=str(d)
+    c.env.update(IDENTITY_DIR=str(live),IDENTITY_NAME='synthetic-live',TRAJ_ID='caller',ROOT_TRAJ_ID='caller',
+                 _SHELLM_PARENT_TRAJ_ID='caller',SHELLM_RUN_ID_OUT=str(live/'caller-handshake'))
+    (c.skills/'probe'/'probe.py').write_text(
+        'import os,pathlib\n'
+        'for k in '+repr(paths)+':\n p=pathlib.Path(os.environ[k]);(p/"probe-wrote").write_text("synthetic")\n'
+        'assert not any(os.environ.get(k) for k in ("IDENTITY_DIR","IDENTITY_NAME","TRAJ_ID","ROOT_TRAJ_ID","_SHELLM_PARENT_TRAJ_ID","SHELLM_RUN_ID_OUT"))\n'
+        'print("".join(["Isolated", " probe executed"]))\n')
+    if kind=='sh':
+        (c.skills/'probe'/'SKILL.md').write_text('---\nname: probe\n---\nRun probe.sh\n')
+        (c.skills/'probe'/'probe.sh').write_text('exec python3 "$(dirname "$0")/probe.py" "$@"\n')
+    for cmd in ('pool','compile'):
+        r=c.run(cmd)
+        offered=json.loads(r.stdout) if cmd=='pool' else json.loads((c.cache/'pool-probe.json').read_text())['offered']
+        assert 'Isolated probe executed' in offered
+        assert sorted(str(p.relative_to(live)) for p in live.rglob('*') if p.is_file())==sorted(k+'/sentinel' for k in paths)
+for kind in ('py','sh'):
+    check(kind+' pool and compile probes isolate identity-selected state',lambda k=kind:probe_isolation(k))
+
+
+def matching_and_missed():
+    c=Case('matching-and-missed')
+    c.tests([dict(name='case',prompt='Run the probe.',expect='final',expect_contains=['Hello','Hello world'])])
+    c.output('hello world');c.run();assert c.result()['tests'][0]['pass']
+check('word and phrase case matching are consistent',matching_and_missed)
+
+
+def missing_json():
+    c=Case('missing-json')
+    missed=['a | b', 'quote " and \\ slash', 'line one\nline two']
+    c.tests([dict(name='missing',prompt='Run the probe.',expect='final',expect_contains=missed)])
+    c.run();assert c.result()['tests'][0]['expect_contains_missed']==missed
+check('missing-literal JSON preserves pipes, quotes, backslashes and newlines',missing_json)
+
+
+def cap_validation():
+    c=Case('cap-validation')
+    for name in ('SKILL_POOL_CAP','SKILL_POOL_SRC_CAP','SKILL_POOL_LIVE_CAP','SKILL_HARVEST_MAX_ENTRIES'):
+        for value in ('abc','-1','2.5',''):
+            c.env[name]=value;r=c.run('pool',success=False)
+            assert r.returncode!=0 and name in r.stderr and 'nonnegative integer' in r.stderr,(name,value,r.stderr)
+        for value in ('0','200 ',' 02 '):
+            c.env[name]=value;c.run('pool')
+        del c.env[name]
+check('caps validate domain and name bad settings, accepting surrounding whitespace',cap_validation)
+
+
+def teacher_failures():
+    for mode in ('failure','empty','recover'):
+        c=Case('teacher-'+mode)
+        if mode=='empty': c.env['TEACHER_EMPTY']='1'
+        else: c.env['TEACHER_FAILURES']='2' if mode=='recover' else '4'
+        r=c.run(success=False)
+        assert (r.returncode==0)==(mode=='recover'),r.stderr
+        assert (c.root/'sleeps').read_text().splitlines()==(['5','10'] if mode=='recover' else ['5','10','15'])
+        if mode!='recover': assert 'llm configured default' in r.stderr and not (c.root/'shell-prompt').exists()
+    c=Case('teacher-invalid-json');(c.root/'tests.json').write_text('invalid')
+    assert c.run(success=False).returncode!=0 and not (c.root/'shell-prompt').exists()
+check('teacher retry recovery, final delay, empty/invalid responses and default diagnostic',teacher_failures)
+
+
+def direct_cache():
+    global SC
+    original=SC;copy=ROOT/'direct-compiler';copy.mkdir()
+    shutil.copyfile(SC,copy/'skill-compiler');cache=copy/'.compiled';cache.mkdir()
+    sentinel=cache/'sentinel';sentinel.write_text('retain')
+    try:
+        SC=copy/'skill-compiler';c=Case('direct-cache');c.run()
+        assert sentinel.read_text()=='retain' and c.cache.parent==c.root
+    finally: SC=original
+check('direct helper leaves sibling cache untouched',direct_cache)
 
 print(f'{count-failed} regression checks passed, {failed} failed',flush=True)
 sys.exit(bool(failed))

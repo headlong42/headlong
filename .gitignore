@@ -34,6 +34,3 @@ handoff/
 # stray backup files
 *.bak
 *.bak.*
-
-# skill-compiler caches (compiled adapters)
-.compiled/

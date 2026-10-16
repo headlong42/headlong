@@ -71,6 +71,16 @@ cat > "$STUB/shellm" <<'STUBLEOF'
 #!/usr/bin/env bash
 [ -n "${STUB_SHELLM_LOG:-}" ] && printf '%s\n' "$*" >> "$STUB_SHELLM_LOG"
 : "${TRAJ_DIR:?stub shellm needs TRAJ_DIR}"
+finish_trajectory() {
+    local f="$TRAJ_DIR/stub-run.jsonl"
+    [[ -f "$f" ]] || return 0
+    jq -c '. + {run_id:"stub-root-run"}' "$f" > "$f.rows"
+    printf '%s\n' '{"type":"trajectory","step_id":"new-trajectory-id"}' '{"type":"shellm-run","step_id":"stub-root-run"}' > "$f"
+    cat "$f.rows" >> "$f"
+    rm "$f.rows"
+    [[ -z "${SHELLM_RUN_ID_OUT:-}" ]] || printf '%s' stub-root-run > "$SHELLM_RUN_ID_OUT"
+}
+trap finish_trajectory EXIT
 mkdir -p "$TRAJ_DIR"
 if [ "${STUB_MODE:-}" = "many" ]; then
   {

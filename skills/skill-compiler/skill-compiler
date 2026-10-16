@@ -200,32 +200,24 @@ PY
 # "test 2" cannot ride on "test 21", while letter welds like
 # "Example Domainbody{...}" keep matching as GLUE-FIX requires and a clean
 # occurrence later in the same text still wins. Single words keep whole-word
-# matching via grep -w in the single-word branch.
+# matching in the single-word branch; both branches ignore case.
 _phrase_match() {
-    local out phrase_file
+    local phrase_file rc=0
     phrase_file=$(mktemp "$TMPDIR/phrase.XXXXXX") || return 1
-    printf '%s\n' "$1" > "$phrase_file"
-    out=$(awk -v phrase_file="$phrase_file" '
-        BEGIN { getline p < phrase_file; close(phrase_file); if (length(p) == 0) exit }
-        {
-            n = length(p); hay = $0; off = 0
-            fw = substr(p, 1, 1); lw = substr(p, n, 1)
-            while (1) {
-                i = index(substr(hay, off + 1), p)
-                if (i == 0) break
-                s = off + i; e = s + n - 1
-                prev = (s > 1) ? substr(hay, s - 1, 1) : ""
-                nxt = substr(hay, e + 1, 1)
-                okp = (fw !~ /[0-9]/ || prev !~ /[0-9]/)
-                okn = (lw !~ /[0-9]/ || nxt !~ /[0-9]/)
-                if (okp && okn) { found = 1; break }
-                off = s
-            }
-        }
-        END { print (found ? "match" : "nomatch") }
-    ')
+    printf '%s' "$1" > "$phrase_file"
+    python3 -c '
+import re,sys
+lit=open(sys.argv[1]).read()
+left=r"(?<![0-9])" if lit[:1].isdigit() else ""
+right=r"(?![0-9])" if lit[-1:].isdigit() else ""
+p=re.compile(left + re.escape(lit) + right, re.I)
+found=False
+for line in sys.stdin:
+    if lit and p.search(line): found=True
+raise SystemExit(0 if found else 1)
+' "$phrase_file" || rc=$?
     rm -f "$phrase_file"
-    [[ "$out" == "match" ]]
+    return "$rc"
 }
 
 # Exact-line subtraction avoids BSD grep's memory blowup on long patterns.
@@ -383,8 +375,38 @@ PY
     [[ -s "$cache" ]] || return 1
     printf '%s\n' "$cache"
 }
+# Caps are counts, not jq slices with implicit coercion or fallback defaults.
+_sc_cap() {
+    python3 - "$1" "$2" <<'PY_CAP'
+import re, sys
+name, value = sys.argv[1:]
+if not re.fullmatch(r"\s*[0-9]+\s*", value):
+    raise SystemExit(name + " must be a nonnegative integer (got " + repr(value) + ")")
+print(int(value))
+PY_CAP
+}
+
+# Keep identity-selected paths disposable for both probe and test execution.
+# Credentials/model configuration remain available; this is not an OS sandbox.
+_sc_isolate_state() {
+    local root="$1"
+    unset IDENTITY_DIR IDENTITY_NAME TRAJ_ID ROOT_TRAJ_ID SHELLM_RUN_STEP_ID
+    unset _SHELLM_PARENT_TRAJ_ID _SHELLM_PARENT_RUN _SHELLM_ROOT_RUNDIR
+    unset SHELLM_RUN_ID_OUT SHELLM_TRIGGER_STEP_ID SHELLM_LAUNCHED_BY SHELLM_ACTIVITY_FILE
+    export HEADLONG_HOME="$root/state" SHELLM_HOME="$root/state"
+    export SHELLM_CONF_DIR="$root/state" SHELLM_ENVS_DIR="$root/state/envs"
+    export MEM_DIR="$root/memories" TRAJ_DIR="$root/traj" SHELLM_TRAJ_DIR="$root/traj"
+    export SHELLM_RUNDIR="$root" SHELLM_WORKDIR="$root" SHELLM_WORKDIRS_DIR="$root/workdirs"
+    mkdir -p "$HEADLONG_HOME" "$MEM_DIR" "$TRAJ_DIR" "$SHELLM_WORKDIRS_DIR" "$SHELLM_ENVS_DIR"
+}
+
 capture_phrase_pool() {
     local skill_abs="$1"
+    local cap src_cap live_cap hist_cap
+    cap=$(_sc_cap SKILL_POOL_CAP "${SKILL_POOL_CAP-400}") || return 1
+    src_cap=$(_sc_cap SKILL_POOL_SRC_CAP "${SKILL_POOL_SRC_CAP-200}") || return 1
+    live_cap=$(_sc_cap SKILL_POOL_LIVE_CAP "${SKILL_POOL_LIVE_CAP-80}") || return 1
+    hist_cap=$(_sc_cap SKILL_HARVEST_MAX_ENTRIES "${SKILL_HARVEST_MAX_ENTRIES-300}") || return 1
     [[ -d "$skill_abs" ]] || { printf '[]'; return 0; }
     rm -f "$COMPILED_DIR/pool-$(basename "${skill_abs%/}").json" || return 1
     local src_pool
@@ -445,10 +467,16 @@ PY
         local tmp
         tmp=$(mktemp -d 2>/dev/null || echo /tmp/phrase-pool.$$)
         mkdir -p "$tmp"
-        case "$script" in
-            *.py) ( cd "$tmp" && _sc_bounded 15 python3 "$script" --help; cd "$tmp" && _sc_bounded 15 python3 "$script" ) 2>/dev/null || true ;;
-            *.sh) ( cd "$tmp" && _sc_bounded 15 bash "$script" --help; cd "$tmp" && _sc_bounded 15 bash "$script" ) 2>/dev/null || true ;;
-        esac | sed '/^[[:space:]]*$/d' | awk '!seen[$0]++' | _sc_jq -Rsc 'split("\n") | map(select(length>0))' > "$tmp/live.json" 2>/dev/null || printf '[]' > "$tmp/live.json"
+        (
+            _sc_isolate_state "$tmp" || exit 1
+            cd "$tmp" || exit 1
+            case "$script" in
+                *.py) _sc_bounded 15 python3 "$script" --help || true
+                      _sc_bounded 15 python3 "$script" || true ;;
+                *.sh) _sc_bounded 15 bash "$script" --help || true
+                      _sc_bounded 15 bash "$script" || true ;;
+            esac
+        ) 2>/dev/null | sed '/^[[:space:]]*$/d' | awk '!seen[$0]++' | _sc_jq -Rsc 'split("\n") | map(select(length>0))' > "$tmp/live.json" 2>/dev/null || printf '[]' > "$tmp/live.json"
         live_pool=$(cat "$tmp/live.json")
         rm -rf "$tmp"
     fi
@@ -545,20 +573,20 @@ PY
         hist_src=$(harvest_history_pool "$skill_abs" || true)
     fi
     if [[ -n "$hist_src" && -f "$hist_src" ]]; then
-        hist_pool=$(_sc_jq -c 'if type=="array" then . else [(.entries // [])[] | .line // empty] end | map(select(type=="string")) | unique' "$hist_src" 2>/dev/null || printf '[]')
+        hist_pool=$(_sc_jq -c 'def stable_unique: reduce .[] as $v ({seen:{}, out:[]}; if .seen[$v] then . else .seen[$v]=true | .out += [$v] end) | .out;
+          if type=="array" then . else [(.entries // [] | sort_by(-(.count // 0)))[] | .line // empty] end | map(select(type=="string")) | stable_unique' "$hist_src" 2>/dev/null || printf '[]')
     fi
-    local cap="${SKILL_POOL_CAP:-400}"
-    [[ "$cap" =~ ^[0-9]+$ ]] || cap=400
     local pool_json
     pool_json=$(_sc_jq -cn --argjson src "$src_pool" --argjson live "$live_pool" --argjson doc "$doc_pool" --argjson hist "$hist_pool" \
-        --argjson cap "$cap" --argjson src_cap "${SKILL_POOL_SRC_CAP:-200}" \
-        --argjson live_cap "${SKILL_POOL_LIVE_CAP:-80}" --argjson hist_cap "${SKILL_HARVEST_MAX_ENTRIES:-300}" '
-        def capped($n): .[:([$n, 0] | max)];
-        ($src + $live + $doc + $hist | unique) as $all
-        | (($src | capped($src_cap)) + ($doc | capped($src_cap)) + ($live | capped($live_cap)) + ($hist | capped($hist_cap)) | unique | capped($cap)) as $offered
+        --argjson cap "$cap" --argjson src_cap "$src_cap" \
+        --argjson live_cap "$live_cap" --argjson hist_cap "$hist_cap" '
+        def stable_unique: reduce .[] as $v ({seen:{}, out:[]}; if .seen[$v] then . else .seen[$v]=true | .out += [$v] end) | .out;
+        def capped($n): .[:$n];
+        ($src + $live + $hist + $doc | stable_unique) as $all
+        | (($src | capped($src_cap)) + ($live | capped($live_cap)) + ($hist | capped($hist_cap)) + ($doc | capped($src_cap)) | stable_unique | capped($cap)) as $offered
         | {offered: $offered, dropped: ($all - $offered), pool_total: ($all | length),
            pool_offered: ($offered | length), pool_dropped: (($all - $offered) | length),
-           pool_version: "v6-source-caps"}') || return 1
+           pool_version: "v7-ranked-source-caps"}') || return 1
     if [[ -n "${COMPILED_DIR:-}" ]]; then
         mkdir -p "$COMPILED_DIR" 2>/dev/null || true
         printf '%s' "$pool_json" > "$COMPILED_DIR/pool-$(basename "${skill_abs%/}").json" || return 1
@@ -611,6 +639,9 @@ Generate validation cases for a Headlong skill. Skills are procedural SKILL.md
 files loaded with skills show; they are not automatically executable commands.
 Return only a JSON array with __NUM_TESTS__ objects. Each has name, prompt,
 expect (final, observation, shell-output, or error), and expect_contains (strings).
+Every case requires a successful runner. final needs an answer; observation and
+shell-output need their named output, without requiring a final answer. error
+means a recorded command failure, never a provider outage or runner failure.
 
 Use the specification and usage syntax exactly. Build all required fixtures in
 the test workdir. For git tasks create a new repository in a subdirectory, stage
@@ -641,26 +672,29 @@ BINARIES THIS SKILL DECLARES, AND WHETHER THE TEST ENVIRONMENT HAS THEM:
 __BINS_STATUS__
 PROMPT_EOF
 )
-    prompt=${prompt//__PHRASE_POOL__/$phrase_pool}
-
-    # Replace placeholders
-    prompt="${prompt/__SKILL_SPEC__/$skill_spec}"
-    prompt="${prompt/__NUM_TESTS__/$num_tests}"
-    prompt="${prompt//__BINS_STATUS__/$bins_status}"
-    [ -n "$skill_abs" ] || skill_abs="${SKILLS_DIR:-}"
-    prompt="${prompt//__SKILL_ABS__/$skill_abs}"
+    # One callback pass over the original template: replacement data is literal
+    # on Bash 3.2 and 5.2, and placeholder-looking input is never expanded again.
+    local replacements="$TMPDIR/teacher-inputs.json"
+    _sc_jq -n --arg spec "$skill_spec" --arg pool "$phrase_pool" --arg bins "$bins_status" \
+        --arg num "$num_tests" --arg path "${skill_abs:-$SKILLS_DIR}" \
+        '{__SKILL_SPEC__:$spec, __PHRASE_POOL__:$pool, __BINS_STATUS__:$bins, __NUM_TESTS__:$num, __SKILL_ABS__:$path}' > "$replacements"
+    prompt=$(printf '%s' "$prompt" | python3 -c '
+import json,re,sys
+values=json.load(open(sys.argv[1]))
+print(re.sub("|".join(map(re.escape,values)), lambda m: values[m[0]], sys.stdin.read()),end="")
+' "$replacements")
 
     local -a teacher_args=()
     [[ -z "$teacher_model" ]] || teacher_args=(-m "$teacher_model")
     local tests_json llm_rc attempt
     for attempt in 1 2 3 4; do
-        llm_err_file="${TMPDIR:-/tmp}/teacher-stderr.$$"; tests_json=$(printf '%s' "$prompt" | llm ${teacher_args[@]+"${teacher_args[@]}"} 2>"$llm_err_file")
-        llm_rc=$?
+        llm_err_file="${TMPDIR:-/tmp}/teacher-stderr.$$"
+        if tests_json=$(printf '%s' "$prompt" | llm ${teacher_args[@]+"${teacher_args[@]}"} 2>"$llm_err_file"); then llm_rc=0; else llm_rc=$?; fi
         [ "$llm_rc" -eq 0 ] && [ -n "$tests_json" ] && break
-        sleep $((attempt * 5))
+        [[ "$attempt" -eq 4 ]] || sleep $((attempt * 5))
     done
-    [ "$llm_rc" -eq 0 ] || die "Teacher model call failed (rc=$llm_rc, model=$teacher_model): ${tests_json:0:500} stderr: $(head -c 300 "$llm_err_file" 2>/dev/null)"
-    [ -n "$tests_json" ] || die "Teacher model returned empty output (model=$teacher_model)"
+    [ "$llm_rc" -eq 0 ] || die "Teacher model call failed (rc=$llm_rc, model=${teacher_model:-llm configured default}): ${tests_json:0:500} stderr: $(head -c 300 "$llm_err_file" 2>/dev/null)"
+    [ -n "$tests_json" ] || die "Teacher model returned empty output (model=${teacher_model:-llm configured default})"
 
     # Extract JSON array from response (handle potential markdown fences)
     extracted=$(printf '%s' "$tests_json" | python3 -c '
@@ -739,17 +773,8 @@ print(re.sub(r"(?<![/A-Za-z0-9_.-])skills/", lambda m:root, sys.stdin.read()), e
 
     export SKILLS_DIR="$SKILLS_DIR"
     export SKILLS_KERNEL_DIR="$KERNEL_DIR"
-    export TRAJ_DIR="$traj_dir"
-    export TRAJ_ID="$test_traj_id"
-    export SHELLM_TRAJ_DIR="$traj_dir"
-    export SHELLM_RUNDIR="$rundir"
-
-    # STORE-ISOLATION 2026-09-22: give the test agent a throwaway memory store.
-    # Test runs used to inherit MEM_DIR pointing at live identity memories, so
-    # skills like goal-review wrote fabricated goals straight into the real store.
-    local test_mem_dir="$rundir/memories"
-    mkdir -p "$test_mem_dir" || die "cannot create test mem dir: $test_mem_dir"
-    export MEM_DIR="$test_mem_dir"
+    _sc_isolate_state "$rundir" || die "cannot create test state: $rundir"
+    export SHELLM_RUN_ID_OUT="$rundir/root-run-id"
 
     # Get skills prompt to include in the test
     local skills_prompt
@@ -788,59 +813,61 @@ ${skill_content}"
     export LLM_PROVIDER="${LLM_PROVIDER:-}"
 
     printf '%s' "$full_prompt" > "$rundir/prompt.txt"
-    shellm --max-iterations "$max_iterations" --workdir "$rundir" --prompt-file "$rundir/prompt.txt" >/dev/null 2>&1 || rc=$?
+    ( cd "$rundir" && shellm --max-iterations "$max_iterations" --workdir "$rundir" --prompt-file "$rundir/prompt.txt" ) >"$rundir/runner.stdout" 2>"$rundir/runner.stderr" || rc=$?
 
-    # Find the trajectory file
-    local actual_traj_file
-    actual_traj_file=$(find "$traj_dir" -name "*.jsonl" -o -name "*.json" 2>/dev/null | head -1)
-
-    local last_step_type="" last_step_content="" final_content=""
-    if [[ -n "$actual_traj_file" && -f "$actual_traj_file" ]]; then
-        # Get the last step type and content
-        local last_line
-        last_line=$(tail -1 "$actual_traj_file")
-        last_step_type=$(printf '%s' "$last_line" | _sc_jq -r '.type // empty')
-        last_step_content=$(printf '%s' "$last_line" | _sc_jq -r '.content // empty')
-
-        # Also get the final answer if present
-        final_content=$(grep '"type":"final"' "$actual_traj_file" | tail -1 | _sc_jq -r '.content // empty' 2>/dev/null || true)
-        [[ -z "$final_content" ]] && final_content=$(grep '"type":"final"' "$actual_traj_file" | tail -1 | _sc_jq -r '.details // empty' 2>/dev/null || true)
-
-        # If there's a final step, use its type for pass/fail determination
-        if [[ -n "$final_content" ]]; then
-            local final_step_type
-            final_step_type=$(grep '"type":"final"' "$actual_traj_file" | tail -1 | _sc_jq -r '.type // empty')
-            if [[ "$final_step_type" == "final" ]]; then
-                last_step_type="final"
-                last_step_content="$final_content"
-            fi
-        fi
+    # shellm creates a new trajectory ID. Its launcher handshake identifies the
+    # actual run header; a child's final or another run's rows are never evidence.
+    local actual_traj_file="$rundir/root-evidence.jsonl" harness_error=""
+    if ! python3 - "$traj_dir" "$SHELLM_RUN_ID_OUT" "$actual_traj_file" 2>"$rundir/selection.stderr" <<'PY_ROOT'
+import json, pathlib, sys
+root, id_path, out = map(pathlib.Path, sys.argv[1:])
+try:
+    run_id = id_path.read_text().strip()
+    if not run_id: raise ValueError("missing root run ID")
+    matches = []
+    for p in sorted(root.rglob("*")):
+        if not p.is_file() or p.suffix not in (".jsonl", ".json"): continue
+        with p.open() as f:
+            try: meta = json.loads(next(f))
+            except (ValueError, StopIteration): continue
+            if not isinstance(meta, dict) or meta.get("type") != "trajectory": continue
+            if meta.get("parent_traj") or meta.get("parent"): continue
+            rows = [json.loads(line) for line in f if line.strip()]
+        if any(r.get("type") == "shellm-run" and r.get("step_id") == run_id for r in rows):
+            matches.append([r for r in rows if r.get("run_id") == run_id])
+    if len(matches) != 1: raise ValueError("expected exactly one root trajectory for launched run")
+    with out.open("w") as f:
+        for r in matches[0]: f.write(json.dumps(r) + "\n")
+except (OSError, ValueError, TypeError, AttributeError) as e:
+    raise SystemExit("cannot select root run: " + str(e))
+PY_ROOT
+    then
+        harness_error=$(cat "$rundir/selection.stderr")
+        : > "$actual_traj_file"
     fi
+    [[ "$rc" -eq 0 ]] || harness_error="shellm runner failed (exit $rc)${harness_error:+; $harness_error}"
+    local runner_stderr
+    runner_stderr=$(head -c 2000 "$rundir/runner.stderr")
+    local last_step_type last_step_content final_content
+    last_step_type=$(_sc_jq -rs 'last.type // ""' "$actual_traj_file")
+    last_step_content=$(_sc_jq -rs 'last.content // ""' "$actual_traj_file")
+    final_content=$(_sc_jq -rs '[.[] | select(.type=="final") | .content // .details // ""] | last // ""' "$actual_traj_file")
 
-    # Determine pass/fail
-    local pass=false
-    local final_len=0
+    # Every expectation requires a successful runner. Error means a recorded
+    # command failure, not a provider error or shellm stall. Non-final outcomes
+    # require their named evidence and do not require a final answer.
+    local pass=false final_len
     final_len=$(printf '%s' "$final_content" | tr -d '[:space:]' | wc -c | tr -d ' ')
-    if [[ "$expect" == "final" ]]; then
-        # For "final" expectation, we accept either a final step OR an observation step that contains the answer
-        if [[ "$last_step_type" == "final" ]] || [[ "$last_step_type" == "observation" ]] || [[ "$last_step_type" == "reasoning" ]] || [[ "$last_step_type" == "shell-output" ]]; then
-            [[ "$final_len" -gt 0 ]] && pass=true
-        fi
-    elif [[ "$expect" == "observation" ]]; then
-        # For "observation" expectation, we accept observation, final, or reasoning (agent often answers in reasoning)
-        if [[ "$last_step_type" == "observation" ]] || [[ "$last_step_type" == "final" ]] || [[ "$last_step_type" == "reasoning" ]]; then
-            pass=true
-        fi
-    elif [[ "$expect" == "shell-output" ]]; then
-        # For "shell-output" expectation, we accept shell-output, final, or reasoning
-        if [[ "$last_step_type" == "shell-output" ]] || [[ "$last_step_type" == "final" ]] || [[ "$last_step_type" == "reasoning" ]]; then
-            pass=true
-        fi
-    elif [[ "$expect" == "error" ]]; then
-        # For "error" expectation, we accept error or non-zero exit
-        if [[ "$last_step_type" == "error" ]] || [[ "$rc" -ne 0 ]]; then
-            pass=true
-        fi
+    if [[ -z "$harness_error" ]]; then
+        case "$expect" in
+            final) [[ "$final_len" -eq 0 ]] || pass=true ;;
+            observation|shell-output)
+                if _sc_jq -se --arg type "$expect" 'any(.[]; .type==$type and
+                    ([.content, .stdout, .stderr] | any(.[]; type=="string" and test("\\S"))))' "$actual_traj_file" >/dev/null; then pass=true; fi ;;
+            error)
+                if _sc_jq -se 'any(.[]; .type=="shell-output" and
+                    (.exit | type=="number" and .!=0) and .timed_out!=true)' "$actual_traj_file" >/dev/null; then pass=true; fi ;;
+        esac
     fi
 
     # Check expect_contains if provided and pass so far
@@ -850,16 +877,17 @@ ${skill_content}"
         # whose term appears in the final answer could never pass (hello-world
         # false-fail). Final steps are in the evidence pool now, still subject to
         # the echo filter and the denial-aware matching below.
-    local ec_matched=0 ec_missed=""
+    local ec_matched=0 ec_missed="$expect_contains"
     if [[ $pass == true ]] && [[ $(printf '%s' "$expect_contains" | _sc_jq 'length') -gt 0 ]]; then
         pass=false
+        ec_missed='[]'
         local exec_content=""
         if [[ -n "$actual_traj_file" && -f "$actual_traj_file" ]]; then
-            exec_content=$(_sc_jq -rs '[.[] | select(.type=="shell-output" or .type=="observation" or .type=="final") | (if .type=="shell-output" then (.stdout // .content // "") else (.content // "") end)] | join("\n")' "$actual_traj_file" 2>/dev/null || true)
+            exec_content=$(_sc_jq -rs '[.[] | select(.type=="shell-output" or .type=="observation" or .type=="final") | (if .type=="shell-output" then ([.stdout // .content // "", .stderr // ""] | join("\n")) else (.content // .details // "") end)] | join("\n")' "$actual_traj_file" 2>/dev/null || true)
         fi
         local fixture_rows=""
         if [[ -d "$rundir" ]]; then
-            fixture_rows=$(find "$rundir" -type f ! -path "$traj_dir/*" ! -path '*/memories/*' ! -name 'echo-filter*' -print0 2>/dev/null | xargs -0 grep -hE '^[[:space:]]*[{\[]' 2>/dev/null || true)
+            fixture_rows=$(find "$rundir" -type f ! -path "$traj_dir/*" ! -path '*/memories/*' ! -name 'echo-filter*' ! -name 'root-evidence.jsonl' ! -name 'runner.*' -print0 2>/dev/null | xargs -0 grep -hE '^[[:space:]]*[{\[]' 2>/dev/null || true)
         fi
         local exec_filter_file="${TMPDIR:-/tmp}/echo-filter-exec.$$"
         printf '%s\n%s\n' "$full_prompt" "$fixture_rows" | sed '/^[[:space:]]*$/d' > "$exec_filter_file"
@@ -950,7 +978,7 @@ ${skill_content}"
             if [[ "$lit_hit" == true ]]; then
                 ec_matched=$((ec_matched + 1))
             else
-                ec_missed="${ec_missed}${ec_missed:+|}${substr}"
+                ec_missed=$(printf '%s' "$ec_missed" | _sc_jq --arg lit "$substr" '. + [$lit]')
             fi
             i=$((i + 1))
         done
@@ -971,9 +999,10 @@ ${skill_content}"
         --arg final "$final_content" \
         --arg exit_code "$rc" \
         --arg ec_matched "$ec_matched" \
-        --arg ec_missed "$ec_missed" \
+        --argjson ec_missed "$ec_missed" \
+        --arg harness_error "$harness_error" --arg runner_stderr "$runner_stderr" \
         --arg final_len "$final_len" \
-        '{test:$test, pass:($pass=="true"), last_step_type:$last_step_type, last_step_content:$last_step_content, final:$final, exit_code:($exit_code|tonumber), expect_contains_matched:($ec_matched|tonumber), expect_contains_missed:(if $ec_missed=="" then [] else ($ec_missed|split("|")) end), final_len:($final_len|tonumber)}'
+        '{test:$test, pass:($pass=="true"), last_step_type:$last_step_type, last_step_content:$last_step_content, final:$final, exit_code:($exit_code|tonumber), expect_contains_matched:($ec_matched|tonumber), expect_contains_missed:$ec_missed, final_len:($final_len|tonumber), runner_stderr:$runner_stderr} + (if $harness_error=="" then {} else {harness_error:$harness_error} end)'
 }
 
 # Write cache files
@@ -1220,12 +1249,11 @@ PY
         printf '## Summary: %d / %d passed, %d / %d verified (a pass counts as verified only on pool-attested literals)\n\n' "$passed" "$total" "$verified" "$total"
         local i=0
         while [[ $i -lt $total ]]; do
-            local r name p lt f
+            local r name p lt
             r=$(printf '%s' "$results_json" | _sc_jq -c ".[$i]")
             name=$(printf '%s' "$r" | _sc_jq -r '.test.name')
             p=$(printf '%s' "$r" | _sc_jq -r '.pass')
             lt=$(printf '%s' "$r" | _sc_jq -r '.last_step_type')
-            f=$(printf '%s' "$r" | _sc_jq -r '.final')
             if [[ "$p" == "true" ]]; then
                 printf '### %s: ✓ PASS\n\n' "$name"
                 printf 'Expected: %s | Got: "%s"\n\n' "$(printf '%s' "$r" | _sc_jq -r '.test.expect')" "$lt"
@@ -1302,6 +1330,7 @@ cmd_compile() {
             result_json=$(_sc_jq -n --argjson test "$test_json" '{test:$test, pass:false, harness_error:"test harness failed; see stderr", last_step_type:"error", final:""}')
             harness_failed=1
         fi
+        if printf '%s' "$result_json" | _sc_jq -e 'has("harness_error")' >/dev/null; then harness_failed=1; fi
         info "Test result: $(printf '%s' "$result_json" | _sc_jq -r '.pass')"
         all_results=$(printf '%s' "$all_results" | _sc_jq --argjson r "$result_json" '. + [$r]')
         i=$((i + 1))
