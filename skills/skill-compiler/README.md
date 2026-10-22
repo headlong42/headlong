@@ -91,6 +91,10 @@ Matching is case-insensitive for both words and phrases. Words match whole
 words with optional s/es plurals; phrases match substrings with digit boundaries.
 Quote-style folding and denial/echo exclusions still apply. Provenance labels
 compare the original literal spelling with the offered vocabulary.
+Multiline literals match contiguous text within one recorded output field, with
+newlines preserved exactly. They cannot join separate records or fields, or
+bridge lines removed as echoes. An expected final newline must be present in
+the recorded output; the matcher does not add one.
 
 Setup, runner, or root-selection failure records `harness_error`, retains prior
 results, and returns nonzero. JSON results retain the runner exit code and up to

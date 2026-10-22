@@ -308,6 +308,75 @@ raise SystemExit(0 if found else 1)
     return "$rc"
 }
 
+# Multiline literals must stay inside one observed field and one uninterrupted
+# eligible span. Filtering a line must not join its former neighbors. Match
+# recorded newlines exactly; never add a terminator absent from the output.
+# Normalize line endings only when recognizing an excluded echo line.
+_multiline_match() {
+    local literal_file rc=0
+    literal_file=$(mktemp "$TMPDIR/multiline.XXXXXX") || return 1
+    printf '%s' "$1" > "$literal_file"
+    python3 - "$literal_file" "$2" "$3" <<'PY_MULTILINE' || rc=$?
+import json, re, sys
+with open(sys.argv[1], newline="") as f: lit = f.read()
+with open(sys.argv[3]) as f: excluded = set(f.read().splitlines())
+denial = re.compile(r"^[\W_]*(no|not|never|nothing|none|without|clean|zero|0)(?:\s|:|$)", re.I)
+def pattern(value):
+    left = r"(?<![0-9])" if value[:1].isdigit() else ""
+    right = r"(?![0-9])" if value[-1:].isdigit() else ""
+    return re.compile(left + re.escape(value) + right, re.I)
+def fold(value): return value.replace('"', "'")
+exact = pattern(lit)
+quoted = pattern(fold(lit)) if '"' in lit or "'" in lit else None
+def matches(span):
+    for regex, text in ((exact, span), (quoted, fold(span))):
+        if regex is None: continue
+        start = 0
+        while True:
+            hit = regex.search(text, start)
+            if hit is None: break
+            pos = hit.start()
+            for fragment in lit.splitlines(keepends=True):
+                begin = span.rfind("\n", 0, pos) + 1
+                end = span.find("\n", pos)
+                line = span[begin:end if end >= 0 else len(span)]
+                # Ordinary lines are always eligible. A denial line may only
+                # supply a fragment that itself explicitly asks for a denial.
+                if denial.search(line) and not denial.search(fragment): break
+                pos += len(fragment)
+            else:
+                return True
+            start = hit.start() + 1  # a later overlapping occurrence may qualify
+    return False
+def output(row, primary, fallback):
+    value = row.get(primary)
+    return row.get(fallback, "") if value is None or value is False else value
+found = False
+with open(sys.argv[2]) as f:
+    for row in map(json.loads, f):
+        kind = row.get("type")
+        if kind == "shell-output":
+            fields = [output(row, "stdout", "content"), row.get("stderr", "")]
+        elif kind in ("observation", "final"):
+            fields = [output(row, "content", "details")]
+        else:
+            continue
+        for text in fields:
+            if not isinstance(text, str) or not text: continue
+            span = ""
+            for line in text.splitlines(keepends=True):
+                if line.rstrip("\r\n") in excluded:
+                    found = matches(span) or found
+                    span = ""
+                else:
+                    span += line
+            found = matches(span) or found
+raise SystemExit(0 if found else 1)
+PY_MULTILINE
+    rm -f "$literal_file"
+    return "$rc"
+}
+
 # Gather eligible output vocabulary from scripts, documented examples and
 # captured history. History output is paired with the command in the same run.
 # This is vocabulary provenance, not proof that a test detects faulty behavior.
@@ -979,7 +1048,6 @@ PY_ROOT
         exec_content=$(printf '%s\n' "$exec_content" | _sc_subtract_lines "$exec_filter_file")
         # Files in the workdir may be inputs, source, or invented notes.
         # Only trajectory output and answers are assertion evidence.
-        rm -f "$exec_filter_file"
         # DENIAL-FIX 2026-09-22: a line that denies the term ("No violations
         # found", "Not a violation", "0 violations") is evidence of absence, not
         # of the term.
@@ -1001,48 +1069,57 @@ PY_ROOT
         while [[ $i -lt $len ]]; do
             local lit_hit=false
             local substr
-            substr=$(printf '%s' "$expect_contains" | _sc_jq -r ".[$i]")
-            # WORD-FIX 2026-09-22: whole-word fixed-string matching. "violation"
-            # no longer rides on "violations" and "verif" no longer rides on
-            # "verification"; regex metacharacters in terms are literal now.
-            # STEM-FIX 2026-09-22: a singular term may match its plain plural
-            # (violation -> violations, via optional s/es), nothing longer. A
-            # partial term like "verif" still cannot ride on "verification".
-            # GLUE-FIX 2026-09-22: a multi-word phrase is matched as a literal
-            # substring, because output that strips HTML glues the phrase to the
-            # next text ("Example Domainbody{...}") and a whole-word boundary
-            # then fails on every occurrence. Single words keep whole-word
-            # matching so "violation" cannot ride on "violations".
-            if [[ "$substr" == *" "* ]]; then
-                if printf '%s\n' "$exec_match" | _phrase_match "$substr"; then
+            # jq -j adds no delimiter; the sentinel protects every trailing LF
+            # from command substitution, then only the sentinel is removed.
+            substr=$(printf '%s' "$expect_contains" | _sc_jq -j ".[$i]" && printf '.')
+            substr=${substr%.}
+            if [[ "$substr" == *$'\n'* ]]; then
+                if _multiline_match "$substr" "$actual_traj_file" "$exec_filter_file"; then
                     lit_hit=true
                 fi
-            elif printf '%s\n' "$exec_match" | _word_match "$substr"; then
-                lit_hit=true
-            fi
-            # QUOTE-FOLD-FIX 2026-09-27: the same command written with the other
-            # quote style is the same command (single-quote and double-quote
-            # spellings of one sed strip produce identical output, verified
-            # 2026-09-27). Fold both quote characters to one before matching a
-            # quoted literal so one spelling is not brittle against the other.
-            if [[ "$substr" == *"'"* || "$substr" == *'"'* ]]; then
-                local fold_lit fold_ev
-                fold_lit=$(printf '%s' "$substr" | sed "s/[\'\"]/'/g")
-                fold_ev=$(printf '%s\n' "$exec_match" | sed "s/[\'\"]/'/g")
-                if printf '%s\n' "$fold_ev" | _phrase_match "$fold_lit"; then
-                    lit_hit=true
-                fi
-            fi
-            # DENIAL-AWARE-FIX 2026-09-22: a denial line may only satisfy a term
-            # that is itself a denial phrase, so "No violations found" still
-            # proves a clean case while a bare "violation" cannot ride on it.
-            if printf '%s' "$substr" | grep -Eiq -- "$denial_re"; then
+            else
+                # WORD-FIX 2026-09-22: whole-word fixed-string matching. "violation"
+                # no longer rides on "violations" and "verif" no longer rides on
+                # "verification"; regex metacharacters in terms are literal now.
+                # STEM-FIX 2026-09-22: a singular term may match its plain plural
+                # (violation -> violations, via optional s/es), nothing longer. A
+                # partial term like "verif" still cannot ride on "verification".
+                # GLUE-FIX 2026-09-22: a multi-word phrase is matched as a literal
+                # substring, because output that strips HTML glues the phrase to the
+                # next text ("Example Domainbody{...}") and a whole-word boundary
+                # then fails on every occurrence. Single words keep whole-word
+                # matching so "violation" cannot ride on "violations".
                 if [[ "$substr" == *" "* ]]; then
-                    if printf '%s\n' "$exec_denial" | _phrase_match "$substr"; then
+                    if printf '%s\n' "$exec_match" | _phrase_match "$substr"; then
                         lit_hit=true
                     fi
-                elif printf '%s\n' "$exec_denial" | _word_match "$substr"; then
+                elif printf '%s\n' "$exec_match" | _word_match "$substr"; then
                     lit_hit=true
+                fi
+                # QUOTE-FOLD-FIX 2026-09-27: the same command written with the other
+                # quote style is the same command (single-quote and double-quote
+                # spellings of one sed strip produce identical output, verified
+                # 2026-09-27). Fold both quote characters to one before matching a
+                # quoted literal so one spelling is not brittle against the other.
+                if [[ "$substr" == *"'"* || "$substr" == *'"'* ]]; then
+                    local fold_lit fold_ev
+                    fold_lit=$(printf '%s' "$substr" | sed "s/[\'\"]/'/g")
+                    fold_ev=$(printf '%s\n' "$exec_match" | sed "s/[\'\"]/'/g")
+                    if printf '%s\n' "$fold_ev" | _phrase_match "$fold_lit"; then
+                        lit_hit=true
+                    fi
+                fi
+                # DENIAL-AWARE-FIX 2026-09-22: a denial line may only satisfy a term
+                # that is itself a denial phrase, so "No violations found" still
+                # proves a clean case while a bare "violation" cannot ride on it.
+                if printf '%s' "$substr" | grep -Eiq -- "$denial_re"; then
+                    if [[ "$substr" == *" "* ]]; then
+                        if printf '%s\n' "$exec_denial" | _phrase_match "$substr"; then
+                            lit_hit=true
+                        fi
+                    elif printf '%s\n' "$exec_denial" | _word_match "$substr"; then
+                        lit_hit=true
+                    fi
                 fi
             fi
             if [[ "$lit_hit" == true ]]; then
@@ -1055,6 +1132,7 @@ PY_ROOT
         if [[ $ec_matched -eq $len ]]; then
             pass=true
         fi
+        rm -f "$exec_filter_file"
     fi
 
     # Build result JSON - use --arg for strings to avoid JSON parsing issues
@@ -1156,8 +1234,8 @@ def label_literal(lit, pool, poolset):
 # LITERAL-SOURCE 2026-09-27: record WHERE each literal is attested in the
 # skill's own text, so the strength of every assertion is visible in the cache
 # itself instead of only in prose. Priority: a line one of the skill's own
-# scripts prints, then other script text, then the metadata frontmatter, then
-# documentation prose, then nowhere (UNATTESTED).
+# scripts prints, then other script text, then documentation prose, then
+# metadata frontmatter, then nowhere (UNATTESTED).
 skill_dir = os.environ.get("skill_dir") or ""
 _SCRIPT_PRINT_RE = re.compile(r"\b(print|echo|printf|append|write|say)\b")
 
@@ -1290,7 +1368,7 @@ summary = dict(green_no_literals=sum(1 for r in res if r.get("verification") == 
 out = dict(summary=summary, tests=res)
 open(os.environ["json_out"], "w").write(json.dumps(out, indent=2))
 md = "\n## Literal provenance (expect_contains vs the phrase pool)\n\n"
-md += "POOL-EXACT means a whole entry in the pool handed to the teacher. POOL-FRAGMENT means a constant fragment of a pool entry, vocabulary the skill's own output or docs carry. INVENTED means unverified. POOL-DROPPED means real tool vocabulary the pool cap dropped from the truncated pool: real, but not pool-attested.\n\n"
+md += "POOL-EXACT means a whole entry in the pool handed to the teacher. POOL-FRAGMENT means a constant fragment of a pool entry, vocabulary the skill's own output or docs carry. INVENTED means unverified. POOL-DROPPED means eligible vocabulary omitted by a cap, including source or documentation text; it was not offered to the teacher.\n\n"
 md += "\n".join(lines) + "\n"
 md += "\n## Literal sources (where each literal is attested in the skill's own text)\n\n"
 md += "TOOL-OUTPUT = the string is in captured real tool output (SKILL_REAL_OUTPUT or SKILL_HISTORY_POOL), the only label that is occurrence evidence. SCRIPT-PRINT-UNATTESTED = on a line a script prints but never seen in captured output. SCRIPT-PRINT = on a print line, with no captured output loaded to check against. SCRIPT-TEXT = in a script away from a print line. METADATA = the frontmatter. DOC = documentation prose. UNATTESTED = found nowhere in the skill's own text. Classified against the copy of the skill the tests execute.\n\n"
@@ -1333,7 +1411,7 @@ PY
 
     {
         printf '\n## Pass verification\n\n'
-        printf 'VERIFIED = green with only pool-attested literals (POOL-EXACT or POOL-FRAGMENT). GREEN-NO-LITERALS = green without literal assertions (not attested). GREEN-ON-INVENTED = green but resting on unverified vocabulary, so not counted as verified. POOL-DROPPED and GREEN-ON-DROPPED mark real vocabulary the pool cap dropped from the truncated pool: real, but not pool-attested, so not counted as verified either.\n\n'
+        printf 'VERIFIED = green with only pool-attested literals (POOL-EXACT or POOL-FRAGMENT). GREEN-NO-LITERALS = green without literal assertions (not attested). GREEN-ON-INVENTED = green but resting on unverified vocabulary, so not counted as verified. POOL-DROPPED and GREEN-ON-DROPPED mark eligible vocabulary omitted by a cap, which may come from source or documentation rather than observed output; it is not pool-attested or counted as verified.\n\n'
         python3 - "$COMPILED_DIR/${skill_name}.json" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))

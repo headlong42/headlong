@@ -902,5 +902,122 @@ def dependency_metadata():
     assert json.loads(r.stdout)['requires']['bins']==['bash','python3','jq','llm','shellm','skills']
 check('repair4 dependency metadata uses actual loader spelling',dependency_metadata)
 
+
+# Sixth repair: literal bytes survive extraction and multiline evidence filtering.
+def newline_case(c, literal, output, want, prompt='Execute the probe.', rows=None):
+    c.tests([dict(name='newline',prompt=prompt,expect='shell-output',expect_contains=[literal])])
+    if rows is None: rows=[dict(type='shell-output',stdout=output,exit=0)]
+    (c.root/'trajectory.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in rows))
+    c.run();t=c.result()['tests'][0]
+    assert t['test']['expect_contains']==[literal]
+    assert t['pass'] is want,(literal,output,t)
+    assert t['expect_contains_matched']==int(want)
+    assert t['expect_contains_missed']==([] if want else [literal])
+    assert t['expect_contains_unchecked']==[]
+
+
+def trailing_newlines():
+    c=Case('trailing-newlines')
+    for literal,output,want in [
+        ('Victory phrase stable\n','Victory phrase stableSuffix',False),
+        ('Victory phrase stable\n','Victory phrase stable',False),
+        ('Victory phrase stable\n','Victory phrase stable\n',True),
+        ('Victory phrase stable\n\n','Victory phrase stable',False),
+        ('Victory phrase stable\n\n','Victory phrase stable\n',False),
+        ('Victory phrase stable\n\n','Victory phrase stable\n\n',True),
+        ('Victory\n','Victories\n',False),
+    ]: newline_case(c,literal,output,want)
+check('repair6 trailing newlines require line boundaries and preserve blank lines',trailing_newlines)
+
+
+def newline_missed_bytes():
+    c=Case('newline-missed-bytes')
+    missed=['Missing assertion\n', 'Missing | "quote" \\ slash\t\n\n']
+    literals=['Victory phrase stable']+missed
+    c.tests([dict(name='missed',prompt='Execute the probe.',expect='final',expect_contains=literals)])
+    c.run();t=c.result()['tests'][0]
+    assert not t['pass'] and t['expect_contains_matched']==1
+    assert t['test']['expect_contains']==literals
+    assert t['expect_contains_missed']==missed and t['expect_contains_unchecked']==[]
+check('repair6 missed literals retain every trailing newline and other byte',newline_missed_bytes)
+
+
+def multiline_literals():
+    c=Case('multiline-literals')
+    for literal,output,want in [
+        ('Alpha\nOmega','Alpha\nOmega',True),
+        ('Victory\nphrase stable','Victory\nphrase stable',True),
+        ('Alpha\nOmega','Alpha Omega',False),
+        ('Alpha\nOmega','Alpha\n\nOmega',False),
+        ('5 tests passed\nDone','15 tests passed\nDone',False),
+        ('5 tests passed\nDone','5 tests passed\nDone',True),
+        ('Alpha\n5','Alpha\n15',False),
+        ('Alpha\n5','Alpha\n51',False),
+        ('Alpha\n5','alpha\n5',True),
+    ]: newline_case(c,literal,output,want)
+    # Separately recorded fields are not a single contiguous multiline output.
+    newline_case(c,'Alpha\nOmega','',False,rows=[dict(type='shell-output',stdout='Alpha',stderr='Omega',exit=0)])
+    newline_case(c,'Alpha\nOmega','',False,rows=[dict(type='shell-output',stdout='Alpha',exit=0),dict(type='final',content='Omega')])
+check('repair6 multiline literals match contiguous output with digit boundaries',multiline_literals)
+
+
+def multiline_exclusions():
+    c=Case('multiline-exclusions')
+    newline_case(c,'Alpha\nOmega','Alpha\nNo failures\nOmega',False)
+    newline_case(c,'Alpha\nOmega','Alpha\nEcho marker\nOmega',False,prompt='Echo marker')
+    newline_case(c,'Alpha\nOmega','Alpha\n{"fixture":"synthetic"}\nOmega',False,
+                 rows=[dict(type='reasoning',cmd='{"fixture":"synthetic"}'),dict(type='shell-output',stdout='Alpha\n{"fixture":"synthetic"}\nOmega',exit=0)])
+    (c.root/'fixture.txt').write_text('{"fixture":"synthetic"}\n')
+    newline_case(c,'Alpha\nOmega','Alpha\n{"fixture":"synthetic"}\nOmega',False)
+    (c.root/'fixture.txt').unlink()
+    newline_case(c,'violations\nfound','No violations\nfound',False)
+    newline_case(c,'No violations\nNo errors','No violations\nNo errors',True)
+    newline_case(c,'No violations\nSummary complete','No violations\nSummary complete',True)
+    newline_case(c,'Summary complete\nNo violations','Summary complete\nNo violations',True)
+    newline_case(c,'No violations\n','Status: No violations',False)
+    newline_case(c,'No violations\n','Status: No violations\n',True)
+    newline_case(c,'Alpha\nAlpha','No Alpha\nAlpha\nAlpha',True)
+
+    newline_case(c,'Alpha\nOmega','Alpha\nNo failures\nOmega\nAlpha\nOmega',True)
+check('repair6 multiline matching cannot bridge echo or denial exclusions',multiline_exclusions)
+
+
+def multiline_quotes():
+    c=Case('multiline-quotes')
+    newline_case(c,"quote 'term'\n",'quote "term"Suffix',False)
+    newline_case(c,"quote 'term'\n",'quote "term"',False)
+    newline_case(c,"quote 'term'\n",'quote "term"\n',True)
+    newline_case(c,"quote 'term'\nNext line",'quote "term"\nNext line',True)
+check('repair6 quote folding retains multiline literal boundaries',multiline_quotes)
+
+
+def multiline_fields():
+    c=Case('multiline-fields');literal='Alpha\nOmega\n'
+    for row in [dict(type='shell-output',stdout=literal,exit=0),
+                dict(type='shell-output',stdout=None,content=literal,exit=0),
+                dict(type='shell-output',stderr=literal,exit=0),
+                dict(type='observation',content=literal),
+                dict(type='final',content=literal),
+                dict(type='final',content=None,details=literal)]:
+        # A named shell-output establishes the outcome; all recorded output
+        # kinds remain eligible for literal evidence, just as for single lines.
+        newline_case(c,literal,'',True,rows=[dict(type='shell-output',stdout='Unrelated output',exit=0),row])
+check('repair6 multiline evidence keeps observed field and fallback semantics',multiline_fields)
+
+
+
+# Coordinator follow-up: CRLF echoes must remain excluded without normalizing
+# the literal or inventing an output newline.
+def multiline_recorded_bytes():
+    c=Case('multiline-recorded-bytes')
+    newline_case(c,'Alpha\r\nEcho marker\r\nOmega','Alpha\r\nEcho marker\r\nOmega',False,prompt='Echo marker')
+    newline_case(c,'Alpha\r\nOmega','Alpha\r\nOmega',True)
+    newline_case(c,'Alpha\nOmega','Alpha\r\nOmega',False)
+    newline_case(c,'Alpha\nOmega\n','Alpha\nOmega',False)
+    newline_case(c,'Alpha\nOmega\n','Alpha\nOmega\n',True)
+    newline_case(c,'Alpha\r\nEcho marker\r\nOmega','',False,rows=[dict(type='reasoning',cmd='Echo marker'),dict(type='shell-output',stdout='Alpha\r\nEcho marker\r\nOmega',exit=0)])
+    newline_case(c,'violations\r\nfound','No violations\r\nfound',False)
+check('coordinator multiline matching preserves recorded bytes and excludes CRLF echoes',multiline_recorded_bytes)
+
 print(f'{count-failed} regression checks passed, {failed} failed',flush=True)
 sys.exit(bool(failed))
