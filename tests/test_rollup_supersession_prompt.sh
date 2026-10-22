@@ -78,6 +78,13 @@ check "sealed block stamped prompt_version 5" \
 # 5. The stub was actually called (log has at least one CALL/SYSTEM record).
 check "rollup model invoked" grep -q '^SYSTEM$' "$LLM_LOG"
 
+# 6. Rollup calls leave room for a reasoning model's thinking: at the old
+# 1024 cap Sonnet 5 was cut off mid-JSON on a quarter of live rollups.
+check "rollup call asks for 4096 output tokens" \
+    grep -q -- '-t 4096 -s' "$LLM_LOG"
+check_not "rollup call no longer capped at 1024" \
+    grep -q -- '-t 1024 -s' "$LLM_LOG"
+
 # 6. Supply 20 sealed children across two disjoint tier-2 ranges. The
 # correction in [100,200) cannot see the claim in [0,100). Preseeding t1
 # makes the summaries deterministic; recap itself constructs the t2 inputs.

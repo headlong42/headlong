@@ -1,0 +1,44 @@
+# Review — a model reviews a pull request when a maintainer asks for it.
+#
+# Comment "/review" on a pull request, or run this workflow from the Actions
+# tab with a pull request number. Only people with write access to the
+# repository can start a review, because each one costs money; the action
+# checks that itself and ignores everyone else.
+#
+# The review comes back as one pull request review: comments on the changed
+# lines for high severity findings only, and a short answer to whether the
+# change belongs in the project, judged against CHARTER.md and the design
+# documents as they were before the change.
+#
+# Pull requests from forks are reviewed too, under the same rule: only a
+# comment from someone with write access starts one. The workflow always runs
+# from the default branch, and the pull request's code is read and never run,
+# so a fork cannot change what runs or reach the key.
+#
+# Needs the OPENROUTER_API_KEY repository secret.
+name: Review
+
+on:
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      pr-number:
+        description: Pull request number
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    if: github.event_name == 'workflow_dispatch' || (github.event.issue.pull_request && startsWith(github.event.comment.body, '/review'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: laude-institute/rev-engine-prime@main
+        with:
+          openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
+          pr-number: ${{ inputs.pr-number }}
+          allow-forks: true

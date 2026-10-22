@@ -148,7 +148,13 @@ SHELLM_INACTIVITY_MAX="${SHELLM_INACTIVITY_MAX:-900}"
 # Kill a command whose output file grows past this many bytes, even while it is
 # actively producing output (a runaway loop resets the inactivity counter every
 # check, so silence-based watchdogs never catch it). 0 disables the guard.
-SHELLM_MAX_OUTPUT_SIZE="${SHELLM_MAX_OUTPUT_SIZE:-104857600}"
+# 10 MB: the model reads about 8K of a block's output, and every stage after
+# the kill works on what is left behind.
+SHELLM_MAX_OUTPUT_SIZE="${SHELLM_MAX_OUTPUT_SIZE:-10485760}"
+# The progress echo shows at most this many new lines per poll, and a block
+# killed for output size keeps this many bytes from each end of its output.
+STREAM_MAX_LINES=200
+OUTPUT_KEEP_BYTES=131072
 # Kill a block that has run this many seconds, however it behaves. A command
 # that prints a heartbeat while it waits on something that never finishes
 # passes every other guard (Audel 2026-09-25: a scan blocked 3.5 h reading a
@@ -359,7 +365,7 @@ Environment:
   SHELLM_INACTIVITY_MAX   Seconds before killing execution that is silent but
                           has a live nested shellm run (default: 900)
   SHELLM_MAX_OUTPUT_SIZE  Bytes of output before killing a command that keeps
-                          producing output (default: 104857600; 0 disables)
+                          producing output (default: 10485760; 0 disables)
   SHELLM_MAX_EXEC_TIME    Seconds before killing a block no matter what it is
                           doing (default: 3600; 0 disables)
   SHELLM_BEACON_INTERVAL  Seconds between activity beacon touches (default: 5)
@@ -411,14 +417,58 @@ redact_sensitive() {
         output="${output//${LLM_API_KEY}/<redacted-api-key>}"
     fi
 
-    local _key_var
+    # Preserve exact masking of every nonempty configured provider value,
+    # including short credentials. Quoting makes glob characters literal.
+    local _key_var _key_val v
     for _key_var in OPENAI_API_KEY OPENROUTER_API_KEY GEMINI_API_KEY OPENCODE_API_KEY; do
-        if [[ -n "${!_key_var:-}" ]]; then
-            output="${output//${!_key_var}/<redacted-api-key>}"
+        v="${!_key_var:-}"
+        if [[ -n "$v" ]]; then
+            output="${output//"$v"/<redacted-api-key>}"
         fi
     done
 
-    printf '%s' "$output" | LC_ALL=C sed -E 's/sk-ant-[A-Za-z0-9._-]+/<redacted-anthropic-key>/g'
+    # Other credential variables retain the minimum length to avoid matching
+    # short placeholder values in ordinary prose.
+    for _key_var in GITHUB_TOKEN GH_TOKEN HOMEBREW_GITHUB_API_TOKEN GITHUB_PAT \
+                    GOOGLE_API_KEY SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_USER_TOKEN \
+                    SLACK_TOKEN TELEGRAM_BOT_TOKEN HF_TOKEN HUGGING_FACE_HUB_TOKEN \
+                    AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_ACCESS_KEY_ID \
+                    STRIPE_SECRET_KEY SENDGRID_API_KEY TWILIO_AUTH_TOKEN \
+                    DATABASE_URL REDIS_URL; do
+        _key_val="${!_key_var:-}"
+        if [[ -n "$_key_val" && ${#_key_val} -ge 8 ]]; then
+            v="$_key_val"
+            output="${output//"$v"/<redacted:value>}"
+        fi
+    done
+
+    # Shape pass for credentials that arrived as text and so have no env var to
+    # match against. The sk-ant- rule stays first and keeps its marker: it is
+    # the one shape a reader can attribute to a provider, and
+    # tests/test_redact_sensitive.sh asserts on that exact string.
+    printf '%s' "$output" | LC_ALL=C sed -E \
+        -e 's/sk-ant-[A-Za-z0-9._-]+/<redacted-anthropic-key>/g' \
+        -e 's/(^|[^A-Za-z0-9])(sk-[A-Za-z0-9_.=-]{12,})/\1<redacted:api-key>/g' \
+        -e 's/(^|[^A-Za-z0-9])(gh[pousr]_[A-Za-z0-9]{12,})/\1<redacted:github-token>/g' \
+        -e 's/(^|[^A-Za-z0-9])(github_pat_[A-Za-z0-9_]{12,})/\1<redacted:github-token>/g' \
+        -e 's/(^|[^A-Za-z0-9])(xox[a-z]-[A-Za-z0-9_.-]{8,})/\1<redacted:slack-token>/g' \
+        -e 's/(^|[^A-Za-z0-9])(hf_[A-Za-z0-9]{12,})/\1<redacted:hf-token>/g' \
+        -e 's/AIza[A-Za-z0-9_-]{25,}/<redacted:google-key>/g' \
+        -e 's/(AKIA|ASIA)[A-Z0-9]{16}/<redacted:aws-key>/g' \
+        -e 's/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/<redacted:jwt>/g' \
+        -e 's#://[^/@[:space:]]+:[^/@[:space:]]+@#://<redacted:basic-auth>@#g' \
+        -e '/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/,/-----END [A-Z0-9 ]*PRIVATE KEY-----/c\
+<redacted:private-key>' \
+        -e 's#"auth"[[:space:]]*:[[:space:]]*"[A-Za-z0-9+/=]{16,}"#"auth": "<redacted:docker-auth>"#g' \
+        -e 's/(^|[^A-Za-z0-9])((sk|rk)_live_[A-Za-z0-9]{8,})/\1<redacted:stripe-key>/g' \
+        -e 's/(^|[^A-Za-z0-9])(whsec_[A-Za-z0-9]{8,})/\1<redacted:stripe-hook>/g' \
+        -e 's/(^|[^A-Za-z0-9])(npm_[A-Za-z0-9]{20,})/\1<redacted:npm-token>/g' \
+        -e 's/(^|[^A-Za-z0-9])(glpat-[A-Za-z0-9_-]{10,})/\1<redacted:gitlab-token>/g' \
+        -e 's/(^|[^A-Za-z0-9])(dckr_pat-[A-Za-z0-9_.-]{10,})/\1<redacted:docker-token>/g' \
+        -e 's/(^|[^A-Za-z0-9])(SG\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})/\1<redacted:sendgrid-key>/g' \
+        -e 's/(^|[^A-Za-z0-9])(SK[0-9a-f]{32})/\1<redacted:twilio-key>/g' \
+        -e 's/(^|[^A-Za-z0-9])(key-[A-Za-z0-9]{20,})/\1<redacted:mailgun-key>/g' \
+        -e 's/((aws|AWS)_secret_access_key)[[:space:]]*[=:][[:space:]]*[^[:space:]]+/\1=<redacted:aws-secret>/g'
 }
 
 # ---------------------------------------------------------------------------
@@ -1949,6 +1999,9 @@ extract_code() {
         }
 
         BEGIN { in_block = 0; hd_top = 0; first_block_closed = 0 }
+        # CRLF input: a trailing \r would survive into the collected code
+        # and both break the closing-fence check and hand bash a bad line.
+        { sub(/\r$/, "", $0) }
 
         # After first block closed: look for another opening fence. A tagged
         # ```bash/```sh fence may be appended to the end of a prose line (see
@@ -2026,7 +2079,22 @@ extract_code() {
     # Strip [cmd]/[thought] markers that the model may emit instead of fences.
     local no_fence=0
     if [[ -z "$code" ]]; then
-        code=$(printf '%s\n' "$response" | sed '/^[[:space:]]*\[cmd\][[:space:]]*$/d; /^[[:space:]]*\[thought\]/d')
+        code=$(printf '%s\n' "$response" | awk '
+            /^[[:space:]]*\[cmd\][[:space:]]*$/ { next }
+            /^[[:space:]]*\[thought\]/ { next }
+            { print }
+        ')
+        # A provenance marker may be literal data in a heredoc or quote.
+        # Cut only when the prefix is a complete script; leave ambiguous
+        # replies intact. Consume all input to avoid SIGPIPE under pipefail.
+        local before_provenance
+        before_provenance=$(printf '%s\n' "$code" | awk '
+            /^\[(served_by|exec_s|exit|stdout|stderr)\]/ { cut = 1 }
+            !cut { print }
+        ')
+        if [[ "$before_provenance" != "$code" ]] && script_parses "$before_provenance"; then
+            code="$before_provenance"
+        fi
         # A response with no bash block and real content is about to be run as
         # a shell command. That is almost always the model ending its turn with
         # a plain sentence (which fails "command not found") or forgetting the
@@ -2045,7 +2113,7 @@ extract_code() {
     if [[ "$toolcall_lifted" -eq 1 ]]; then
         local toolcall_notice
         toolcall_notice=$(cat <<'NOTICE'
-printf '%s\n' '[shellm: your reply used <tool_call>/<function=bash> markup. This runtime only reads ```bash fences; it lifted your code into one and ran it this time. Next time put the script inside a ```bash block, nothing else: start the reply with a line that is exactly ```bash and end the block with a line that is exactly ```.]' >&2
+printf '%s\n' '[shellm: your reply used tool-call markup (angle-bracket function-call tags). This runtime only reads ```bash fences; it lifted your code into one and ran it this time. Next time put the script inside a ```bash block, nothing else: start the reply with a line that is exactly ```bash and end the block with a line that is exactly ```.]' >&2
 NOTICE
 )
         code="$toolcall_notice"$'\n'"$code"
@@ -2078,7 +2146,7 @@ build_system_prompt() {
 You are running in shellm, headlong's bash agent loop: you solve tasks by generating and executing bash code.
 
 IMPORTANT: End your response with exactly ONE ```bash code block. Your response is NOT streamed — code blocks are not executed until your entire response is complete. Combine multiple steps into a single script. Only the first code block is executed; all others are silently discarded.
-Never use <tool_call>, <function=bash>, <parameter=...> or <bash> tags: this runtime is not a tool-calling API and only reads ```bash fences.
+Never use angle-bracket function-call tags (tool-call markup of any form, including single-word pseudo-tags): this runtime is not a tool-calling API and only reads ```bash fences.
 
 CRITICAL — the opening ```bash fence MUST start on its OWN new line. Put a
 newline after your prose, THEN the fence on a line by itself. Never append the
@@ -2401,34 +2469,62 @@ ${combined}"
 }
 
 # Stream lines past $2 from $1 to stderr (redacted), then print the new
-# total line count on stdout so the caller can update its cursor.
+# line count and PEM-block state on stdout. The caller carries both across
+# polls and resets them for each execution output file.
 _stream_new_output() {
-    local output_file="$1" lines_read="$2"
+    local output_file="$1" lines_read="$2" in_pem="${3:-0}"
+    local pem_begin='-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----'
+    local pem_end='-----END [A-Z0-9 ]*PRIVATE KEY-----'
     local total_lines
     total_lines=$(wc -l < "$output_file" 2>/dev/null || echo 0)
     total_lines=$(echo "$total_lines" | tr -d ' ')
-    if [[ "$total_lines" -gt "$lines_read" ]]; then
+    if [[ "$QUIET" -eq 0 && "$total_lines" -gt "$lines_read" ]]; then
         local new_count=$((total_lines - lines_read))
         local skip_n=$((lines_read + 1))
+        # A flood is not echoed line by line. Each line below costs a fork
+        # (about 240 lines a second), so the 27M trace lines of a busy loop
+        # held a run for 26 h after the command was dead (Audel 2026-10-07).
+        if [[ "$new_count" -gt "$STREAM_MAX_LINES" ]]; then
+            printf '\033[90m  │ [... %s lines not shown ...]\033[0m\n' "$((new_count - STREAM_MAX_LINES))" >&2
+            skip_n=$((total_lines - STREAM_MAX_LINES + 1))
+            new_count=$STREAM_MAX_LINES
+        fi
         # Use tail + head to get new lines (bash 3.2 safe). pipefail OFF in a
         # subshell: the output file is written CONCURRENTLY by the running
         # command, so `head` can close after $new_count lines while `tail` is
         # still reading freshly-appended lines → SIGPIPE to tail. Under the
         # global `set -o pipefail` that made the whole run exit rc=141 (on macOS
         # every streaming run died this way). See design/monolith_run_health.md.
-        ( set +o pipefail; tail -n +"$skip_n" "$output_file" | head -n "$new_count" ) | while IFS= read -r line; do
+        # On versions with a display limit, skip_n can omit newly appended
+        # lines. Track delimiters there before displaying the remaining body.
+        # Read only that new range, keeping the existing display policy intact.
+        if [[ "$skip_n" -gt $((lines_read + 1)) ]]; then
+            local omitted=$((skip_n - lines_read - 1))
+            in_pem=$( ( set +o pipefail; tail -n +"$((lines_read + 1))" "$output_file" | head -n "$omitted" ) |
+                awk -v open="$in_pem" -v begin="$pem_begin" -v end="$pem_end" '
+                    $0 ~ begin { open=1 } $0 ~ end { open=0 } END { print open }')
+        fi
+        while IFS= read -r line; do
+            # A fresh sed per line cannot retain a multiline private-key range.
+            # Track it here, before value masking can hide a delimiter.
+            if [[ "$in_pem" -eq 1 ]]; then
+                [[ "$line" =~ $pem_end ]] && in_pem=0
+                continue
+            elif [[ "$line" =~ $pem_begin ]]; then
+                in_pem=1
+                [[ "$line" =~ $pem_end ]] && in_pem=0
+                line='<redacted:private-key>'
+            fi
             local redacted_line
             redacted_line=$(redact_sensitive "$line")
-            if [[ "$QUIET" -eq 0 ]]; then
-                if [[ "$redacted_line" == +* ]]; then
-                    printf '\033[36m  $ %s\033[0m\n' "${redacted_line#+ }" >&2
-                else
-                    printf '\033[90m  │ %s\033[0m\n' "$redacted_line" >&2
-                fi
+            if [[ "$redacted_line" == +* ]]; then
+                printf '\033[36m  $ %s\033[0m\n' "${redacted_line#+ }" >&2
+            else
+                printf '\033[90m  │ %s\033[0m\n' "$redacted_line" >&2
             fi
-        done
+        done < <( set +o pipefail; tail -n +"$skip_n" "$output_file" | head -n "$new_count" )
     fi
-    printf '%s\n' "$total_lines"
+    printf '%s %s\n' "$total_lines" "$in_pem"
 }
 
 # ---------------------------------------------------------------------------
@@ -3145,9 +3241,9 @@ exit \$__shellm_rc
         printf '%s' "$watchdog_pid" > "$watchdog_pid_file"
 
         # Foreground: poll output file and stream new lines to stderr
-        local lines_read=0
+        local lines_read=0 pem_open=0
         while kill -0 "$exec_pid" 2>/dev/null; do
-            lines_read=$(_stream_new_output "$output_file" "$lines_read")
+            read -r lines_read pem_open <<< "$(_stream_new_output "$output_file" "$lines_read" "$pem_open")"
             sleep 0.2
         done
 
@@ -3159,7 +3255,7 @@ exit \$__shellm_rc
         wait "$watchdog_pid" 2>/dev/null || true
 
         # Drain any remaining output lines
-        _stream_new_output "$output_file" "$lines_read" >/dev/null
+        _stream_new_output "$output_file" "$lines_read" "$pem_open" >/dev/null
 
         # Check if we timed out. The marker carries why, so the feedback the
         # model gets names the real cause instead of guessing at a prompt.
@@ -3178,8 +3274,17 @@ exit \$__shellm_rc
         local had_nested=0
         [[ -s "$activity_file" ]] && had_nested=1
 
-        local output
-        output=$(cat "$output_file")
+        # A block killed for output size keeps only the two ends of what it
+        # wrote: everything below holds the output in one bash variable.
+        local output _out_bytes
+        _out_bytes=$(( $(wc -c < "$output_file") ))
+        if [[ "$timed_out" -eq 1 && "$kill_reason" == "output" && "$_out_bytes" -gt $((OUTPUT_KEEP_BYTES * 2)) ]]; then
+            output="$(head -c "$OUTPUT_KEEP_BYTES" "$output_file")
+[... $((_out_bytes - OUTPUT_KEEP_BYTES * 2)) bytes of output dropped ...]
+$(tail -c "$OUTPUT_KEEP_BYTES" "$output_file" | tail -n +2)"
+        else
+            output=$(cat "$output_file")
+        fi
         rm -f "$output_file" "$exec_pid_file" "$watchdog_pid_file" "$timeout_marker" "$activity_file"
         local _exec_s=$(( $(date +%s) - _exec_t0 ))
 

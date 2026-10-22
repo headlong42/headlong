@@ -59,11 +59,11 @@ The dispatcher is a background process launched by `thinkers start`. It:
 
 1. Reads all `subscriptions.jsonl` files from `$THINKERS_DIR/*/subscriptions.jsonl`
 2. Resolves each `traj_id` to a file path (defaults to `$TRAJ_DIR/$TRAJ_ID`)
-3. Creates a FIFO at `/tmp/headlong-dispatch.XXXXXX/dispatch.fifo`, outside the identity dir so nothing the mind walks can open it, and records the path in `$IDENTITY_DIR/run/fifo_path`
+3. Acquires the dispatcher lock when flock is available, checks its ownership token, then creates a FIFO at `/tmp/headlong-dispatch.XXXXXX/dispatch.fifo`, outside the identity dir so nothing the mind walks can open it, and records the path in `$IDENTITY_DIR/run/fifo_path`
 4. For each unique trajectory file, starts `tail -n 0 -F <file>` piped through a tagger that prefixes each line with the trajectory ID, all writing to the FIFO
-5. Starts a ticker that writes a `TICK` heartbeat line into the FIFO every second
+5. Uses a one-second FIFO read timeout for housekeeping, even when the trajectory is quiet
 6. Main loop reads from FIFO:
-   - On a `TICK` line: fire any pending re-triggers, run the liveness watchdog check (see below), continue
+   - On each housekeeping tick: verify ownership, fire pending re-triggers and due scheduled wakes, run watchdog checks, and repair dead feeders
    - Parse step JSON
    - Extract `type` and `source` fields
    - Find all thinkers whose subscription matches the step type and trajectory
@@ -71,6 +71,41 @@ The dispatcher is a background process launched by `thinkers start`. It:
    - If the thinker already has a step running: set a **pending-trigger flag** instead of dispatching (see below)
    - Run matching thinker's `step` as a background job, passing the step JSON on stdin
 7. Concurrency control: `wait -n` when at `$THINKERS_MAX_CONCURRENT` active jobs (default: 4)
+
+## Dispatcher ownership and scheduled wakes
+
+Each start publishes a random ownership token by atomic rename. Where `flock`
+is available, the dispatcher holds `run/dispatcher.lock` on fd 4 for its
+lifetime. Feeders and thinker steps close that descriptor before running, so
+an orphaned feeder or a draining step cannot keep a replacement dispatcher
+waiting. A contender waits up to 15 seconds. A timeout does not grant cleanup
+rights over the incumbent's runtime. After acquiring the lock, a starter
+checks its token again before publishing shared state. On systems without
+flock, the token check remains the ownership mechanism.
+
+Each dispatcher creates its own FIFO outside the identity directory. Cleanup
+always removes its own FIFO and feeder processes, but removes shared runtime
+files only while it owns them. Stop snapshots the old FIFO path before
+signalling its dispatcher, so even a crash that bypassed EXIT cleanup can be
+cleaned without deleting a successor's FIFO.
+
+A thinker schedules a wake by writing its due epoch to `run/<name>.wake_at`.
+When it is due and the thinker is active and free, the dispatcher moves it to
+`run/claimed/<name>` and refreshes its modification time. A claim older than
+`THINKERS_CLAIM_STALE_SECS` (default 30 seconds) is recovered on a later tick.
+There is one pending due time per thinker: if a valid wake_at already exists,
+it wins and the stale claim is discarded. The missed occurrence is not replayed
+or allowed to advance the new schedule. Distinct occurrences needing separate
+recovery must use distinct thinker names.
+
+Immediately before launching the step, the claim moves to `run/sent/<name>`.
+Sent receipts are discarded, never replayed. A crash after this rename but
+before launch can lose a wake; the receipts do not promise exactly-once
+execution or message delivery. A direct restart after a crash recovers pending
+claims. An explicit `thinkers stop` cancels wake files and receipts for the
+selected thinker, or all thinkers, while already launched steps still follow
+the normal drain policy. Stopping and then starting is therefore different
+from recovering a crashed dispatcher without a stop.
 
 ## Pending Re-Triggers
 
@@ -123,6 +158,11 @@ This prevents infinite loops where a thinker reacts to its own output.
 ```
 $IDENTITY_DIR/run/
   dispatcher.pid        # PID of the dispatcher process
+  dispatcher.token      # Current ownership token
+  dispatcher.lock       # Dispatcher-only flock, where available
+  <name>.wake_at        # One pending due epoch per thinker
+  claimed/<name>        # Claimed but not yet committed to launch
+  sent/<name>           # Committed to launch; never replayed
   fifo_path             # Path of the step-routing named pipe (lives in /tmp)
   tail_pids             # One PID per line for tail -F and ticker processes
   pending/

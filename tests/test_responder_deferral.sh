@@ -368,6 +368,19 @@ plog=$(ls -t "$ID/run/logs/responder-prompts/"*.txt 2>/dev/null | head -1)
 grep -q "No dashes of any kind" "$plog" && grep -q 'put `DEFER:' "$plog" && ! grep -q 'action "defer"' "$plog" \
     && ok "text prompt: voice block present, DEFER-line protocol, no JSON instruction" || bad "text prompt: voice block present, DEFER-line protocol, no JSON instruction" "$plog"
 
+# --- 19. two inbounds, same holding text inside the window: the second
+#        still sends (the deferral holding line is deliberate, --force) ------
+printf '{"step_id":"trig-19a","type":"message","from":"%s","to":"%s","content":"can you look at the grinder?","ts":"%s","source":"chat"}\n' "$THEM" "$ME" "$(now)" >> "$TRAJ"
+printf 'DEFER: check the grinder state and report\nWorking on it.\n' > "$STUB_REPLY_FILE"
+run_responder "$(grep -F '"step_id":"trig-19a"' "$TRAJ")"
+first=$(jq -r 'select(.type=="message" and .from=="testid" and .reply_to=="trig-19a") | .content' "$TRAJ" | tail -1)
+[[ "$first" == "Working on it." ]] || { echo "SKIP second-holding-line test: first holding line missing" >> "$WORK/step.log"; }
+printf '{"step_id":"trig-19b","type":"message","from":"%s","to":"%s","content":"also look at the lathe?","ts":"%s","source":"chat"}\n' "$THEM" "$ME" "$(now)" >> "$TRAJ"
+printf 'DEFER: check the lathe state and report\nWorking on it.\n' > "$STUB_REPLY_FILE"
+run_responder "$(grep -F '"step_id":"trig-19b"' "$TRAJ")"
+second=$(jq -r 'select(.type=="message" and .from=="testid" and .reply_to=="trig-19b") | .content' "$TRAJ" | tail -1)
+[[ "$second" == "Working on it." ]] && ok "a second deferral holding line inside the window still sends (--force exemption)" || bad "a second deferral holding line inside the window still sends (--force exemption)" "got '$second'"
+
 echo
 echo "$pass passed, $fail failed"
 [[ $fail -eq 0 ]]

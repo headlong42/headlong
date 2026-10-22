@@ -8,6 +8,7 @@
 # goal-review hint fires on the first wake and not on the next, and the
 # active-goals section lists a todo with its type.
 set -uo pipefail
+export SHELLM_ENV=local
 unset IDENTITY_DIR IDENTITY_NAME MEM_DIR TRAJ_DIR TRAJ_ID ROOT_TRAJ_ID 2>/dev/null
 HERE="$(cd "$(dirname "$0")" && pwd)"; REPO="$(dirname "$HERE")"; STEP="$REPO/thinkers/monolith/step"
 pass=0; fail=0
@@ -97,6 +98,26 @@ run_step "$WAKE" STUB_FAIL=1
 e=$(grep '"reason":"run-failed"' "$TRAJ" | tail -1)
 printf '%s' "$e" | jq -e '.rc == 1 and (.stderr_tail | test("502 upstream")) and (.content | test("502 upstream"))' >/dev/null 2>&1 \
     && ok "a failed run's error step carries the last stderr lines" || bad "failed run reason" "$e"
+
+# Historical fixtures bypass traj append deliberately: old records predate
+# write-time sanitization. No real credentials or model calls are involved.
+pem_begin=$(printf '%s' '-----BEGIN ' 'PRIVATE KEY-----')
+pem_end=$(printf '%s' '-----END ' 'PRIVATE KEY-----')
+for fixture in complete incomplete auth; do
+    case "$fixture" in
+        complete) content="before $pem_begin"$'\nU1lOVEhFVElD\n'"$pem_end after" ;;
+        incomplete) content="before $pem_begin"$'\nU1lOVEhFVElD' ;;
+        auth) content='{"auth":"U1lOVEhFVElDOk5PVF9BX1NFQ1JFVA=="}' ;;
+    esac
+    printf '%s' "$content" | jq -Rsc '{step_id:"historical-fixture",type:"thought",content:.,source:"test"}' > "$TRAJ"
+    run_step "$WAKE" MONOLITH_RELATED_MEMORIES=0
+    if grep -q 'U1lOVEhFVElD' "$STUB_CAPTURE"; then bad "$fixture credential removed"
+    else ok "$fixture credential removed"; fi
+    grep -q '^Routing signals:' "$STUB_CAPTURE" && ok "$fixture routing preserved" || bad "$fixture routing preserved"
+    grep -q 'Choose ONE function for this wakeup' "$STUB_CAPTURE" && ok "$fixture final instruction preserved" || bad "$fixture final instruction preserved"
+    grep -q '\*\*share\*\*' "$STUB_CAPTURE" && ok "$fixture function menu preserved" || bad "$fixture function menu preserved"
+    grep -q '^</context>' "$STUB_CAPTURE" && ok "$fixture menu boundary preserved" || bad "$fixture menu boundary preserved"
+done
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]
