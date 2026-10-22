@@ -1019,5 +1019,124 @@ def multiline_recorded_bytes():
     newline_case(c,'violations\r\nfound','No violations\r\nfound',False)
 check('coordinator multiline matching preserves recorded bytes and excludes CRLF echoes',multiline_recorded_bytes)
 
+def history_concurrency(stage):
+    """Pause real tool boundaries; let B replace shared history before A resumes."""
+    import signal
+    import time
+
+    a=Case('history-race-'+stage+'-a'); b=Case('history-race-'+stage+'-b')
+    shared=ROOT/('history-race-'+stage+'-cache')
+    phrases=('Alpha owned historical phrase', 'Beta owned historical phrase')
+    for c, phrase in zip((a,b), phrases):
+        td=c.root/'history';td.mkdir()
+        rows=[dict(type='reasoning',run_id='fixture',cmd='python3 probe.py'),
+              dict(type='shell-output',run_id='fixture',stdout=phrase)]
+        (td/'events.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in rows))
+        c.env.update(SKILL_AUTO_HARVEST='1',SKILL_HARVEST_TRAJ_DIR=str(td),
+                     SKILL_HARVEST_MIN_COUNT='1',SKILL_HARVEST_CACHE=str(shared))
+    # A's result exercises occurrence provenance as well as the teacher's pool.
+    a.tests([dict(name='history',prompt='Run the probe.',expect='final',
+                  expect_contains=list(phrases))])
+    a.output('\n'.join(phrases))
+    if stage=='cached':
+        a.run('pool')  # Seed a valid reusable A cache before the overlap.
+
+    wrapped=a.root/'barrier-tools';wrapped.mkdir()
+    # These launchers still execute the actual Python/jq code. Only A pauses,
+    # once, at the chosen handoff. No compiler test hooks or fabricated results.
+    barrier=r'''import os, pathlib, subprocess, sys, time
+name=pathlib.Path(sys.argv[0]).name
+root=pathlib.Path(os.environ['CASE_ROOT'])
+stage=os.environ['HISTORY_RACE_STAGE']
+harvest=name=='python3' and 'SKILL_HARVEST_FILES' in os.environ
+cached=name=='jq' and any('.schema == 2 and .skill_path' in x for x in sys.argv)
+provenance=name=='python3' and 'results_json_file' in os.environ
+selected=(stage in ('input','published') and harvest or stage=='cached' and cached
+          or stage=='provenance' and provenance)
+if selected and not (root/'barrier-ready').exists():
+    tool=os.environ['REAL_PYTHON' if name=='python3' else 'REAL_JQ']
+    if stage in ('published','cached'):
+        rc=subprocess.run([tool]+sys.argv[1:]).returncode
+        if rc: sys.exit(rc)
+    (root/'barrier-ready').write_text(stage)
+    deadline=time.monotonic()+45
+    while not (root/'barrier-release').exists():
+        if time.monotonic()>deadline: raise SystemExit('history barrier timed out')
+        time.sleep(.02)
+    if stage in ('published','cached'): sys.exit(0)
+'''
+    for name in ('python3','jq'):
+        p=wrapped/name;p.write_text('#!'+PYTHON+'\n'+barrier+STUB);p.chmod(0o755)
+    a.env.update(PATH=str(wrapped)+os.pathsep+a.env['PATH'],HISTORY_RACE_STAGE=stage)
+    bash=os.environ.get('SC_TEST_BASH','/bin/bash' if sys.platform=='darwin' else 'bash')
+    children=[]
+
+    def start(c, command):
+        # Own the whole compiler group, including launchers blocked at barriers.
+        out=(c.root/'concurrent.stdout').open('w');err=(c.root/'concurrent.stderr').open('w')
+        try:
+            p=subprocess.Popen([bash,str(SC),command,'--skill','probe'],env=c.env,
+                               cwd=c.root,stdout=out,stderr=err,start_new_session=True)
+        finally:
+            out.close();err.close()
+        children.append(p)
+        return p
+
+    try:
+        pa=start(a,'compile')
+        deadline=time.monotonic()+30
+        while not (a.root/'barrier-ready').exists():
+            assert pa.poll() is None, (a.root/'concurrent.stderr').read_text()
+            assert time.monotonic()<deadline, 'A did not reach '+stage+' barrier'
+            time.sleep(.02)
+        pb=start(b,'pool')
+        assert pb.wait(timeout=30)==0, (b.root/'concurrent.stderr').read_text()
+        bpool=json.loads((b.root/'concurrent.stdout').read_text())
+        assert phrases[1] in bpool and phrases[0] not in bpool, bpool
+        blob=json.loads((shared/'pool-history-probe.json').read_text())
+        assert blob['skill_path']==str(b.skills/'probe') and blob['traj_path']==str(b.root/'history')
+        assert [r['line'] for r in blob['entries']]==[phrases[1]], blob
+        (a.root/'barrier-release').touch()
+        assert pa.wait(timeout=45)==0, (a.root/'concurrent.stderr').read_text()
+        prompt=(a.root/'teacher-prompt').read_text()
+        result=a.result()['tests'][0]
+        # Record both claims before asserting, so negative baselines show which
+        # handoff failed even when the later provenance harvest repaired itself.
+        evidence=dict(stage=stage,teacher_alpha=phrases[0] in prompt,
+                      teacher_beta=phrases[1] in prompt,result=result)
+        (a.root/'race-evidence.json').write_text(json.dumps(evidence,indent=2))
+        assert evidence['teacher_alpha'] and not evidence['teacher_beta'], evidence
+        assert result['pass'] is True, result
+        assert result['literal_sources'][phrases[0]]=='TOOL-OUTPUT', result
+        assert result['literal_sources'][phrases[1]]!='TOOL-OUTPUT', result
+        assert result['literal_labels'][phrases[0]]=='POOL-EXACT', result
+        assert result['literal_labels'][phrases[1]]=='INVENTED', result
+    finally:
+        (a.root/'barrier-release').touch()
+        for p in children:
+            try: os.killpg(p.pid,signal.SIGKILL)
+            except ProcessLookupError: pass
+            p.wait(timeout=5)
+
+for stage in ('input','published','cached','provenance'):
+    check('history concurrency '+stage,lambda stage=stage:history_concurrency(stage))
+
+def history_unavailable_cache():
+    c=Case('history-unavailable-cache');td=c.root/'history';td.mkdir()
+    phrase='Private harvest survives unavailable publication'
+    rows=[dict(type='reasoning',run_id='fixture',cmd='python3 probe.py'),
+          dict(type='shell-output',run_id='fixture',stdout=phrase)]
+    (td/'events.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in rows))
+    unavailable=c.root/'not-a-directory';unavailable.write_text('untouched')
+    c.env.update(SKILL_AUTO_HARVEST='1',SKILL_HARVEST_TRAJ_DIR=str(td),
+                 SKILL_HARVEST_MIN_COUNT='1',SKILL_HARVEST_CACHE=str(unavailable))
+    c.tests([dict(name='history',prompt='Run the probe.',expect='final',expect_contains=[phrase])])
+    c.output(phrase);c.run()
+    assert phrase in (c.root/'teacher-prompt').read_text()
+    result=c.result()['tests'][0]
+    assert result['pass'] is True and result['literal_sources'][phrase]=='TOOL-OUTPUT', result
+    assert unavailable.read_text()=='untouched'
+check('history concurrency publication is optional',history_unavailable_cache)
+
 print(f'{count-failed} regression checks passed, {failed} failed',flush=True)
 sys.exit(bool(failed))

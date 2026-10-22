@@ -142,6 +142,9 @@ History caches live under `<state-home>/skill-compiler/history`, overridden by
 `SKILL_HARVEST_CACHE`. TTL is `SKILL_HARVEST_TTL` seconds (3600);
 `SKILL_HARVEST_REFRESH=1` rebuilds. `SKILL_HARVEST_ECHO_FILTER=music` optionally
 filters note/interval echoes; it is off for general skills.
+Each harvest keeps a private file list and result for its caller. Cached results
+are copied before validation, so a concurrent cache replacement cannot change
+the history used by that caller. Shared cache publication is best effort.
 
 Generated tests contain `name`, `prompt`, `expect` (`final`, `observation`,
 `shell-output`, or `error`), and optional `expect_contains` strings. `[]` means

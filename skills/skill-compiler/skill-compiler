@@ -398,30 +398,38 @@ harvest_history_pool() {
     fi
     [[ -n "$script" ]] || return 1
     local cache_dir="${SKILL_HARVEST_CACHE:-$_sc_state/skill-compiler/history}"
-    mkdir -p "$cache_dir" 2>/dev/null || return 1
+    mkdir -p "$cache_dir" 2>/dev/null || true
+    # Shared history is only a reusable publication. Every caller reads its own
+    # snapshot, including when another root uses the same skill basename.
+    local history_dir snapshot
+    history_dir=$(mktemp -d "$SC_SCRATCH/history.XXXXXX") || return 1
+    snapshot="$history_dir/pool.json"
     local cache="$cache_dir/pool-history-$skill_name.json"
     local traj_dir="${SKILL_HARVEST_TRAJ_DIR:-${TRAJ_DIR:-$_sc_state/trajectories}}"
     [[ -d "$traj_dir" ]] || return 1
     traj_dir=$(cd "$traj_dir" && pwd -P)
     local ttl="${SKILL_HARVEST_TTL:-3600}"
     [[ "$ttl" =~ ^[0-9]+$ ]] || ttl=3600
+    # Copy before validation; cp -p retains the cache age on the same bytes
+    # that will be validated and consumed. A concurrent rename cannot switch it.
     if [[ -f "$cache" && -z "${SKILL_HARVEST_REFRESH:-}" ]] &&
+       cp -p "$cache" "$snapshot" 2>/dev/null &&
        _sc_jq -e --arg skill "$skill_abs" --arg traj "$traj_dir" --arg echo "${SKILL_HARVEST_ECHO_FILTER:-none}" --argjson count "${SKILL_HARVEST_MIN_COUNT:-2}" \
-       '.schema == 2 and .skill_path == $skill and .traj_path == $traj and .echo_filter == $echo and .min_count == $count' "$cache" >/dev/null 2>&1; then
+       '.schema == 2 and .skill_path == $skill and .traj_path == $traj and .echo_filter == $echo and .min_count == $count' "$snapshot" >/dev/null 2>&1; then
         local now mtime
         now=$(date +%s 2>/dev/null || echo 0)
-        mtime=$(stat -c %Y "$cache" 2>/dev/null || stat -f %m "$cache" 2>/dev/null || echo 0)
+        mtime=$(stat -c %Y "$snapshot" 2>/dev/null || stat -f %m "$snapshot" 2>/dev/null || echo 0)
         if [[ "$now" -gt 0 && "$mtime" -gt 0 && $((now - mtime)) -lt "$ttl" ]]; then
-            printf '%s\n' "$cache"
+            printf '%s\n' "$snapshot"
             return 0
         fi
     fi
     [[ -d "$traj_dir" ]] || return 1
-    local files_list="$cache_dir/files-$skill_name.txt"
+    local files_list="$history_dir/files.txt"
     grep -rlF --include='*.jsonl' -m1 "$script" "$traj_dir" 2>/dev/null | head -300 > "$files_list" || true
     [[ -s "$files_list" ]] || return 1
     SKILL_HARVEST_SKILL_ABS="$skill_abs" SKILL_HARVEST_SCRIPT="$script" \
-    SKILL_HARVEST_FILES="$files_list" SKILL_HARVEST_OUT="$cache" SKILL_HARVEST_ROOT="$traj_dir" \
+    SKILL_HARVEST_FILES="$files_list" SKILL_HARVEST_OUT="$snapshot" SKILL_HARVEST_PUBLISH="$cache" SKILL_HARVEST_ROOT="$traj_dir" \
     SKILL_HARVEST_MIN_COUNT="${SKILL_HARVEST_MIN_COUNT:-2}" python3 - <<'PY' 2>/dev/null || return 1
 import json, os, re, collections
 skill_abs = os.environ["SKILL_HARVEST_SKILL_ABS"]
@@ -503,9 +511,25 @@ import tempfile
 fd, tmp = tempfile.mkstemp(dir=os.path.dirname(out_path))
 with os.fdopen(fd, "w") as f: json.dump(blob, f, indent=1)
 os.replace(tmp, out_path)
+# Publish atomically for later invocations, but never return the shared path.
+# A failed optional publication must not discard this caller's valid harvest.
+import shutil
+publish = os.environ["SKILL_HARVEST_PUBLISH"]
+tmp = None
+try:
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(publish))
+    with os.fdopen(fd, "wb") as dst, open(out_path, "rb") as src:
+        shutil.copyfileobj(src, dst)
+    os.replace(tmp, publish)
+except OSError:
+    pass
+finally:
+    if tmp:
+        try: os.unlink(tmp)
+        except OSError: pass
 PY
-    [[ -s "$cache" ]] || return 1
-    printf '%s\n' "$cache"
+    [[ -s "$snapshot" ]] || return 1
+    printf '%s\n' "$snapshot"
 }
 # Caps are counts, not jq slices with implicit coercion or fallback defaults.
 _sc_cap() {
