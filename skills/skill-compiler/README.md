@@ -152,3 +152,10 @@ no literal assertions. Empty or whitespace-only elements are invalid. Nonblank
 strings retain their exact whitespace; they are not trimmed. The response parser
 can skip bracketed prose or unrelated JSON before the first schema-valid case
 array, but never relaxes the case schema.
+
+NUL bytes are unsupported in test names, prompts and expected literals; such
+teacher cases are rejected before the runner starts. NUL in selected runner
+output, final/observation text or command echo text produces a `harness_error`,
+with assertions unchecked and a nonzero compile status. Bytes are never silently
+removed to make a match. Ordinary Unicode, whitespace, LF and CRLF remain
+supported; `[]` still explicitly requests no literal assertions.

@@ -1138,5 +1138,82 @@ def history_unavailable_cache():
     assert unavailable.read_text()=='untouched'
 check('history concurrency publication is optional',history_unavailable_cache)
 
+def nul_teacher(field, value, suffix):
+    c=Case('nul-teacher-'+suffix)
+    case=dict(name='probe',prompt='Run the probe.',expect='final',
+              expect_contains=['Victory phrase stable'])
+    case[field]=[value] if field=='expect_contains' else value
+    c.tests([case]);r=c.run(success=False)
+    assert r.returncode!=0 and 'NUL' in r.stderr, (r.returncode,r.stderr[-300:])
+    assert not (c.root/'runner-selectors.json').exists()
+    assert not (c.root/'shell-prompt').exists()
+    assert not (c.cache/'probe.json').exists() and not (c.cache/'probe.md').exists()
+for suffix, value in [('start','\0Victory phrase stable'),
+                      ('middle','Victory phrase\0 stable'),
+                      ('end','Victory phrase stable\0'),('only','\0')]:
+    check('NUL boundary teacher literal '+suffix,
+          lambda value=value,suffix=suffix:nul_teacher('expect_contains',value,suffix))
+for field in ('name','prompt'):
+    check('NUL boundary teacher '+field,
+          lambda field=field:nul_teacher(field,'Run\0probe',field))
+
+
+def nul_evidence(kind, field, multiline=False):
+    c=Case('nul-evidence-'+kind+'-'+field+('-multiline' if multiline else ''))
+    c.env['SC_KEEP_RUNS']='1'
+    literal='Victory phrase stable\nNext line\r\n' if multiline else 'Victory phrase stable'
+    c.tests([dict(name='before',prompt='Run the probe.',expect='final',expect_contains=[literal]),
+             dict(name='binary',prompt='Run the probe.',expect='final',expect_contains=[literal])])
+    good=[dict(type='shell-output',stdout=literal),dict(type='final',content='Reported.')]
+    # The first case succeeds. Only the second runner writes binary evidence.
+    bad=[dict(type=kind,**{field:literal.replace('phrase','phrase\0')}),
+         dict(type='final',content='Reported.')]
+    wrapper=c.root/'runner';wrapper.mkdir()
+    prefix='''import json, os, pathlib
+root=pathlib.Path(os.environ['CASE_ROOT'])
+counter=root/'runner-count'
+n=int(counter.read_text())+1 if counter.exists() else 1
+counter.write_text(str(n))
+rows=json.loads((root/('good.json' if n==1 else 'bad.json')).read_text())
+(root/'trajectory.jsonl').write_text(''.join(json.dumps(r)+'\\n' for r in rows))
+'''
+    (c.root/'good.json').write_text(json.dumps(good))
+    (c.root/'bad.json').write_text(json.dumps(bad))
+    stub=wrapper/'shellm';stub.write_text('#!'+PYTHON+'\n'+prefix+STUB);stub.chmod(0o755)
+    c.env['PATH']=str(wrapper)+os.pathsep+c.env['PATH']
+    r=c.run(success=False);results=c.result()['tests']
+    assert r.returncode!=0, 'binary evidence silently accepted'
+    assert len(results)==2 and results[0]['pass'] is True, results
+    t=results[1]
+    assert t['pass'] is False and 'NUL' in t['harness_error'], t
+    assert t['expect_contains_unchecked']==[literal] and t['expect_contains_missed']==[],t
+    assert t['expect_contains_matched']==0 and t['verification']!='VERIFIED',t
+    raw=list((c.root/'runs').rglob('trajectory.jsonl'))
+    assert any(any('\0' in str(row.get(field,'')) for row in
+                   [json.loads(line) for line in p.read_text().splitlines()]) for p in raw), raw
+for kind, field in [('shell-output','stdout'),('shell-output','stderr'),
+                    ('shell-output','content'),('final','content'),('final','details'),
+                    ('observation','content'),('observation','details'),('reasoning','cmd')]:
+    check('NUL boundary evidence '+kind+' '+field,
+          lambda kind=kind,field=field:nul_evidence(kind,field))
+check('NUL boundary evidence multiline',lambda:nul_evidence('observation','content',True))
+
+
+def nul_supported_controls():
+    c=Case('nul-supported-controls')
+    literal='Café 漢字\nNext line\r\n'
+    cases=[dict(name='Café 漢字',prompt='Run the probe.\r\n',expect='shell-output',expect_contains=[literal]),
+           dict(name='no literals',prompt='Run the probe.',expect='final',expect_contains=[])]
+    invalid=[dict(name='bad\0name',prompt='Run.',expect='final',expect_contains=[])]
+    (c.root/'tests.json').write_text('Unrelated [prose] '+json.dumps(invalid)+'\n'+json.dumps(cases))
+    c.output(literal)
+    # A different run's binary row is not selected evidence.
+    with (c.root/'trajectory.jsonl').open('a') as f:
+        f.write(json.dumps(dict(type='final',content='other\0run',run_id='unrelated'))+'\n')
+    c.run();results=c.result()['tests']
+    assert len(results)==2 and all(t['pass'] for t in results),results
+    assert [t['test'] for t in results]==cases,results
+check('NUL boundary supported controls and later valid array',nul_supported_controls)
+
 print(f'{count-failed} regression checks passed, {failed} failed',flush=True)
 sys.exit(bool(failed))

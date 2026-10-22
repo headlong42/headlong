@@ -872,11 +872,11 @@ def valid(cases):
     if not isinstance(cases, list) or not cases: return False
     for case in cases:
         if not isinstance(case, dict): return False
-        if not all(isinstance(case.get(k), str) for k in ("name", "prompt")): return False
+        if not all(isinstance(case.get(k), str) and "\x00" not in case[k] for k in ("name", "prompt")): return False
         if case.get("expect") not in ("final", "observation", "shell-output", "error"): return False
         literals = case.get("expect_contains", [])
         if not isinstance(literals, list): return False
-        if not all(isinstance(lit, str) and lit.strip() for lit in literals): return False
+        if not all(isinstance(lit, str) and lit.strip() and "\x00" not in lit for lit in literals): return False
     return True
 decoder = json.JSONDecoder()
 for i, char in enumerate(text):
@@ -888,7 +888,7 @@ for i, char in enumerate(text):
         break
 else:
     raise SystemExit(1)
-') || die "Teacher returned invalid test cases (expected a case array with nonblank literal strings; use [] for no literals)"
+') || die "Teacher returned invalid test cases (expected NUL-free name, prompt and nonblank literal strings; use [] for no literals)"
 
     # The requested count is a budget ceiling, even if the teacher returns more.
     printf '%s' "$tests_json" | _sc_jq --argjson n "$num_tests" '.[:$n]'
@@ -1010,6 +1010,13 @@ try:
         if any(r.get("type") == "shellm-run" and r.get("step_id") == run_id for r in rows):
             matches.append([r for r in rows if r.get("run_id") == run_id])
     if len(matches) != 1: raise ValueError("expected exactly one root trajectory for launched run")
+    # Bash cannot represent NUL. Reject evidence before any shell extraction,
+    # including command text used to exclude echoes, rather than joining bytes.
+    for row in matches[0]:
+        for field in ("type", "content", "details", "stdout", "stderr", "cmd"):
+            value = row.get(field)
+            if isinstance(value, str) and "\x00" in value:
+                raise ValueError("unsupported NUL in runner evidence field " + field)
     with out.open("w") as f:
         for r in matches[0]: f.write(json.dumps(r) + "\n")
 except (OSError, ValueError, TypeError, AttributeError) as e:
