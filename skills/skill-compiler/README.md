@@ -46,7 +46,10 @@ Only run trusted skills. Both `compile` and `pool` can execute a skill script
 with no arguments and with `--help`, in scratch with a 15-second deadline.
 Remaining probe process-group members are killed on normal exit and timeout.
 Both probes and tests use separate work, state-home, memory and trajectory
-directories and clear caller identity/run selectors. This is not an OS
+directories and clear caller identity/run selectors. CHATRC and SKILLSRC point
+to empty per-run files; THINKERS_DIR and SHELLM_BROKER_DIR point to per-run
+directories. The compiler calls `skills prompt` from that disposable workdir,
+so neither an explicit caller rc nor the caller cwd's `.skillsrc` is loaded. This is not an OS
 sandbox and does not revoke inherited credentials or other filesystem access.
 The fixed refusal list excludes known messaging, credential and live-store
 skills, including Obsidian. It rejects path spellings and aliases that bypass those names; installed
@@ -63,9 +66,12 @@ reinstallation. State home follows `HEADLONG_HOME`, then `SHELLM_HOME`, then
 
 Each skill has a Markdown summary, JSON results, a `.json.prov` provenance
 sidecar, and `pool-<skill>.json` containing offered and dropped vocabulary.
+Each compile captures one private complete pool snapshot for synthesis and report
+attestation, including `summary.pool_truncated`. Replacing or removing the shared
+pool cache during execution does not change that invocation's labels.
 `clean` removes all four. Invocation scratch and completed test runs are removed
 on exit. Set `SC_KEEP_RUNS=1` to retain them for debugging; their location is
-printed to stderr. `SC_TMP_BASE` and `SC_RUNS_BASE` override scratch locations.
+printed to stderr, including each run path when `SC_RUNS_BASE` is separate. `SC_TMP_BASE` and `SC_RUNS_BASE` override scratch locations.
 
 Every expectation requires shellm to exit successfully and evidence from the
 actual launched root run. A nested run's answer or another run's rows cannot
@@ -134,4 +140,8 @@ History caches live under `<state-home>/skill-compiler/history`, overridden by
 filters note/interval echoes; it is off for general skills.
 
 Generated tests contain `name`, `prompt`, `expect` (`final`, `observation`,
-`shell-output`, or `error`), and optional `expect_contains` strings.
+`shell-output`, or `error`), and optional `expect_contains` strings. `[]` means
+no literal assertions. Empty or whitespace-only elements are invalid. Nonblank
+strings retain their exact whitespace; they are not trimmed. The response parser
+can skip bracketed prose or unrelated JSON before the first schema-valid case
+array, but never relaxes the case schema.

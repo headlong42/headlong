@@ -27,7 +27,7 @@ trap 'rm -rf "$WORK"' EXIT
 # Isolate all state, credentials and tool configuration, including when run alone.
 for var in $(env | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p'); do
     case "$var" in
-        SKILL_*|SC_*|HEADLONG_*|SHELLM_*|LLM_*|*_API_KEY|*_TOKEN|MEM_DIR|TRAJ_*|ROOT_TRAJ_ID) unset "$var" ;;
+        SKILL_*|SC_*|HEADLONG_*|SHELLM_*|LLM_*|*_API_KEY|*_TOKEN|MEM_DIR|TRAJ_*|ROOT_TRAJ_ID|CHATRC|SKILLSRC|THINKERS_DIR) unset "$var" ;;
     esac
 done
 export HOME="$WORK/home" HEADLONG_HOME="$WORK/home/.headlong" SHELLM_ENV=local
@@ -260,9 +260,9 @@ export STUB_LLM_LOG="$WORK/llm-bins.log"
 rm -f "$STUB_LLM_LOG"
 run_sc compile --skill fixture-bins --num-tests 3 --max-iterations 3 >/dev/null 2>&1 || true
 if [[ -f "$STUB_LLM_LOG" ]] && grep -q 'PROMPT-EXPECT AGREEMENT' "$STUB_LLM_LOG" && grep -q 'NO PLACEHOLDER SCAFFOLDING' "$STUB_LLM_LOG" && grep -q 'EXPECT THE OUTPUT NOT THE COMMAND' "$STUB_LLM_LOG" && grep -q 'definitely-not-installed-xyz: NOT INSTALLED' "$STUB_LLM_LOG" && grep -q 'bash: installed' "$STUB_LLM_LOG"; then
-  ok "teacher prompt carries rules 15-18 and the bins install status"
+  ok "teacher prompt carries rules 1-4 and the bins install status"
 else
-  bad "teacher prompt carries rules 15-18 and the bins install status" "log=$WORK/llm-bins.log"
+  bad "teacher prompt carries rules 1-4 and the bins install status" "log=$WORK/llm-bins.log"
 fi
 rm -rf "$SKILL_COMPILED_DIR/fixture-bins.json" "$SKILL_COMPILED_DIR/fixture-bins.md"
 

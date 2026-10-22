@@ -14,6 +14,11 @@ export TMPDIR="$SC_SCRATCH"
 cleanup() {
     if [[ "${SC_KEEP_RUNS:-0}" == 1 ]]; then
         printf '[skill-compiler] Retained scratch: %s\n' "$SC_SCRATCH" >&2
+        if [[ -f "$SC_SCRATCH/runs" ]]; then
+            while IFS= read -r run; do
+                printf '[skill-compiler] Retained run: %s\n' "$run" >&2
+            done < "$SC_SCRATCH/runs"
+        fi
     else
         if [[ -f "$SC_SCRATCH/runs" ]]; then
             while IFS= read -r run; do rm -rf -- "$run"; done < "$SC_SCRATCH/runs"
@@ -44,14 +49,14 @@ usage() {
 skill-compiler — Validate a skill specification and save a report
 
 Usage:
-  skill-compiler compile --skill <name> [--teacher-model <model>] [--num-tests <n>]
+  skill-compiler compile --skill <name> [--teacher-model <model>] [--num-tests <n>] [--max-iterations <n>]
   skill-compiler list
   skill-compiler pool --skill <name>
   skill-compiler show --skill <name>
   skill-compiler clean --skill <name>
 
 Options:
-  --skill NAME            Skill to compile (directory name under skills/ or kernel/)
+  --skill NAME            Skill directory name under SKILLS_DIR or SKILLS_KERNEL_DIR
   --teacher-model MODEL   Teacher model for test synthesis (default: llm configuration)
   --num-tests N           Maximum test cases to execute (default: 8)
   --max-iterations N      Max shellm iterations per test (default: 15)
@@ -125,7 +130,7 @@ for root in roots:
             if os.path.commonpath([real, target]) != real:
                 raise SystemExit("skill contains an escaping symlink (compile skip-list guard)")
     text = open(spec).read()
-    fm = re.match(r"\A---\s*\n(.*?)\n---(?:\n|$)", text, re.S)
+    fm = re.match(r"\A---[ \t]*\n(.*?)\n---[ \t]*(?:\n|$)", text, re.S)
     declared = re.search(r"(?m)^name:\s*([^\n]+)", fm[1]) if fm else None
     if declared and declared[1].strip(" \"'") in blocked:
         raise SystemExit("declared skill is on the compile skip-list")
@@ -455,13 +460,18 @@ _sc_isolate_state() {
     export SHELLM_CONF_DIR="$root/state" SHELLM_ENVS_DIR="$root/state/envs"
     export MEM_DIR="$root/memories" TRAJ_DIR="$root/traj" SHELLM_TRAJ_DIR="$root/traj"
     export SHELLM_RUNDIR="$root" SHELLM_WORKDIR="$root" SHELLM_WORKDIRS_DIR="$root/workdirs"
-    mkdir -p "$HEADLONG_HOME" "$MEM_DIR" "$TRAJ_DIR" "$SHELLM_WORKDIRS_DIR" "$SHELLM_ENVS_DIR"
+    export CHATRC="$root/chatrc" SKILLSRC="$root/skillsrc"
+    export THINKERS_DIR="$root/thinkers" SHELLM_BROKER_DIR="$root/broker"
+    mkdir -p "$HEADLONG_HOME" "$MEM_DIR" "$TRAJ_DIR" "$SHELLM_WORKDIRS_DIR" "$SHELLM_ENVS_DIR" \
+        "$THINKERS_DIR" "$SHELLM_BROKER_DIR"
+    : > "$CHATRC"
+    : > "$SKILLSRC"
 }
 
 capture_phrase_pool() {
     _sc_positive_integer SKILL_HARVEST_MIN_COUNT "${SKILL_HARVEST_MIN_COUNT-2}" || return 1
 
-    local skill_abs="$1"
+    local skill_abs="$1" snapshot="${2:-}"
     local cap src_cap live_cap hist_cap
     cap=$(_sc_cap SKILL_POOL_CAP "${SKILL_POOL_CAP-400}") || return 1
     src_cap=$(_sc_cap SKILL_POOL_SRC_CAP "${SKILL_POOL_SRC_CAP-200}") || return 1
@@ -570,7 +580,7 @@ text = open(p, errors="replace").read() if os.path.isfile(p) else ""
 # the YAML frontmatter (requires: env/bins/anyBins/os), so stripping the
 # frontmatter left the pool empty and every literal invented (pool-vacuity map,
 # test-skill 8/8 INVENTED). Harvest the metadata key names and scalar values too.
-_m = re.match(r"\A---\n(.*?)\n---\n", text, flags=re.S)
+_m = re.match(r"\A---[ \t]*\n(.*?)\n---[ \t]*(?:\n|$)", text, flags=re.S)
 _fm = _m.group(1) if _m else ""
 if _m:
     text = text[_m.end():]
@@ -592,7 +602,6 @@ for _line in _fm.splitlines():
     for _tok in re.split(r"[\[\]{}\",]+", _line):
         emit_meta(_tok.strip(" :"))
 
-text = re.sub(r"\A---\n.*?\n---\n", " ", text, count=1, flags=re.S)
 for block in re.findall(r"\x60\x60\x60[A-Za-z0-9_-]*\n(.*?)\x60\x60\x60", text, flags=re.S):
     for line in block.splitlines():
         line = line.strip()
@@ -647,6 +656,11 @@ PY
         | {offered: $offered, dropped: ($all - $offered), pool_total: ($all | length),
            pool_offered: ($offered | length), pool_dropped: (($all - $offered) | length),
            pool_version: "v7-ranked-source-caps"}') || return 1
+    # Save the invocation snapshot directly from capture, never by rereading
+    # the shared diagnostic cache after another compile/pool/clean can change it.
+    if [[ -n "$snapshot" ]]; then
+        printf '%s' "$pool_json" > "$snapshot" || return 1
+    fi
     if [[ -n "${COMPILED_DIR:-}" ]]; then
         mkdir -p "$COMPILED_DIR" 2>/dev/null || true
         printf '%s' "$pool_json" > "$COMPILED_DIR/pool-$(basename "${skill_abs%/}").json" || return 1
@@ -756,24 +770,32 @@ print(re.sub("|".join(map(re.escape,values)), lambda m: values[m[0]], sys.stdin.
     [ "$llm_rc" -eq 0 ] || die "Teacher model call failed (rc=$llm_rc, model=${teacher_model:-llm configured default}): ${tests_json:0:500} stderr: $(head -c 300 "$llm_err_file" 2>/dev/null)"
     [ -n "$tests_json" ] || die "Teacher model returned empty output (model=${teacher_model:-llm configured default})"
 
-    # Extract JSON array from response (handle potential markdown fences)
-    extracted=$(printf '%s' "$tests_json" | python3 -c '
-import sys,json
-s = sys.stdin.read()
-i = s.find(chr(91))
-if i < 0: raise SystemExit
-obj, _ = json.JSONDecoder().raw_decode(s[i:])
-print(json.dumps(obj))
-' 2>/dev/null) || extracted=""
-    [ -n "$extracted" ] && tests_json="$extracted"
-
-    # Validate JSON
-    printf '%s' "$tests_json" | _sc_jq -e '
-        type == "array" and length > 0 and all(.[];
-          type == "object" and (.name | type == "string") and (.prompt | type == "string")
-          and (.expect == "final" or .expect == "observation" or .expect == "shell-output" or .expect == "error")
-          and ((.expect_contains // []) | type == "array" and all(.[]; type == "string")))
-    ' >/dev/null || die "Teacher returned invalid test cases"
+    # Skip bracketed prose and unrelated JSON; accept only a complete case
+    # array. Validate here once, retaining every accepted literal byte-for-byte.
+    tests_json=$(printf '%s' "$tests_json" | python3 -c '
+import json, sys
+text = sys.stdin.read()
+def valid(cases):
+    if not isinstance(cases, list) or not cases: return False
+    for case in cases:
+        if not isinstance(case, dict): return False
+        if not all(isinstance(case.get(k), str) for k in ("name", "prompt")): return False
+        if case.get("expect") not in ("final", "observation", "shell-output", "error"): return False
+        literals = case.get("expect_contains", [])
+        if not isinstance(literals, list): return False
+        if not all(isinstance(lit, str) and lit.strip() for lit in literals): return False
+    return True
+decoder = json.JSONDecoder()
+for i, char in enumerate(text):
+    if char != "[": continue
+    try: cases, _ = decoder.raw_decode(text, i)
+    except ValueError: continue
+    if valid(cases):
+        print(json.dumps(cases))
+        break
+else:
+    raise SystemExit(1)
+') || die "Teacher returned invalid test cases (expected a case array with nonblank literal strings; use [] for no literals)"
 
     # The requested count is a budget ceiling, even if the teacher returns more.
     printf '%s' "$tests_json" | _sc_jq --argjson n "$num_tests" '.[:$n]'
@@ -846,7 +868,7 @@ print(re.sub(r"(?<![/A-Za-z0-9_.-])skills/", lambda m:root, sys.stdin.read()), e
 
     # Get skills prompt to include in the test
     local skills_prompt
-    skills_prompt=$(skills prompt 2>/dev/null || echo "")
+    skills_prompt=$(cd "$rundir" && skills prompt 2>/dev/null || echo "")
 
     # For reference skills, pre-load the skill content so the agent can answer directly
     local skill_content=""
@@ -1057,7 +1079,7 @@ PY_ROOT
 write_cache() {
     local skill_name="$1"
     local results_json="$2"
-    local phrase_pool="${3:-[]}"
+    local pool_snapshot="${3:?pool snapshot is required}"
     # LITERAL-SOURCE 2026-09-27: the copy of the skill the tests execute, so the
     # attestation site of every literal is classified against the same text the
     # tests ran against (SKILLS_DIR copy first, then the kernel copy).
@@ -1096,31 +1118,23 @@ write_cache() {
     local prov_summary
     prov_summary=$(
         skill_name="$skill_name"
-        printf '%s' "$phrase_pool" > "$TMPDIR/cache-pool.json"
         printf '%s' "$results_json" > "$TMPDIR/cache-results.json"
-        phrase_pool_file="$TMPDIR/cache-pool.json"
         results_json_file="$TMPDIR/cache-results.json"
         json_out="$COMPILED_DIR/${skill_name}.json"
         skill_dir="$skill_dir"
-        poolcap_json_path="${COMPILED_DIR:-}/pool-$(basename "${skill_dir%/}").json"
-        export skill_name phrase_pool_file results_json_file json_out skill_dir poolcap_json_path
+        poolcap_json_path="$pool_snapshot"
+        export skill_name results_json_file json_out skill_dir poolcap_json_path
         export SKILL_REAL_OUTPUT="${real_out_src:-}"
         python3 - <<'PY'
 import os, json, re, glob
-pool = json.load(open(os.environ["phrase_pool_file"]))
 res = json.load(open(os.environ["results_json_file"]))
 # POOL-CAP FIX 2026-10-02: the pool handed the teacher is the tail-truncated
 # view of the harvested vocabulary, so a real phrase the cap dropped was labeled
 # INVENTED, a false negative in the instrument's own reference frame. The pool
 # file records the truncation, and a dropped-but-real literal gets its own
 # provenance class instead of sharing one with invented vocabulary.
-poolcap = {}
-_pc = os.environ.get("poolcap_json_path") or ""
-if _pc and os.path.isfile(_pc):
-    try:
-        poolcap = json.load(open(_pc))
-    except Exception:
-        poolcap = {}
+poolcap = json.load(open(os.environ["poolcap_json_path"]))
+pool = poolcap["offered"]
 pooldropped = set(poolcap.get("dropped") or [])
 poolset = set(pool)
 
@@ -1209,7 +1223,7 @@ def classify_literal(lit):
     fm = ""
     sp = os.path.join(skill_dir, "SKILL.md")
     text = open(sp, errors="replace").read() if os.path.isfile(sp) else ""
-    m = re.match(r"\A---\n(.*?)\n---\n", text, flags=re.S)
+    m = re.match(r"\A---[ \t]*\n(.*?)\n---[ \t]*(?:\n|$)", text, flags=re.S)
     if m:
         fm = m.group(1)
         body = text[m.end():]
@@ -1361,7 +1375,8 @@ cmd_compile() {
 
     local tests_json
     local phrase_pool
-    phrase_pool=$(capture_phrase_pool "$skill_dir") || die "cannot capture phrase pool"
+    local pool_snapshot="$SC_SCRATCH/pool-snapshot.json"
+    phrase_pool=$(capture_phrase_pool "$skill_dir" "$pool_snapshot") || die "cannot capture phrase pool"
     tests_json=$(synthesize_tests "$spec_json" "$teacher_model" "$num_tests" "$skill_dir" "$phrase_pool")
 
     local test_count
@@ -1390,7 +1405,7 @@ cmd_compile() {
         i=$((i + 1))
     done
 
-    write_cache "$skill_name" "$all_results" "$phrase_pool" "$skill_dir"
+    write_cache "$skill_name" "$all_results" "$pool_snapshot" "$skill_dir"
     [[ "$harness_failed" -eq 0 ]]
 }
 

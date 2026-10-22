@@ -59,6 +59,13 @@ if name == 'llm':
     print((root/'tests.json').read_text())
     sys.exit(0)
 if name == 'shellm':
+    (root/'runner-selectors.json').write_text(json.dumps({k:os.environ.get(k) for k in
+        ('CHATRC','SKILLSRC','THINKERS_DIR','SHELLM_BROKER_DIR')}))
+    if os.environ.get('MUTATE_POOL'):
+        pool=pathlib.Path(os.environ['SKILL_COMPILED_DIR'])/'pool-probe.json'
+        (root/'pool-before-mutation.json').write_text(pool.read_text())
+        if os.environ['MUTATE_POOL']=='remove': pool.unlink()
+        else: pool.write_text('{"offered":[],"dropped":[],"pool_dropped":0}')
     args=sys.argv[1:]
     if '--prompt-file' in args:
         prompt=pathlib.Path(args[args.index('--prompt-file')+1]).read_text()
@@ -119,7 +126,7 @@ class Case:
         self.cache = self.root / 'compiled'
         self.env = dict(os.environ)
         for key in list(self.env):
-            if key.startswith(('SKILL_', 'SC_', 'SHELLM_', 'HEADLONG_', 'LLM_', 'TRAJ_', 'MEM_', 'ROOT_TRAJ_')) or key.endswith(('_API_KEY', '_TOKEN')):
+            if key.startswith(('SKILL_', 'SC_', 'SHELLM_', 'HEADLONG_', 'LLM_', 'TRAJ_', 'MEM_', 'ROOT_TRAJ_')) or key.endswith(('_API_KEY', '_TOKEN')) or key in ('CHATRC','SKILLSRC','THINKERS_DIR'):
                 self.env.pop(key)
         self.env.update(HOME=str(self.root/'home'), HEADLONG_HOME=str(self.root/'state'),
                         SKILLS_DIR=str(self.skills), SKILLS_KERNEL_DIR=str(self.root/'kernel'),
@@ -642,25 +649,47 @@ for kind in ('observation','shell-output','final'):
 
 
 def probe_children(mode):
+    import signal
     import time
     c=Case('probe-child-'+mode)
     source=SC.read_text();helper=c.root/'bounded.sh'
     helper.write_text(source[source.index('_sc_bounded() {'):source.index('\nexecute_test() {')]+'\n_sc_bounded "$@"\n')
-    child=c.root/'child.py';marker=c.root/'survived';pidfile=c.root/'child-pid'
-    # Finite children ensure even the old, broken helper cannot leak a long-lived process.
-    child.write_text('import time,pathlib\ntime.sleep(1)\npathlib.Path('+repr(str(marker))+').write_text("survived")\n')
+    child=c.root/'child.py';pidfile=c.root/'child-pid';parent_pid=c.root/'parent-pid'
+    # The child publishes readiness itself. Its finite lifetime also bounds
+    # cleanup if a broken helper or restricted test environment cannot signal it.
+    child.write_text('import os,time,pathlib\npathlib.Path('+repr(str(pidfile))+').write_text(str(os.getpid()))\ntime.sleep(20)\n')
     parent=c.root/'parent.py'
-    parent.write_text('import subprocess,sys,pathlib,time\np=subprocess.Popen([sys.executable,'+repr(str(child))+'])\n'
-                      'pathlib.Path('+repr(str(pidfile))+').write_text(str(p.pid))\n'
-                      + ('time.sleep(1)\n' if mode=='timeout' else ''))
-    start=time.monotonic()
-    r=subprocess.run([os.environ.get('SC_TEST_BASH','/bin/bash'),str(helper),'0.2',PYTHON,str(parent)],
-                     env=c.env,text=True,capture_output=True,timeout=4)
-    elapsed=time.monotonic()-start
-    # Wait past the finite child's write deadline before asserting it was killed.
-    time.sleep(max(0,1.2-(time.monotonic()-start)))
-    assert r.returncode==(124 if mode=='timeout' else 0),(r.returncode,r.stderr)
-    assert elapsed<0.8 and not marker.exists(),(mode,elapsed,'descendant survived deadline')
+    parent.write_text('import os,subprocess,sys,pathlib,time\n'
+        'pathlib.Path('+repr(str(parent_pid))+').write_text(str(os.getpid()))\n'
+        'subprocess.Popen([sys.executable,'+repr(str(child))+'])\n'
+        'while not pathlib.Path('+repr(str(pidfile))+').exists(): time.sleep(.01)\n'
+        + ('time.sleep(20)\n' if mode=='timeout' else ''))
+    def running(pid):
+        try: os.kill(pid,0)
+        except ProcessLookupError: return False
+        # Orphaned zombies may await container init reaping; they cannot run or
+        # retain stdout. A denied inspection is a test failure, never a pass.
+        status=subprocess.run(['/bin/ps','-p',str(pid),'-o','stat='],text=True,capture_output=True)
+        if status.stderr.strip(): raise RuntimeError('process inspection unavailable: '+status.stderr.strip())
+        return bool(status.stdout.strip()) and not status.stdout.lstrip().startswith('Z')
+    try:
+        # Generous outer limit still catches inherited-output pipes held by a
+        # surviving descendant, without a subsecond interpreter-startup budget.
+        r=subprocess.run([os.environ.get('SC_TEST_BASH','/bin/bash'),str(helper),'2',PYTHON,str(parent)],
+                         env=c.env,text=True,capture_output=True,timeout=8)
+        assert r.returncode==(124 if mode=='timeout' else 0),(r.returncode,r.stderr)
+        assert pidfile.exists(),'child did not reach synchronized startup'
+        pid=int(pidfile.read_text())
+        deadline=time.monotonic()+2
+        while running(pid) and time.monotonic()<deadline: time.sleep(.05)
+        assert not running(pid),'probe descendant still running'
+    finally:
+        if parent_pid.exists():
+            try: os.killpg(int(parent_pid.read_text()),signal.SIGKILL)
+            except ProcessLookupError: pass
+        if pidfile.exists():
+            try: os.kill(int(pidfile.read_text()),signal.SIGKILL)
+            except ProcessLookupError: pass
 for mode in ('normal','timeout'):
     check('repair3 probe descendants bounded on '+mode,lambda mode=mode:probe_children(mode))
 
@@ -743,6 +772,135 @@ def command_echo():
     (c.root/'trajectory.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in rows))
     c.run();assert not c.result()['tests'][0]['pass']
 check('repair3 recorded command echo is not assertion evidence',command_echo)
+
+
+# Fourth repair: invocation-local provenance and actual rc-loader isolation.
+def selector_isolation(mode):
+    import shlex
+    c=Case('selectors-'+mode);live=c.root/'pretend-live';live.mkdir()
+    keys=('CHATRC','SKILLSRC','THINKERS_DIR','SHELLM_BROKER_DIR')
+    marker=live/'rc-sourced'
+    rc='printf touched > '+shlex.quote(str(marker))+'\n'
+    (c.root/'.skillsrc').write_text(rc)
+    (live/'skillsrc').write_text(rc)
+    (live/'chatrc').write_text('default_send_from=pretend-live\n')
+    for k in ('THINKERS_DIR','SHELLM_BROKER_DIR'): (live/k).mkdir()
+    c.env.update(CHATRC=str(live/'chatrc'),THINKERS_DIR=str(live/'THINKERS_DIR'),
+                 SHELLM_BROKER_DIR=str(live/'SHELLM_BROKER_DIR'),SC_KEEP_RUNS='1')
+    if mode=='explicit': c.env['SKILLSRC']=str(live/'skillsrc')
+    original=(STUBS/'skills').read_text()
+    loader=Path(__file__).resolve().parents[1]/'bin'/'skills'
+    capture=('import os,json,pathlib; p=pathlib.Path(os.environ["CASE_ROOT"])/"loader-calls.jsonl"; '
+             'p.open("a").write(json.dumps(dict(cwd=os.getcwd(),rc=os.environ.get("SKILLSRC")))+"\\n")')
+    (STUBS/'skills').write_text('#!/bin/bash\n'+shlex.quote(PYTHON)+' -c '+shlex.quote(capture)
+                               +'\nexec /bin/bash '+shlex.quote(str(loader))+' "$@"\n')
+    try: c.run()
+    finally: (STUBS/'skills').write_text(original)
+    assert not marker.exists(),'caller rc consumed by actual skills loader'
+    calls=[json.loads(x) for x in (c.root/'loader-calls.jsonl').read_text().splitlines()]
+    assert calls and '## Skills' in (c.root/'shell-prompt').read_text()
+    for call in calls:
+        assert Path(call['cwd']).is_relative_to(c.root/'runs')
+        assert Path(call['rc']).is_relative_to(Path(call['cwd']))
+        assert Path(call['rc']).read_text()==''
+    actual=json.loads((c.root/'runner-selectors.json').read_text())
+    for key in keys:
+        assert Path(actual[key]).is_relative_to(c.root/'runs'),key
+        path=Path(actual[key])
+        if key.endswith('RC'): assert path.read_text()==''
+        else: assert path.is_dir()
+for mode in ('explicit','fallback'):
+    check('repair4 actual skills loader '+mode+' rc and runner selectors',lambda mode=mode:selector_isolation(mode))
+
+
+def probe_selectors():
+    c=Case('probe-selectors');live=c.root/'pretend-live';live.mkdir()
+    keys=('CHATRC','SKILLSRC','THINKERS_DIR','SHELLM_BROKER_DIR')
+    for key in keys:
+        p=live/key
+        if key.endswith('RC'): p.write_text('sentinel')
+        else: p.mkdir();(p/'sentinel').write_text('sentinel')
+        c.env[key]=str(p)
+    (c.skills/'probe'/'probe.py').write_text(
+        'import os,pathlib\nfor key in '+repr(keys)+':\n'
+        ' p=pathlib.Path(os.environ[key])\n assert not p.is_relative_to(pathlib.Path('+repr(str(live))+'))\n'
+        ' if key.endswith("RC"): assert p.read_text()==""\n else: assert p.is_dir()\n'
+        'print("".join(["Controlled", " selector probe"]))\n')
+    assert 'Controlled selector probe' in json.loads(c.run('pool').stdout)
+    for key in keys:
+        p=live/key
+        assert (p if key.endswith('RC') else p/'sentinel').read_text()=='sentinel'
+check('repair4 pool probe redirects omitted selectors',probe_selectors)
+
+
+def immutable_pool(mode):
+    c=Case('pool-snapshot-'+mode);c.env['SKILL_POOL_CAP']='1'
+    phrase='Dropped unique diagnostic'
+    c.skill('probe','Run probe.py.\n','print("Offered unique diagnostic")\nprint("'+phrase+'")\n')
+    c.tests([dict(name='dropped',prompt='Execute probe.',expect='shell-output',expect_contains=[phrase])])
+    c.output(phrase);c.env['MUTATE_POOL']=mode;c.run()
+    t=c.result()['tests'][0]
+    assert t['literal_labels'][phrase]=='POOL-DROPPED',t
+    assert t['verification']=='GREEN-ON-DROPPED' and c.result()['summary']['pool_truncated']
+    assert (c.root/'pool-before-mutation.json').exists()
+for mode in ('remove','replace'):
+    check('repair4 pool snapshot survives shared cache '+mode,lambda mode=mode:immutable_pool(mode))
+
+
+def blank_literals():
+    for i,lit in enumerate(('', ' ', '   ', '\t', '\n', '\t \n')):
+        c=Case('blank-'+str(i));c.tests([dict(name='blank',prompt='Run.',expect='final',expect_contains=[lit])])
+        r=c.run(success=False)
+        assert r.returncode!=0 and 'invalid test cases' in r.stderr
+        assert not (c.root/'shell-prompt').exists()
+    c=Case('empty-list');c.tests([dict(name='none',prompt='Run.',expect='final',expect_contains=[])])
+    c.run();assert c.result()['tests'][0]['verification']=='GREEN-NO-LITERALS'
+    for i,lit in enumerate(('  Victory phrase stable  ', '\tVictory phrase stable\t', 'Victory\nphrase stable')):
+        c=Case('nonblank-'+str(i));c.tests([dict(name='nonblank',prompt='Run.',expect='final',expect_contains=[lit])])
+        if '\n' not in lit: c.output(lit)
+        c.run();assert c.result()['tests'][0]['test']['expect_contains']==[lit]
+        if '\n' not in lit: assert c.result()['tests'][0]['pass']
+check('repair4 reject all blank literals but preserve nonblank bytes and empty lists',blank_literals)
+
+
+def bracketed_prose():
+    for i,prefix in enumerate(('Here are [3] cases:','Here are [some] cases:',
+                               '[{"name":"wrong schema"}]\n', '```json\n')):
+        c=Case('bracketed-'+str(i));p=c.root/'tests.json';p.write_text(prefix+p.read_text()+'\n```')
+        c.run();assert c.result()['tests'][0]['pass']
+    c=Case('invalid-candidates');(c.root/'tests.json').write_text('[] [3] [{"name":"incomplete"}]')
+    assert c.run(success=False).returncode!=0 and not (c.root/'shell-prompt').exists()
+check('repair4 find schema-valid arrays after bracketed prose, reject invalid candidates',bracketed_prose)
+
+
+def retained_locations():
+    c=Case('retained-locations');c.env['SC_KEEP_RUNS']='1';r=c.run()
+    runs=[p for p in (c.root/'runs').iterdir() if p.is_dir()]
+    assert runs and all('Retained run: '+str(p) in r.stderr for p in runs)
+    assert 'Retained scratch:' in r.stderr
+check('repair4 retained run paths printed with custom runs base',retained_locations)
+
+
+def frontmatter_contract():
+    c=Case('frontmatter-contract');p=c.skills/'probe'/'SKILL.md'
+    p.write_text('--- \t\nname: probe\ndescription: MetadataUniqueToken\n---\t \nBody `BodyUniqueToken`.\n')
+    c.tests([dict(name='metadata',prompt='Describe the skill.',expect='final',expect_contains=['MetadataUniqueToken'])])
+    c.output('MetadataUniqueToken');c.run();t=c.result()['tests'][0]
+    assert t['literal_sources']['MetadataUniqueToken']=='METADATA',t
+    assert t['literal_labels']['MetadataUniqueToken']=='POOL-EXACT',t
+    assert '"description":"MetadataUniqueToken"' in (c.root/'teacher-prompt').read_text()
+check('repair4 frontmatter delimiters agree for spec, pool and provenance',frontmatter_contract)
+
+
+def dependency_metadata():
+    c=Case('dependency-metadata');d=c.skills/'skill-compiler';d.mkdir()
+    repo=Path(__file__).resolve().parents[1]
+    shutil.copyfile(repo/'skills'/'skill-compiler'/'SKILL.md',d/'SKILL.md')
+    c.env['SKILLSRC']=str(c.root/'empty-rc');Path(c.env['SKILLSRC']).write_text('')
+    r=subprocess.run(['/bin/bash',str(repo/'bin'/'skills'),'show','skill-compiler','--requires'],
+                     env=c.env,cwd=c.root,text=True,capture_output=True,check=True)
+    assert json.loads(r.stdout)['requires']['bins']==['bash','python3','jq','llm','shellm','skills']
+check('repair4 dependency metadata uses actual loader spelling',dependency_metadata)
 
 print(f'{count-failed} regression checks passed, {failed} failed',flush=True)
 sys.exit(bool(failed))

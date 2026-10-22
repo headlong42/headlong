@@ -1,6 +1,10 @@
 ---
 name: skill-compiler
 description: Generate and run validation cases for a trusted skill, then inspect a saved report of results and assertion provenance.
+metadata:
+  shelllm:
+    requires:
+      bins: ["bash", "python3", "jq", "llm", "shellm", "skills"]
 ---
 
 # skill-compiler
