@@ -895,7 +895,7 @@ check('repair4 frontmatter delimiters agree for spec, pool and provenance',front
 def dependency_metadata():
     c=Case('dependency-metadata');d=c.skills/'skill-compiler';d.mkdir()
     repo=Path(__file__).resolve().parents[1]
-    shutil.copyfile(repo/'skills'/'skill-compiler'/'SKILL.md',d/'SKILL.md')
+    shutil.copyfile(repo/'contrib'/'skill-compiler'/'SKILL.md',d/'SKILL.md')
     c.env['SKILLSRC']=str(c.root/'empty-rc');Path(c.env['SKILLSRC']).write_text('')
     r=subprocess.run(['/bin/bash',str(repo/'bin'/'skills'),'show','skill-compiler','--requires'],
                      env=c.env,cwd=c.root,text=True,capture_output=True,check=True)
