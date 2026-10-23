@@ -15,15 +15,16 @@ configuration and can incur charges. This produces validation reports, not
 trained adapters or automatically loaded examples.
 
 ```bash
-sc="$HOME/.skills/core-skills/skill-compiler/skill-compiler"
+sc="${SKILLS_DIR:-./.skills}/skill-compiler/skill-compiler"
 "$sc" compile --skill shellm --num-tests 3 --max-iterations 5
 "$sc" show --skill shellm
 "$sc" pool --skill shellm
 "$sc" clean --skill shellm
 ```
 
-The installer does not put the executable on PATH. From a source checkout use
-`sc="$PWD/skills/skill-compiler/skill-compiler"`. Use `--teacher-model` only to
+This skill requires explicit installation; default agents do not receive it.
+The executable is not on PATH. See [README.md](README.md) for installation and
+source-checkout usage. Use `--teacher-model` only to
 override the teacher's configured model. Defaults are up to eight cases and fifteen
 iterations per case.
 

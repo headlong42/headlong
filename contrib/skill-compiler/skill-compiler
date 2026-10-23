@@ -628,8 +628,7 @@ PY
     if [[ -n "$script" ]]; then
         [[ "$script" == /* ]] || script="$skill_abs/$script"
         local tmp
-        tmp=$(mktemp -d 2>/dev/null || echo /tmp/phrase-pool.$$)
-        mkdir -p "$tmp"
+        tmp=$(mktemp -d "$SC_SCRATCH/phrase-pool.XXXXXX") || return 1
         (
             _sc_isolate_state "$tmp" || exit 1
             cd "$tmp" || exit 1

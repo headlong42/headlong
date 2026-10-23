@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/test_skill_compiler.sh — offline checks for skills/skill-compiler: the
+# tests/test_skill_compiler.sh — offline checks for contrib/skill-compiler: the
 # compile skip-list refuses side-effect skills before any model call, a missing
 # skill dies cleanly, the phrase pool carries the tool's own output vocabulary,
 # the cache is self-describing with POOL-EXACT / POOL-FRAGMENT / INVENTED literal
@@ -14,7 +14,7 @@ unset IDENTITY_DIR IDENTITY_NAME MEM_DIR TRAJ_DIR TRAJ_ID ROOT_TRAJ_ID 2>/dev/nu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(dirname "$HERE")"
-compiler_source="${SKILL_COMPILER_TEST_SOURCE:-$REPO/skills/skill-compiler/skill-compiler}"
+compiler_source="${SKILL_COMPILER_TEST_SOURCE:-$REPO/contrib/skill-compiler/skill-compiler}"
 
 pass=0
 fail=0

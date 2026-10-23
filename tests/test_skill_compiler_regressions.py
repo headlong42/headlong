@@ -1215,5 +1215,24 @@ def nul_supported_controls():
     assert [t['test'] for t in results]==cases,results
 check('NUL boundary supported controls and later valid array',nul_supported_controls)
 
+def probe_temp_failure():
+    for command in ('pool', 'compile'):
+        c=Case('probe-temp-failure-'+command)
+        (c.skills/'probe'/'probe.py').write_text(
+            'import os, pathlib\npathlib.Path(os.environ["CASE_ROOT"], "probe-executed").touch()\n')
+        wrapper=c.root/'temp-wrapper';wrapper.mkdir()
+        stub=wrapper/'mktemp'
+        stub.write_text('#!'+PYTHON+'\nimport os, sys\n'
+                        'if "-d" in sys.argv and (len(sys.argv)==2 or "phrase-pool." in sys.argv[-1]): sys.exit(1)\n'
+                        'os.execv('+repr(shutil.which('mktemp'))+', ["mktemp"]+sys.argv[1:])\n')
+        stub.chmod(0o755)
+        c.env['PATH']=str(wrapper)+os.pathsep+c.env['PATH']
+        r=c.run(command, success=False)
+        assert r.returncode != 0, r.stdout
+        assert not (c.root/'probe-executed').exists()
+        assert not (c.root/'teacher-count').exists()
+        assert not (c.cache/'probe.json').exists()
+check('probe temporary directory failure stops before execution',probe_temp_failure)
+
 print(f'{count-failed} regression checks passed, {failed} failed',flush=True)
 sys.exit(bool(failed))

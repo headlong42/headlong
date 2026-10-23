@@ -11,11 +11,14 @@ commands. Model calls use your normal llm configuration and can incur charges.
 `--teacher-model` overrides only the teacher model; otherwise llm resolves its
 model and provider normally, including `SHELLM_MODEL` and `LLM_PROVIDER`.
 
-The installer copies this directory but does not add its executable to PATH.
-For a standard installation:
+This optional package is not installed or advertised to default agents. To add
+it to one agent, enter that agent's shell with `persona <name> shell`, then run
+`skills install /absolute/path/to/headlong/contrib/skill-compiler`. The existing
+skill installer copies it into that agent's skills directory. It does not add a
+command to PATH. In that same shell:
 
 ```bash
-sc="$HOME/.skills/core-skills/skill-compiler/skill-compiler"
+sc="$SKILLS_DIR/skill-compiler/skill-compiler"
 "$sc" compile --skill shellm --num-tests 3 --max-iterations 5
 "$sc" pool --skill shellm
 "$sc" list
@@ -23,7 +26,10 @@ sc="$HOME/.skills/core-skills/skill-compiler/skill-compiler"
 "$sc" clean --skill shellm
 ```
 
-From a source checkout, use `sc="$PWD/skills/skill-compiler/skill-compiler"`.
+From a source checkout, use `sc="$PWD/contrib/skill-compiler/skill-compiler"`
+and set `SKILLS_DIR` to the directory containing the skills you want to test.
+To remove the installed skill, run `skills remove skill-compiler` in the agent's
+shell. Saved reports remain under the state home.
 `SKILLS_DIR` defaults to the directory containing this skill;
 `SKILLS_KERNEL_DIR` selects a second search root. An existing `SKILLS_DIR`
 setting takes precedence. `--num-tests` is a ceiling on cases executed (default
