@@ -32,8 +32,7 @@ pattern="${1:-}"
 # scripts that take 12 s or more with their macOS CI seconds (run
 # 37511119972, 2026-10-06); every other script counts as 4 s. These numbers
 # only affect balance. A stale or missing entry never drops a script.
-# skill-compiler measured 547.2 s on Linux CI (2026-10-22), rounded up.
-SLOW="test_skill_compiler.sh:548 test_contrib_opencode.sh:263 test_thinkers_pending.sh:66
+SLOW="test_contrib_opencode.sh:263 test_thinkers_pending.sh:66
 test_thinkers_stuck_step.sh:44 test_inactivity_beacon.sh:40
 test_monolith_backoff.sh:39 test_thinkers_wake_at.sh:37
 test_responder_deferral.sh:35 test_responder_reply_guard.sh:26
